@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+
+set -u
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+APP_HOME="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
+
+MAIN_CLASS="org.apache.paimon.agent.PaimonAgent"
+LIB_DIR="$APP_HOME/lib"
+CONFIG_DIR="$APP_HOME/config"
+DATA_DIR="${PAIMON_AGENT_DATA_DIR:-$APP_HOME/data}"
+PAIMON_CONFIG="${PAIMON_AGENT_PAIMON_CONFIG:-$CONFIG_DIR/paimon.properties}"
+PROJECT_CONFIG="${PAIMON_AGENT_PROJECT_CONFIG:-$CONFIG_DIR/project.properties}"
+PID_FILE="$DATA_DIR/paimon-agent.pid"
+LOG_FILE="$DATA_DIR/paimon-agent.log"
+CONTROL_LOCK_DIR="$DATA_DIR/.paimon-agent-control.lock"
+CONTROL_LOCK_OWNER="$CONTROL_LOCK_DIR/owner"
+CONTROL_LOCK_HELD=false
+
+usage() {
+    cat <<EOF
+Usage: $0 <command> [options]
+
+Commands:
+  start [options]    Start the collector in the background
+  stop               Gracefully stop the background collector
+  status             Show whether the collector is running
+  run [options]      Run the collector in the foreground
+  dashboard          Run the read-only dashboard in the foreground
+  dashboard-url      Print the authenticated local dashboard URL
+  restore [options]  Restore conversations from Paimon
+
+Restore options are passed to Java unchanged:
+  --type codex|claude [--target <path>] [--target-project <path>]
+                      [--session-id <id>] [--overwrite]
+
+Environment:
+  JAVA_HOME                         JDK location; Java 11 is required
+  PAIMON_AGENT_JAVA_OPTS            Additional JVM options
+  PAIMON_AGENT_PAIMON_CONFIG        Catalog configuration path
+  PAIMON_AGENT_PROJECT_CONFIG       Collector configuration path
+  PAIMON_AGENT_DATA_DIR             PID, log, and local cache directory
+  PAIMON_AGENT_STOP_TIMEOUT         Graceful stop timeout in seconds (default: 30)
+  PAIMON_AGENT_CONTROL_TIMEOUT      Wait for another start/stop command (default: 40)
+EOF
+}
+
+fail() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+select_java() {
+    if [[ -n "${JAVA_HOME:-}" ]]; then
+        JAVA_CMD="$JAVA_HOME/bin/java"
+        [[ -x "$JAVA_CMD" ]] || fail "JAVA_HOME does not contain an executable bin/java: $JAVA_HOME"
+    else
+        JAVA_CMD="$(command -v java 2>/dev/null || true)"
+        [[ -n "$JAVA_CMD" ]] || fail "Java was not found. Set JAVA_HOME to a JDK 11 installation."
+    fi
+
+    local version
+    local major
+    version="$("$JAVA_CMD" -version 2>&1 | awk -F '"' '/version/ {print $2; exit}')"
+    [[ -n "$version" ]] || fail "Unable to determine Java version from $JAVA_CMD"
+    major="${version%%.*}"
+    [[ "$major" == "11" ]] || fail "Java 11 is required, but $JAVA_CMD reports version $version"
+}
+
+prepare_runtime() {
+    [[ -d "$LIB_DIR" ]] || fail "Missing library directory: $LIB_DIR"
+    compgen -G "$LIB_DIR/paimon-agent-*.jar" >/dev/null \
+        || fail "Missing paimon-agent application JAR in $LIB_DIR"
+    [[ -f "$PAIMON_CONFIG" ]] || fail "Missing Paimon configuration: $PAIMON_CONFIG"
+    [[ -f "$PROJECT_CONFIG" ]] || fail "Missing project configuration: $PROJECT_CONFIG"
+    mkdir -p "$DATA_DIR" || fail "Unable to create data directory: $DATA_DIR"
+}
+
+build_java_command() {
+    JAVA_COMMAND=("$JAVA_CMD")
+    if [[ -n "${PAIMON_AGENT_JAVA_OPTS:-}" ]]; then
+        local extra_opts
+        read -r -a extra_opts <<< "$PAIMON_AGENT_JAVA_OPTS"
+        JAVA_COMMAND+=("${extra_opts[@]}")
+    fi
+    JAVA_COMMAND+=("-cp" "$LIB_DIR/*" "$MAIN_CLASS")
+}
+
+read_pid() {
+    [[ -f "$PID_FILE" ]] || return 1
+    PID="$(tr -d '[:space:]' < "$PID_FILE")"
+    [[ "$PID" =~ ^[0-9]+$ ]]
+}
+
+remove_pid_if_matches() {
+    local expected_pid="$1"
+    local current_pid
+    [[ -f "$PID_FILE" ]] || return 0
+    current_pid="$(tr -d '[:space:]' < "$PID_FILE" 2>/dev/null || true)"
+    if [[ "$current_pid" == "$expected_pid" ]]; then
+        rm -f "$PID_FILE"
+    fi
+}
+
+publish_pid() {
+    local pid="$1"
+    local temporary="$PID_FILE.$$"
+    rm -f "$temporary"
+    if ! printf '%s\n' "$pid" > "$temporary"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    if ! mv -f "$temporary" "$PID_FILE"; then
+        rm -f "$temporary"
+        return 1
+    fi
+}
+
+pid_exists() {
+    kill -0 "$1" 2>/dev/null
+}
+
+is_agent_process() {
+    local pid="$1"
+    local command_line
+    pid_exists "$pid" || return 1
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ "$command_line" == *"$MAIN_CLASS"* && "$command_line" == *"$LIB_DIR"* ]]
+}
+
+release_control_lock() {
+    local exit_status=$?
+    local owner=""
+    if [[ "$CONTROL_LOCK_HELD" == true ]]; then
+        if [[ -f "$CONTROL_LOCK_OWNER" ]]; then
+            owner="$(tr -d '[:space:]' < "$CONTROL_LOCK_OWNER" 2>/dev/null || true)"
+        fi
+        if [[ "$owner" == "$$" ]]; then
+            rm -f "$CONTROL_LOCK_OWNER"
+            rmdir "$CONTROL_LOCK_DIR" 2>/dev/null || true
+        fi
+        CONTROL_LOCK_HELD=false
+    fi
+    return "$exit_status"
+}
+
+acquire_control_lock() {
+    local timeout="${PAIMON_AGENT_CONTROL_TIMEOUT:-40}"
+    local waited=0
+    local owner="unknown"
+    [[ "$timeout" =~ ^[0-9]+$ ]] \
+        || fail "PAIMON_AGENT_CONTROL_TIMEOUT must be a non-negative integer"
+    mkdir -p "$DATA_DIR" || fail "Unable to create data directory: $DATA_DIR"
+
+    while ! mkdir "$CONTROL_LOCK_DIR" 2>/dev/null; do
+        if (( waited >= timeout )); then
+            if [[ -f "$CONTROL_LOCK_OWNER" ]]; then
+                owner="$(tr -d '[:space:]' < "$CONTROL_LOCK_OWNER" 2>/dev/null || true)"
+                [[ -n "$owner" ]] || owner="unknown"
+            fi
+            fail "Timed out waiting for start/stop control lock $CONTROL_LOCK_DIR (owner PID $owner); if the owner no longer exists, remove the stale lock directory"
+        fi
+        sleep 1
+        ((waited += 1))
+    done
+
+    if ! printf '%s\n' "$$" > "$CONTROL_LOCK_OWNER"; then
+        rmdir "$CONTROL_LOCK_DIR" 2>/dev/null || true
+        fail "Unable to record control lock owner in $CONTROL_LOCK_OWNER"
+    fi
+    CONTROL_LOCK_HELD=true
+    trap release_control_lock EXIT
+}
+
+start_agent() {
+    select_java
+    prepare_runtime
+    acquire_control_lock
+
+    if read_pid; then
+        if is_agent_process "$PID"; then
+            echo "paimon-agent is already running (PID $PID)"
+            return 0
+        fi
+        if pid_exists "$PID"; then
+            fail "PID file $PID_FILE belongs to another process (PID $PID); remove it after checking that process"
+        fi
+        remove_pid_if_matches "$PID"
+    elif [[ -f "$PID_FILE" ]]; then
+        fail "Invalid PID file: $PID_FILE"
+    fi
+
+    build_java_command
+    nohup "${JAVA_COMMAND[@]}" \
+        --paimon-config "$PAIMON_CONFIG" \
+        --project-config "$PROJECT_CONFIG" \
+        --data-dir "$DATA_DIR" \
+        "$@" </dev/null >>"$LOG_FILE" 2>&1 &
+    local pid=$!
+    if ! publish_pid "$pid"; then
+        kill -TERM "$pid" 2>/dev/null || true
+        fail "Unable to publish PID file: $PID_FILE"
+    fi
+
+    sleep 1
+    if ! is_agent_process "$pid"; then
+        remove_pid_if_matches "$pid"
+        echo "paimon-agent failed to start; recent log output:" >&2
+        tail -n 30 "$LOG_FILE" >&2 || true
+        return 1
+    fi
+    echo "paimon-agent started (PID $pid, log $LOG_FILE)"
+}
+
+stop_agent() {
+    acquire_control_lock
+    if ! read_pid; then
+        if [[ -f "$PID_FILE" ]]; then
+            fail "Invalid PID file: $PID_FILE"
+        fi
+        echo "paimon-agent is not running"
+        return 0
+    fi
+
+    if ! pid_exists "$PID"; then
+        remove_pid_if_matches "$PID"
+        echo "paimon-agent is not running (removed stale PID file)"
+        return 0
+    fi
+    is_agent_process "$PID" \
+        || fail "Refusing to stop PID $PID because it is not this paimon-agent installation"
+
+    local timeout="${PAIMON_AGENT_STOP_TIMEOUT:-30}"
+    [[ "$timeout" =~ ^[0-9]+$ ]] || fail "PAIMON_AGENT_STOP_TIMEOUT must be a non-negative integer"
+
+    kill -TERM "$PID"
+    local waited=0
+    while pid_exists "$PID" && (( waited < timeout )); do
+        sleep 1
+        ((waited += 1))
+    done
+    if pid_exists "$PID"; then
+        fail "paimon-agent did not stop within ${timeout}s; PID $PID was left running"
+    fi
+    remove_pid_if_matches "$PID"
+    echo "paimon-agent stopped"
+}
+
+status_agent() {
+    if read_pid && is_agent_process "$PID"; then
+        echo "paimon-agent is running (PID $PID)"
+        return 0
+    fi
+    if [[ -f "$PID_FILE" ]]; then
+        echo "paimon-agent is not running (stale or invalid PID file: $PID_FILE)"
+    else
+        echo "paimon-agent is not running"
+    fi
+    return 3
+}
+
+run_agent() {
+    select_java
+    prepare_runtime
+    build_java_command
+    exec "${JAVA_COMMAND[@]}" \
+        --paimon-config "$PAIMON_CONFIG" \
+        --project-config "$PROJECT_CONFIG" \
+        --data-dir "$DATA_DIR" \
+        "$@"
+}
+
+restore_agent() {
+    select_java
+    prepare_runtime
+    build_java_command
+    exec "${JAVA_COMMAND[@]}" restore \
+        --paimon-config "$PAIMON_CONFIG" \
+        --project-config "$PROJECT_CONFIG" \
+        --data-dir "$DATA_DIR" \
+        "$@"
+}
+
+dashboard_agent() {
+    select_java
+    prepare_runtime
+    build_java_command
+    exec "${JAVA_COMMAND[@]}" dashboard \
+        --paimon-config "$PAIMON_CONFIG" \
+        --project-config "$PROJECT_CONFIG" \
+        --data-dir "$DATA_DIR" \
+        "$@"
+}
+
+dashboard_url() {
+    select_java
+    prepare_runtime
+    build_java_command
+    exec "${JAVA_COMMAND[@]}" dashboard-url \
+        --paimon-config "$PAIMON_CONFIG" \
+        --project-config "$PROJECT_CONFIG" \
+        --data-dir "$DATA_DIR" \
+        "$@"
+}
+
+COMMAND="${1:-}"
+if [[ -n "$COMMAND" ]]; then
+    shift
+fi
+
+case "$COMMAND" in
+    start)
+        start_agent "$@"
+        ;;
+    stop)
+        stop_agent "$@"
+        ;;
+    status)
+        status_agent "$@"
+        ;;
+    run)
+        run_agent "$@"
+        ;;
+    restore)
+        restore_agent "$@"
+        ;;
+    dashboard)
+        dashboard_agent "$@"
+        ;;
+    dashboard-url)
+        dashboard_url "$@"
+        ;;
+    help|--help|-h|"")
+        usage
+        ;;
+    *)
+        echo "Unknown command: $COMMAND" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,293 @@
+package org.apache.paimon.agent.sink;
+
+import org.apache.paimon.agent.config.AgentConfiguration;
+import org.apache.paimon.agent.config.ProjectConfig;
+import org.apache.paimon.agent.config.SourceConfig;
+import org.apache.paimon.agent.model.AttachmentPayload;
+import org.apache.paimon.agent.model.ChatMessage;
+import org.apache.paimon.agent.model.ChatSession;
+import org.apache.paimon.agent.model.SessionBatch;
+import org.apache.paimon.agent.model.SessionKey;
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.data.InternalArray;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.ReadBuilder;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class PaimonChatRepositoryTest {
+
+    @TempDir Path tempDir;
+
+    @Test
+    void readsMessagesWithSourceAndSessionFiltersAndRoundTripsArrayBlob() throws Exception {
+        AgentConfiguration configuration = configuration();
+        SessionKey selectedKey = new SessionKey("codex", "s1");
+        SessionKey otherCodexKey = new SessionKey("codex", "s2");
+        SessionKey claudeKey = new SessionKey("claude", "s1");
+        Instant createdAt = Instant.parse("2026-01-01T00:00:00.123Z");
+        Instant ingestedAt = Instant.parse("2026-01-01T00:05:00.456Z");
+        ChatSession selectedSession =
+                new ChatSession(
+                        selectedKey,
+                        "title",
+                        "/tmp",
+                        false,
+                        "/tmp/s1.jsonl",
+                        "byte:100",
+                        0,
+                        createdAt,
+                        createdAt,
+                        createdAt,
+                        ingestedAt);
+        ChatMessage selectedMessage =
+                new ChatMessage(
+                        "m1",
+                        selectedKey,
+                        42,
+                        "user",
+                        "response_item",
+                        "{\"text\":\"hello 世界\",\"nested\":{\"value\":7}}",
+                        Arrays.asList(
+                                AttachmentPayload.of("blob".getBytes(StandardCharsets.UTF_8)),
+                                AttachmentPayload.missing(),
+                                AttachmentPayload.of(new byte[0])),
+                        createdAt,
+                        ingestedAt);
+        ChatSession otherCodexSession = session(otherCodexKey, createdAt, ingestedAt);
+        ChatMessage otherCodexMessage =
+                message("m2", otherCodexKey, 43, "assistant", createdAt, ingestedAt);
+        ChatSession claudeSession = session(claudeKey, createdAt, ingestedAt);
+        ChatMessage claudeMessage =
+                message("m3", claudeKey, 44, "assistant", createdAt, ingestedAt);
+        List<SessionBatch> batches =
+                Arrays.asList(
+                        new SessionBatch(
+                                selectedSession, Collections.singletonList(selectedMessage)),
+                        new SessionBatch(
+                                otherCodexSession,
+                                Collections.singletonList(otherCodexMessage)),
+                        new SessionBatch(
+                                claudeSession, Collections.singletonList(claudeMessage)));
+
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration)) {
+            repository.initialize();
+            repository.commit(0L, batches);
+            repository.commit(0L, batches);
+
+            assertThat(repository.loadSessions()).containsKeys(selectedKey, otherCodexKey, claudeKey);
+            assertThat(repository.loadSessions().get(selectedKey).lastCommitId()).isZero();
+            assertThat(repository.loadSessions().get(selectedKey).pendingCommitId()).isNull();
+            assertThat(repository.loadSessions().get(selectedKey).pendingCursor()).isNull();
+
+            List<ChatMessage> selected = new ArrayList<>();
+            repository.forEachMessage(
+                    "codex", Collections.singleton("s1"), selected::add);
+            assertThat(selected).hasSize(1);
+            assertRoundTrip(selected.get(0), selectedMessage);
+
+            List<ChatMessage> allCodex = new ArrayList<>();
+            repository.forEachMessage("codex", Collections.emptySet(), allCodex::add);
+            assertThat(allCodex)
+                    .extracting(message -> message.sessionKey().sessionId())
+                    .containsExactlyInAnyOrder("s1", "s2");
+            assertThat(allCodex)
+                    .extracting(message -> message.sessionKey().sourceType())
+                    .containsOnly("codex");
+
+            List<ChatMessage> claude = new ArrayList<>();
+            repository.forEachMessage(
+                    "claude", Collections.singleton("s1"), claude::add);
+            assertThat(claude).hasSize(1);
+            assertRoundTrip(claude.get(0), claudeMessage);
+
+            List<ChatMessage> missingSession = new ArrayList<>();
+            repository.forEachMessage(
+                    "codex", Collections.singleton("missing"), missingSession::add);
+            assertThat(missingSession).isEmpty();
+        }
+
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("metastore", "filesystem");
+        options.put("warehouse", tempDir.toString());
+        try (Catalog catalog =
+                CatalogFactory.createCatalog(CatalogContext.create(Options.fromMap(options)))) {
+            Table table = catalog.getTable(Identifier.create("ai_memory", "ai_chat_messages"));
+            ReadBuilder builder = table.newReadBuilder();
+            int count = 0;
+            try (RecordReader<InternalRow> reader =
+                    builder.newRead().createReader(builder.newScan().plan())) {
+                RecordReader.RecordIterator<InternalRow> rows;
+                while ((rows = reader.readBatch()) != null) {
+                    try {
+                        InternalRow row;
+                        while ((row = rows.next()) != null) {
+                            count++;
+                            if ("m1".equals(row.getString(0).toString())) {
+                                assertThat(row.getString(6).toString())
+                                        .isEqualTo(selectedMessage.contentJson());
+                                InternalArray attachments = row.getArray(7);
+                                assertThat(attachments.size()).isEqualTo(3);
+                                assertThat(attachments.getBlob(0).toData())
+                                        .isEqualTo("blob".getBytes(StandardCharsets.UTF_8));
+                                assertThat(attachments.isNullAt(1)).isTrue();
+                                assertThat(attachments.getBlob(2).toData()).isEmpty();
+                            }
+                        }
+                    } finally {
+                        rows.releaseBatch();
+                    }
+                }
+            }
+            assertThat(count).isEqualTo(3);
+        }
+
+        try (PaimonChatRepository differentWriter =
+                new PaimonChatRepository(configuration("another-writer"))) {
+            assertThatThrownBy(differentWriter::initialize)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("only one writer per table pair");
+        }
+        try (PaimonChatRepository restoreReader =
+                new PaimonChatRepository(configuration("restore-machine"))) {
+            restoreReader.initializeForRestore();
+            assertThat(restoreReader.loadSessions()).containsKey(selectedKey);
+        }
+
+        Identifier messagesIdentifier =
+                Identifier.create("ai_memory", "ai_chat_messages");
+        try (Catalog catalog =
+                CatalogFactory.createCatalog(
+                        CatalogContext.create(
+                                Options.fromMap(
+                                        Map.of(
+                                                "metastore",
+                                                "filesystem",
+                                                "warehouse",
+                                                tempDir.toString()))))) {
+            catalog.dropTable(messagesIdentifier, false);
+        }
+        try (PaimonChatRepository differentWriter =
+                new PaimonChatRepository(configuration("half-pair-writer"))) {
+            assertThatThrownBy(differentWriter::initialize)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("ai_chat_sessions is owned by collector.id=test-agent");
+        }
+        try (Catalog catalog =
+                CatalogFactory.createCatalog(
+                        CatalogContext.create(
+                                Options.fromMap(
+                                        Map.of(
+                                                "metastore",
+                                                "filesystem",
+                                                "warehouse",
+                                                tempDir.toString()))))) {
+            assertThatThrownBy(() -> catalog.getTable(messagesIdentifier))
+                    .isInstanceOf(Catalog.TableNotExistException.class);
+        }
+    }
+
+    private static ChatSession session(SessionKey key, Instant createdAt, Instant ingestedAt) {
+        return new ChatSession(
+                key,
+                "title-" + key.sourceType() + "-" + key.sessionId(),
+                "/tmp",
+                false,
+                "/tmp/" + key.sessionId() + ".jsonl",
+                "byte:100",
+                0,
+                createdAt,
+                createdAt,
+                createdAt,
+                ingestedAt);
+    }
+
+    private static ChatMessage message(
+            String id,
+            SessionKey key,
+            long sequenceNumber,
+            String role,
+            Instant createdAt,
+            Instant ingestedAt) {
+        return new ChatMessage(
+                id,
+                key,
+                sequenceNumber,
+                role,
+                "message",
+                "{\"id\":\"" + id + "\"}",
+                Collections.emptyList(),
+                createdAt,
+                ingestedAt);
+    }
+
+    private static void assertRoundTrip(ChatMessage actual, ChatMessage expected) {
+        assertThat(actual.messageId()).isEqualTo(expected.messageId());
+        assertThat(actual.sessionKey()).isEqualTo(expected.sessionKey());
+        assertThat(actual.sequenceNumber()).isEqualTo(expected.sequenceNumber());
+        assertThat(actual.role()).isEqualTo(expected.role());
+        assertThat(actual.eventType()).isEqualTo(expected.eventType());
+        assertThat(actual.contentJson()).isEqualTo(expected.contentJson());
+        assertThat(actual.createdAt()).isEqualTo(expected.createdAt());
+        assertThat(actual.ingestedAt()).isEqualTo(expected.ingestedAt());
+        assertThat(actual.attachments()).hasSameSizeAs(expected.attachments());
+        for (int index = 0; index < expected.attachments().size(); index++) {
+            AttachmentPayload actualAttachment = actual.attachments().get(index);
+            AttachmentPayload expectedAttachment = expected.attachments().get(index);
+            assertThat(actualAttachment.isMissing()).isEqualTo(expectedAttachment.isMissing());
+            assertThat(actualAttachment.bytes()).isEqualTo(expectedAttachment.bytes());
+        }
+    }
+
+    private AgentConfiguration configuration() {
+        return configuration("test-agent");
+    }
+
+    private AgentConfiguration configuration(String collectorId) {
+        Map<String, String> catalog = new LinkedHashMap<>();
+        // Unit tests construct the repository directly with a local Catalog. The public
+        // ConfigLoader intentionally accepts only metastore=rest.
+        catalog.put("metastore", "filesystem");
+        catalog.put("warehouse", tempDir.toString());
+        ProjectConfig project =
+                new ProjectConfig(
+                        "ai_memory",
+                        "ai_chat_sessions",
+                        "ai_chat_messages",
+                        Duration.ofMinutes(5),
+                        Duration.ofMinutes(5),
+                        false,
+                        collectorId,
+                        new SourceConfig(false, tempDir),
+                        new SourceConfig(false, tempDir),
+                        true,
+                        false,
+                        1024 * 1024,
+                        100,
+                        100,
+                        0,
+                        Duration.ofSeconds(1));
+        return new AgentConfiguration(catalog, project);
+    }
+}

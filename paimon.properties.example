@@ -1,0 +1,4 @@
+# Only Paimon Catalog construction options belong in this file.
+metastore=rest
+uri=http://127.0.0.1:8080
+warehouse=default

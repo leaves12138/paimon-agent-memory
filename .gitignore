@@ -1,0 +1,7 @@
+target/
+.idea/
+*.iml
+/paimon.properties
+/project.properties
+*.log
+*.lock

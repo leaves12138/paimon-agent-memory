@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="referrer" content="no-referrer">
+    <meta name="description" content="Paimon AI 对话数据采集与上传状态看板">
+    <title>Paimon 对话数据中心</title>
+    <link rel="stylesheet" href="./dashboard.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#data-explorer">跳到数据列表</a>
+
+    <header class="topbar">
+      <div class="brand" aria-label="Paimon 对话数据中心">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span class="brand-copy">
+          <strong>Paimon</strong>
+          <small>AI Conversation Archive</small>
+        </span>
+      </div>
+      <div class="topbar-actions">
+        <div class="freshness" id="freshness" aria-live="polite">
+          <span class="freshness-label">数据时间</span>
+          <time id="generated-at">--</time>
+        </div>
+        <button class="button button-primary" id="refresh-all" type="button">
+          <span class="refresh-symbol" aria-hidden="true">↻</span>
+          <span>刷新数据</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="page-shell">
+      <section class="hero" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">对话数据采集中心</p>
+          <h1 id="page-title">数据流转，一目了然</h1>
+          <p class="hero-copy">集中查看 Codex 与 Claude 的本地采集结果、待提交数据和已写入 Paimon 的会话历史。</p>
+        </div>
+        <div class="collector-state" id="collector-state" role="status" aria-live="polite">
+          <span class="status-orbit" aria-hidden="true"><span></span></span>
+          <span>
+            <small>采集服务</small>
+            <strong id="collector-state-text">状态获取中</strong>
+          </span>
+        </div>
+      </section>
+
+      <section class="access-banner" id="access-banner" role="alert" hidden>
+        <span class="access-mark" aria-hidden="true">钥</span>
+        <div>
+          <strong>需要安全访问地址</strong>
+          <p>当前页面没有访问凭证。请运行 <code>bin/paimon-agent dashboard-url</code> 获取访问地址，然后使用完整地址重新打开本页面。</p>
+        </div>
+      </section>
+
+      <section class="error-banner" id="global-error" role="alert" hidden>
+        <span class="error-mark" aria-hidden="true">!</span>
+        <div>
+          <strong>最近一次采集发生异常</strong>
+          <p id="global-error-message"></p>
+        </div>
+      </section>
+
+      <section class="metric-grid" aria-label="采集概览">
+        <article class="metric-card metric-card-uploaded">
+          <div class="metric-card-top">
+            <span class="metric-label">已上传会话</span>
+            <span class="metric-icon" aria-hidden="true">✓</span>
+          </div>
+          <strong class="metric-value" id="uploaded-sessions">--</strong>
+          <p>已写入 <code id="sessions-table-card">ai_chat_sessions</code></p>
+        </article>
+        <article class="metric-card metric-card-uploaded">
+          <div class="metric-card-top">
+            <span class="metric-label">已上传消息</span>
+            <span class="metric-icon" aria-hidden="true">✓</span>
+          </div>
+          <strong class="metric-value" id="uploaded-messages">--</strong>
+          <p>已写入 <code id="messages-table-card">ai_chat_messages</code></p>
+        </article>
+        <article class="metric-card metric-card-pending">
+          <div class="metric-card-top">
+            <span class="metric-label">待提交会话</span>
+            <span class="metric-icon" aria-hidden="true">…</span>
+          </div>
+          <strong class="metric-value" id="pending-sessions">--</strong>
+          <p>已采集，等待下一次提交</p>
+        </article>
+        <article class="metric-card metric-card-pending">
+          <div class="metric-card-top">
+            <span class="metric-label">待提交消息</span>
+            <span class="metric-icon" aria-hidden="true">…</span>
+          </div>
+          <strong class="metric-value" id="pending-messages">--</strong>
+          <p>包含文本与附件数据</p>
+        </article>
+      </section>
+
+      <section class="pipeline-panel" aria-label="运行与存储状态">
+        <div class="pipeline-copy">
+          <div class="section-heading compact-heading">
+            <div>
+              <p class="eyebrow">Pipeline</p>
+              <h2>采集运行状态</h2>
+            </div>
+            <span class="live-badge" id="live-badge"><span aria-hidden="true"></span><span id="live-badge-text">连接中</span></span>
+          </div>
+          <div class="pipeline-times">
+            <div>
+              <span>最近扫描</span>
+              <time id="last-scan-at">--</time>
+            </div>
+            <div>
+              <span>最近提交</span>
+              <time id="last-commit-at">--</time>
+            </div>
+          </div>
+        </div>
+        <div class="pipeline-progress">
+          <div class="progress-summary">
+            <span>消息上传进度</span>
+            <strong id="upload-progress-label">--</strong>
+          </div>
+          <progress class="progress-track" aria-label="消息上传进度" max="100" value="0" id="upload-progress">0%</progress>
+          <div class="catalog-meta">
+            <span><small>Database</small><code id="database-name">--</code></span>
+            <span><small>Sessions</small><code id="sessions-table-name">--</code></span>
+            <span><small>Messages</small><code id="messages-table-name">--</code></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="explorer-panel" id="data-explorer" aria-labelledby="explorer-title">
+        <div class="explorer-head">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Data Explorer</p>
+              <h2 id="explorer-title">数据明细</h2>
+            </div>
+            <span class="record-count" id="record-count">-- 条记录</span>
+          </div>
+          <div class="tabs" role="tablist" aria-label="数据表">
+            <button class="tab is-active" id="sessions-tab" type="button" role="tab" aria-selected="true" aria-controls="table-panel" data-tab="sessions">
+              <span>会话表</span>
+              <code>ai_chat_sessions</code>
+            </button>
+            <button class="tab" id="messages-tab" type="button" role="tab" aria-selected="false" aria-controls="table-panel" data-tab="messages" tabindex="-1">
+              <span>消息表</span>
+              <code>ai_chat_messages</code>
+            </button>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <label class="search-field">
+            <span class="search-symbol" aria-hidden="true"></span>
+            <span class="visually-hidden">搜索数据</span>
+            <input id="search-input" type="search" autocomplete="off" placeholder="搜索标题、会话 ID 或内容…">
+            <kbd>⌘ K</kbd>
+          </label>
+          <label class="select-field">
+            <span>来源</span>
+            <select id="source-filter" aria-label="按来源筛选">
+              <option value="">全部来源</option>
+              <option value="codex">Codex</option>
+              <option value="claude">Claude</option>
+            </select>
+          </label>
+          <div class="active-filter" id="session-filter-chip" hidden>
+            <span>会话</span>
+            <code id="session-filter-value"></code>
+            <button type="button" id="clear-session-filter" aria-label="清除会话筛选">×</button>
+          </div>
+          <button class="button button-quiet" id="refresh-table" type="button" aria-label="刷新当前表">
+            <span class="refresh-symbol" aria-hidden="true">↻</span>
+            <span>刷新</span>
+          </button>
+        </div>
+
+        <div class="table-panel" id="table-panel" role="tabpanel" aria-labelledby="sessions-tab" tabindex="0">
+          <div class="table-status" id="table-status" aria-live="polite"></div>
+          <div class="table-scroll">
+            <table>
+              <caption class="visually-hidden" id="table-caption">会话采集数据</caption>
+              <thead id="table-head"></thead>
+              <tbody id="table-body"></tbody>
+            </table>
+          </div>
+
+          <div class="table-state" id="loading-state" aria-live="polite" hidden>
+            <span class="loader" aria-hidden="true"></span>
+            <strong>正在读取数据</strong>
+            <p>正在汇总本地采集与 Paimon 上传记录…</p>
+          </div>
+          <div class="table-state" id="empty-state" hidden>
+            <span class="empty-glyph" aria-hidden="true"><span></span><span></span><span></span></span>
+            <strong>暂时没有匹配的数据</strong>
+            <p>可以调整搜索条件，或等待下一次采集完成。</p>
+            <button class="button button-quiet" id="clear-filters" type="button">清除筛选</button>
+          </div>
+          <div class="table-state table-error" id="error-state" role="alert" hidden>
+            <span class="error-mark" aria-hidden="true">!</span>
+            <strong>数据读取失败</strong>
+            <p id="table-error-message">请稍后重试。</p>
+            <button class="button button-quiet" id="retry-table" type="button">重新加载</button>
+          </div>
+
+          <footer class="pagination" id="pagination" hidden>
+            <label>
+              每页
+              <select id="page-size" aria-label="每页记录数" disabled>
+                <option value="">--</option>
+              </select>
+              条
+            </label>
+            <span class="pagination-summary" id="pagination-summary"></span>
+            <nav class="page-controls" aria-label="分页">
+              <button type="button" id="previous-page" aria-label="上一页">‹</button>
+              <span id="page-numbers"></span>
+              <button type="button" id="next-page" aria-label="下一页">›</button>
+            </nav>
+          </footer>
+        </div>
+      </section>
+    </main>
+
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+    <div class="preview-modal" id="preview-modal" role="dialog" aria-modal="true" aria-labelledby="preview-title" hidden>
+      <div class="preview-backdrop" data-close-preview></div>
+      <div class="preview-dialog">
+        <header>
+          <div>
+            <p class="eyebrow">Attachment Preview</p>
+            <h2 id="preview-title">附件预览</h2>
+          </div>
+          <button type="button" class="modal-close" id="close-preview" aria-label="关闭附件预览">×</button>
+        </header>
+        <div class="preview-canvas">
+          <div class="preview-loading" id="preview-loading" aria-live="polite">
+            <span class="loader" aria-hidden="true"></span>
+            <strong>正在安全加载附件</strong>
+          </div>
+          <img id="preview-image" alt="" hidden>
+        </div>
+        <p class="preview-meta" id="preview-meta"></p>
+      </div>
+    </div>
+
+    <script src="./dashboard.js" defer></script>
+  </body>
+</html>
