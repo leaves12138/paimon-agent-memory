@@ -137,7 +137,7 @@ temporarily unavailable remote attachment does not prevent other sessions from a
 
 ## Dashboard
 
-The distribution includes a token-protected, read-only web dashboard for customer demonstrations
+The distribution includes a loopback-only, read-only web dashboard for customer demonstrations
 and local inspection. With `dashboard.enabled=true`, an ordinary `bin/paimon-agent start` starts
 the collector and Dashboard in the same managed process; `bin/paimon-agent stop` stops both. Set
 `dashboard.enabled=false` to run only the collector. A one-shot
@@ -146,22 +146,17 @@ Dashboard, regardless of this setting.
 
 Both table views merge the collector's current in-memory batch with rows already visible in
 Paimon. Every expandable session and message is marked `待上传` or `已上传`; pending attachment
-bytes can be previewed through the same size-limited, authenticated endpoint. A standalone
+bytes can be previewed through the same size-limited, loopback-only endpoint. A standalone
 Dashboard has no access to another process's in-memory batch and therefore shows Paimon rows only.
 
-After starting the service, obtain the authenticated address with:
+After starting the service, open the Dashboard directly:
 
-```bash
-bin/paimon-agent dashboard-url
+```text
+http://127.0.0.1:8787/
 ```
 
-The command prints an address such as
-`http://127.0.0.1:8787/#token=<temporary-capability-token>`. Open the complete address, including
-the fragment. The fragment is not sent as part of the initial HTTP request; the page consumes it,
-removes it from the address bar, and uses it to authenticate subsequent API and attachment
-requests. The token belongs to the running process, is kept in the private `data` directory, and
-is removed when that Dashboard stops. Run `dashboard-url` again after every restart instead of
-bookmarking the authenticated address.
+No token is required. `bin/paimon-agent dashboard-url` remains available as a convenience command
+that prints the configured local address.
 
 The overview distinguishes uploaded rows from sessions and messages that still belong to an
 unfinished collector commit. The `ai_chat_sessions` and `ai_chat_messages` tabs expose both table
@@ -179,7 +174,7 @@ bin/paimon-agent dashboard
 ```
 
 This command does not acquire the collector writer lock or collect, upload, restore, or modify any
-conversation. Use `dashboard-url` from another terminal after it starts. Do not run the standalone
+conversation. Open the configured loopback address after it starts. Do not run the standalone
 command on the same host and port while the Dashboard managed by `start` is already active.
 
 The server accepts only the literal loopback addresses `127.0.0.1` and `::1`; it cannot be bound to
@@ -191,9 +186,8 @@ port through SSH:
 ssh -L 8787:127.0.0.1:8787 user@collector-host
 ```
 
-Then run `bin/paimon-agent dashboard-url` on `collector-host` and open the returned loopback URL in
-the local browser. Use the same local and remote port so the Dashboard's strict Host validation is
-preserved.
+Then open `http://127.0.0.1:8787/` in the local browser. Use the same local and remote port so the
+Dashboard's strict Host validation is preserved.
 
 ## Build
 

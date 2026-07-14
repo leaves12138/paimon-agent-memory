@@ -20,17 +20,13 @@ import java.net.URI;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.PosixFilePermission;
-import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
@@ -49,7 +45,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
-/** Token-protected, loopback-only HTTP dashboard for the two chat tables. */
+/** Loopback-only HTTP dashboard for the two chat tables. */
 public final class DashboardServer implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(DashboardServer.class);
@@ -71,9 +67,6 @@ public final class DashboardServer implements AutoCloseable {
     private final CountDownLatch stopped = new CountDownLatch(1);
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
-    private final Path tokenFile;
-    private final String accessToken;
-
     public DashboardServer(
             ProjectConfig project,
             DashboardDataStore dataStore,
@@ -102,14 +95,10 @@ public final class DashboardServer implements AutoCloseable {
                         new ArrayBlockingQueue<>(16),
                         new DashboardThreadFactory(),
                         new ThreadPoolExecutor.AbortPolicy());
-        Path createdTokenFile = null;
-        String createdAccessToken = generateToken();
         try {
             createdServer.setExecutor(createdExecutor);
             createdServer.createContext("/", this::handle);
-            Path privateData = preparePrivateDataDirectory(dataDirectory);
-            createdTokenFile = privateData.resolve("dashboard.token");
-            publishToken(createdTokenFile, createdAccessToken);
+            preparePrivateDataDirectory(dataDirectory);
         } catch (IOException | RuntimeException failure) {
             createdServer.stop(0);
             createdExecutor.shutdownNow();
@@ -117,8 +106,6 @@ public final class DashboardServer implements AutoCloseable {
         }
         this.server = createdServer;
         this.executor = createdExecutor;
-        this.tokenFile = createdTokenFile;
-        this.accessToken = createdAccessToken;
     }
 
     public URI start() {
@@ -127,9 +114,7 @@ public final class DashboardServer implements AutoCloseable {
         }
         server.start();
         URI address = address();
-        LOG.info(
-                "Dashboard listening at {} (run bin/paimon-agent dashboard-url to get an authenticated URL)",
-                address);
+        LOG.info("Dashboard listening at {}", address);
         return address;
     }
 
@@ -140,10 +125,6 @@ public final class DashboardServer implements AutoCloseable {
                         + ':'
                         + server.getAddress().getPort()
                         + '/');
-    }
-
-    public Path tokenFile() {
-        return tokenFile;
     }
 
     public void await() throws InterruptedException {
@@ -188,33 +169,22 @@ public final class DashboardServer implements AutoCloseable {
                             "text/javascript; charset=utf-8");
                     return;
                 case "/api/overview":
-                    requireApiToken(exchange);
                     handleOverview(exchange);
                     return;
                 case "/api/sessions":
-                    requireApiToken(exchange);
                     handleSessions(exchange);
                     return;
                 case "/api/messages":
-                    requireApiToken(exchange);
                     handleMessages(exchange);
                     return;
                 case "/api/messages/detail":
-                    requireApiToken(exchange);
                     handleMessageDetail(exchange);
                     return;
                 case "/api/attachments":
-                    requireApiToken(exchange);
                     handleAttachment(exchange);
                     return;
                 default:
                     sendError(exchange, 404, "Not found");
-            }
-        } catch (UnauthorizedException ignored) {
-            try {
-                sendError(exchange, 401, "Authentication required");
-            } catch (IOException sendFailure) {
-                LOG.debug("Unable to send dashboard authentication response", sendFailure);
             }
         } catch (BadRequestException error) {
             try {
@@ -594,19 +564,6 @@ public final class DashboardServer implements AutoCloseable {
         }
     }
 
-    private void requireApiToken(HttpExchange exchange) {
-        List<String> values = exchange.getRequestHeaders().get("Authorization");
-        if (values == null || values.size() != 1) {
-            throw new UnauthorizedException();
-        }
-        String expected = "Bearer " + accessToken;
-        if (!MessageDigest.isEqual(
-                expected.getBytes(StandardCharsets.UTF_8),
-                values.get(0).getBytes(StandardCharsets.UTF_8))) {
-            throw new UnauthorizedException();
-        }
-    }
-
     private boolean requestIsLocal(HttpExchange exchange) {
         InetAddress remote = exchange.getRemoteAddress().getAddress();
         if (remote == null || !remote.isLoopbackAddress()) {
@@ -880,40 +837,6 @@ public final class DashboardServer implements AutoCloseable {
         return value.toRealPath();
     }
 
-    private static String generateToken() {
-        byte[] bytes = new byte[32];
-        new SecureRandom().nextBytes(bytes);
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
-    }
-
-    private static void publishToken(Path file, String token) throws IOException {
-        if (Files.isSymbolicLink(file)) {
-            throw new IOException("Dashboard token file must not be a symbolic link: " + file);
-        }
-        Path temporary = Files.createTempFile(file.getParent(), ".dashboard-token-", ".tmp");
-        boolean installed = false;
-        try {
-            Files.writeString(temporary, token + System.lineSeparator(), StandardCharsets.UTF_8);
-            setPermissions(
-                    temporary,
-                    EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
-            try {
-                Files.move(
-                        temporary,
-                        file,
-                        StandardCopyOption.REPLACE_EXISTING,
-                        StandardCopyOption.ATOMIC_MOVE);
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
-            }
-            installed = true;
-        } finally {
-            if (!installed) {
-                Files.deleteIfExists(temporary);
-            }
-        }
-    }
-
     private static void setPermissions(Path path, Set<PosixFilePermission> permissions) {
         try {
             Files.setPosixFilePermissions(path, permissions);
@@ -969,24 +892,7 @@ public final class DashboardServer implements AutoCloseable {
                 failure.addSuppressed(terminationFailure);
             }
         }
-        try {
-            if (Files.isRegularFile(tokenFile, LinkOption.NOFOLLOW_LINKS)) {
-                String stored = Files.readString(tokenFile, StandardCharsets.UTF_8).trim();
-                if (MessageDigest.isEqual(
-                        stored.getBytes(StandardCharsets.UTF_8),
-                        accessToken.getBytes(StandardCharsets.UTF_8))) {
-                    Files.deleteIfExists(tokenFile);
-                }
-            }
-        } catch (IOException cleanupFailure) {
-            if (failure == null) {
-                failure = cleanupFailure;
-            } else {
-                failure.addSuppressed(cleanupFailure);
-            }
-        } finally {
-            stopped.countDown();
-        }
+        stopped.countDown();
         if (interrupted != null) {
             Thread.currentThread().interrupt();
         }
@@ -1010,8 +916,6 @@ public final class DashboardServer implements AutoCloseable {
             return thread;
         }
     }
-
-    private static final class UnauthorizedException extends RuntimeException {}
 
     private static final class BadRequestException extends IllegalArgumentException {
         private BadRequestException(String message) {

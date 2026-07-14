@@ -378,52 +378,6 @@ kbd {
   background: var(--red-soft);
 }
 
-.access-banner {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 18px;
-  padding: 14px 16px;
-  border: 1px solid rgba(214, 116, 50, 0.24);
-  border-radius: var(--radius-md);
-  color: #864817;
-  background: var(--orange-soft);
-}
-
-.access-banner strong {
-  font-size: 13px;
-}
-
-.access-banner p {
-  margin: 4px 0 0;
-  color: #9b5a24;
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.access-banner code {
-  padding: 2px 5px;
-  border: 1px solid rgba(214, 116, 50, 0.2);
-  border-radius: 5px;
-  color: #7d3e0f;
-  background: rgba(255, 255, 255, 0.45);
-  font-size: 10px;
-  overflow-wrap: anywhere;
-}
-
-.access-mark {
-  display: inline-grid;
-  width: 25px;
-  height: 25px;
-  flex: 0 0 auto;
-  place-items: center;
-  border-radius: 8px;
-  color: #fff;
-  background: var(--orange);
-  font-size: 10px;
-  font-weight: 750;
-}
-
 .error-banner strong {
   font-size: 13px;
 }

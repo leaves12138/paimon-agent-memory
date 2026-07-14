@@ -24,9 +24,6 @@ import org.apache.paimon.agent.source.codex.CodexConversationSource;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -57,7 +54,7 @@ public final class PaimonAgent {
             return;
         }
         if (arguments.command == Command.DASHBOARD_URL) {
-            printDashboardUrl(arguments, configuration);
+            printDashboardUrl(configuration);
             return;
         }
 
@@ -189,22 +186,7 @@ public final class PaimonAgent {
         stopped.await();
     }
 
-    private static void printDashboardUrl(
-            Arguments arguments, AgentConfiguration configuration) throws Exception {
-        Path dataDirectory = arguments.dataDirectory.toAbsolutePath().normalize();
-        if (Files.isSymbolicLink(dataDirectory)) {
-            throw new IllegalStateException(
-                    "Dashboard data directory must not be a symbolic link: " + dataDirectory);
-        }
-        Path tokenFile = dataDirectory.resolve("dashboard.token");
-        if (!Files.isRegularFile(tokenFile, LinkOption.NOFOLLOW_LINKS)) {
-            throw new IllegalStateException(
-                    "Dashboard access token was not found; start paimon-agent first: " + tokenFile);
-        }
-        String token = Files.readString(tokenFile, StandardCharsets.UTF_8).trim();
-        if (!token.matches("[A-Za-z0-9_-]{43}")) {
-            throw new IllegalStateException("Dashboard access token is invalid: " + tokenFile);
-        }
+    private static void printDashboardUrl(AgentConfiguration configuration) {
         String host = configuration.project().dashboard().host();
         if (host.indexOf(':') >= 0) {
             host = '[' + host + ']';
@@ -214,8 +196,7 @@ public final class PaimonAgent {
                         + host
                         + ':'
                         + configuration.project().dashboard().port()
-                        + "/#token="
-                        + token);
+                        + '/');
     }
 
     private static DashboardServer createDashboard(

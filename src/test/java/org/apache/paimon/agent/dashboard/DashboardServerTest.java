@@ -19,7 +19,6 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -50,7 +49,6 @@ class DashboardServerTest {
     private DashboardServer server;
     private FakeDashboardDataStore dataStore;
     private URI address;
-    private String token;
 
     @AfterEach
     void closeServer() throws Exception {
@@ -60,10 +58,10 @@ class DashboardServerTest {
     }
 
     @Test
-    void servesStaticResourcesSecurityHeadersAndTokenProtectedOverview() throws Exception {
+    void servesStaticResourcesSecurityHeadersAndOverviewWithoutAuthentication() throws Exception {
         startServer();
 
-        HttpResponse<byte[]> index = request("GET", "", null);
+        HttpResponse<byte[]> index = request("GET", "");
         assertThat(index.statusCode()).isEqualTo(200);
         assertThat(index.headers().firstValue("Content-Type"))
                 .contains("text/html; charset=utf-8");
@@ -72,29 +70,24 @@ class DashboardServerTest {
                 .contains("dashboard.css");
         assertSecurityHeaders(index);
 
-        HttpResponse<byte[]> css = request("GET", "dashboard.css", null);
+        HttpResponse<byte[]> css = request("GET", "dashboard.css");
         assertThat(css.statusCode()).isEqualTo(200);
         assertThat(css.headers().firstValue("Content-Type"))
                 .contains("text/css; charset=utf-8");
         assertThat(new String(css.body(), StandardCharsets.UTF_8)).contains(":root");
 
-        HttpResponse<byte[]> javascript = request("GET", "dashboard.js", null);
+        HttpResponse<byte[]> javascript = request("GET", "dashboard.js");
         assertThat(javascript.statusCode()).isEqualTo(200);
         assertThat(javascript.headers().firstValue("Content-Type"))
                 .contains("text/javascript; charset=utf-8");
         assertThat(new String(javascript.body(), StandardCharsets.UTF_8))
                 .contains("\"use strict\"")
-                .contains("/api");
+                .contains("/api")
+                .doesNotContain("Authorization", "dashboard-url", "capabilityToken");
 
-        HttpResponse<byte[]> missingToken = request("GET", "api/overview", null);
-        assertError(missingToken, 401, "Authentication required");
-        assertSecurityHeaders(missingToken);
-
-        HttpResponse<byte[]> wrongToken = request("GET", "api/overview", "wrong-token");
-        assertError(wrongToken, 401, "Authentication required");
-
-        HttpResponse<byte[]> overview = request("GET", "api/overview", token);
+        HttpResponse<byte[]> overview = request("GET", "api/overview");
         assertThat(overview.statusCode()).isEqualTo(200);
+        assertSecurityHeaders(overview);
         JsonNode body = json(overview);
         assertThat(body.path("database").asText()).isEqualTo("ai_memory");
         assertThat(body.path("sessionsTable").asText()).isEqualTo("ai_chat_sessions");
@@ -116,12 +109,9 @@ class DashboardServerTest {
         assertThat(body.path("lastError").asText()).isEqualTo("temporary error");
         assertThat(body.path("generatedAt").asText()).isNotEmpty();
 
-        Path tokenFile = server.tokenFile();
-        assertThat(tokenFile).exists();
-        assertThat(Files.readString(tokenFile, StandardCharsets.UTF_8).trim()).isEqualTo(token);
+        assertThat(tempDir.resolve("data/dashboard.token")).doesNotExist();
         server.close();
         server = null;
-        assertThat(tokenFile).doesNotExist();
         assertThat(dataStore.closed).isTrue();
     }
 
@@ -132,8 +122,7 @@ class DashboardServerTest {
         HttpResponse<byte[]> sessions =
                 request(
                         "GET",
-                        "api/sessions?page=2&pageSize=3&sourceType=codex&query=demo&archived=false",
-                        token);
+                        "api/sessions?page=2&pageSize=3&sourceType=codex&query=demo&archived=false");
         assertThat(sessions.statusCode()).isEqualTo(200);
         JsonNode sessionsBody = json(sessions);
         assertThat(sessionsBody.path("page").asInt()).isEqualTo(2);
@@ -157,8 +146,7 @@ class DashboardServerTest {
                 request(
                         "GET",
                         "api/messages?page=1&pageSize=4&sourceType=codex&sessionId=session-1"
-                                + "&role=user&eventType=message&query=hello",
-                        token);
+                                + "&role=user&eventType=message&query=hello");
         assertThat(messages.statusCode()).isEqualTo(200);
         JsonNode messagesBody = json(messages);
         JsonNode message = messagesBody.path("items").get(0);
@@ -174,7 +162,7 @@ class DashboardServerTest {
 
         String key =
                 "sourceType=codex&sessionId=session-1&messageId=message-1&sequenceNo=7";
-        HttpResponse<byte[]> detail = request("GET", "api/messages/detail?" + key, token);
+        HttpResponse<byte[]> detail = request("GET", "api/messages/detail?" + key);
         assertThat(detail.statusCode()).isEqualTo(200);
         JsonNode detailBody = json(detail);
         assertThat(detailBody.path("contentJson").asText()).isEqualTo("{\"text\":\"hello\"}");
@@ -189,7 +177,7 @@ class DashboardServerTest {
                 .contains("messageId=message-1");
         assertThat(dataStore.lastDetailKey).isEqualTo("codex/session-1/message-1/7");
 
-        HttpResponse<byte[]> image = request("GET", "api/attachments?" + key + "&index=0", token);
+        HttpResponse<byte[]> image = request("GET", "api/attachments?" + key + "&index=0");
         assertThat(image.statusCode()).isEqualTo(200);
         assertThat(image.headers().firstValue("Content-Type")).contains("image/png");
         assertThat(image.headers().firstValue("Content-Disposition"))
@@ -208,26 +196,40 @@ class DashboardServerTest {
         startServer();
 
         assertError(
-                request("GET", "api/sessions?page=1&page=2", token),
+                request("GET", "api/sessions?page=1&page=2"),
                 400,
                 "Duplicate query parameter: page");
         assertError(
-                request("GET", "api/sessions?unknown=value", token),
+                request("GET", "api/sessions?unknown=value"),
                 400,
                 "Unknown query parameter: unknown");
         assertError(
-                request("GET", "api/sessions?archived=maybe", token),
+                request("GET", "api/sessions?archived=maybe"),
                 400,
                 "archived must be true or false");
         assertError(
-                request("GET", "api/messages?pageSize=6", token),
+                request("GET", "api/messages?pageSize=6"),
                 400,
                 "pageSize exceeds dashboard.max-page-size=5");
 
-        HttpResponse<byte[]> post = request("POST", "api/overview", token);
+        HttpResponse<byte[]> post = request("POST", "api/overview");
         assertError(post, 405, "Only GET and HEAD are supported");
         assertThat(post.headers().firstValue("Allow")).contains("GET, HEAD");
         assertSecurityHeaders(post);
+    }
+
+    @Test
+    void rejectsCrossOriginAndCrossSiteRequests() throws Exception {
+        startServer();
+
+        assertError(
+                request("GET", "api/overview", "Origin", "http://example.invalid"),
+                403,
+                "Request rejected");
+        assertError(
+                request("GET", "api/overview", "Sec-Fetch-Site", "cross-site"),
+                403,
+                "Request rejected");
     }
 
     @Test
@@ -236,7 +238,7 @@ class DashboardServerTest {
         startServer("::1");
 
         assertThat(address.toString()).startsWith("http://[::1]:");
-        HttpResponse<byte[]> index = request("GET", "", null);
+        HttpResponse<byte[]> index = request("GET", "");
         assertThat(index.statusCode()).isEqualTo(200);
         assertThat(new String(index.body(), StandardCharsets.UTF_8))
                 .contains("Paimon 对话数据中心");
@@ -264,9 +266,6 @@ class DashboardServerTest {
                                         3),
                         objectMapper,
                         tempDir.resolve("data"));
-        Path tokenFile = server.tokenFile();
-        token = Files.readString(tokenFile, StandardCharsets.UTF_8).trim();
-        assertThat(token).hasSizeGreaterThanOrEqualTo(43);
         address = server.start();
     }
 
@@ -316,13 +315,18 @@ class DashboardServerTest {
         }
     }
 
-    private HttpResponse<byte[]> request(String method, String relativePath, String bearerToken)
+    private HttpResponse<byte[]> request(String method, String relativePath) throws Exception {
+        return request(method, relativePath, null, null);
+    }
+
+    private HttpResponse<byte[]> request(
+            String method, String relativePath, String headerName, String headerValue)
             throws Exception {
         HttpRequest.Builder request =
                 HttpRequest.newBuilder(address.resolve(relativePath))
                         .timeout(Duration.ofSeconds(5));
-        if (bearerToken != null) {
-            request.header("Authorization", "Bearer " + bearerToken);
+        if (headerName != null) {
+            request.header(headerName, headerValue);
         }
         request.method(method, HttpRequest.BodyPublishers.noBody());
         return httpClient.send(request.build(), HttpResponse.BodyHandlers.ofByteArray());

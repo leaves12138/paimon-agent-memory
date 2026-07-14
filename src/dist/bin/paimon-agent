@@ -28,7 +28,7 @@ Commands:
   status             Show whether the collector is running
   run [options]      Run the collector in the foreground
   dashboard          Run the read-only dashboard in the foreground
-  dashboard-url      Print the authenticated local dashboard URL
+  dashboard-url      Print the local dashboard URL
   restore [options]  Restore conversations from Paimon
 
 Restore options are passed to Java unchanged:

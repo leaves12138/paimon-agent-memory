@@ -1,9 +1,7 @@
 (function () {
   "use strict";
 
-  const capabilityToken = consumeCapabilityToken();
   const API_ROOT = "/api";
-  const AUTH_HELP = "请运行 bin/paimon-agent dashboard-url 获取新的安全访问地址。";
   const ALLOWED_IMAGE_TYPES = new Set([
     "image/png",
     "image/jpeg",
@@ -56,7 +54,6 @@
   };
 
   const dom = {
-    accessBanner: byId("access-banner"),
     collectorState: byId("collector-state"),
     collectorStateText: byId("collector-state-text"),
     liveBadge: byId("live-badge"),
@@ -133,28 +130,11 @@
   wireEvents();
   renderTable();
 
-  if (!capabilityToken) {
-    showMissingCapability();
-  } else {
-    initializeDashboard();
-  }
+  initializeDashboard();
 
   async function initializeDashboard() {
     await loadOverview();
     await loadTable();
-  }
-
-  function consumeCapabilityToken() {
-    const rawHash = window.location.hash;
-    let token = "";
-    if (rawHash && rawHash.length > 1) {
-      const params = new URLSearchParams(rawHash.slice(1));
-      if (params.has("token")) {
-        token = (params.get("token") || "").trim();
-        window.history.replaceState(null, document.title, window.location.pathname + window.location.search);
-      }
-    }
-    return token;
   }
 
   function createTabState() {
@@ -271,23 +251,15 @@
     return url.href;
   }
 
-  async function authorizedFetch(url, options) {
-    if (!capabilityToken) {
-      const error = new Error(AUTH_HELP);
-      error.status = 401;
-      throw error;
-    }
+  async function sameOriginFetch(url, options) {
     const requestUrl = sameOriginUrl(url);
     const requestOptions = Object.assign({}, options || {});
-    const headers = new Headers(requestOptions.headers || {});
-    headers.set("Authorization", "Bearer " + capabilityToken);
-    requestOptions.headers = headers;
     requestOptions.cache = "no-store";
     return window.fetch(requestUrl, requestOptions);
   }
 
   async function fetchJson(path, signal) {
-    const response = await authorizedFetch(path, {
+    const response = await sameOriginFetch(path, {
       method: "GET",
       headers: { Accept: "application/json" },
       signal: signal
@@ -307,8 +279,8 @@
       if (!message) {
         message = "请求失败（HTTP " + response.status + "）";
       }
-      if (response.status === 401 || response.status === 403) {
-        message = "访问凭证无效或已经过期。" + AUTH_HELP;
+      if (response.status === 403) {
+        message = "请求被拒绝，请确认正在通过本机地址访问。";
       }
       const requestError = new Error(displayValue(message));
       requestError.status = response.status;
@@ -318,9 +290,6 @@
   }
 
   async function loadOverview() {
-    if (!capabilityToken) {
-      return false;
-    }
     if (state.overviewController) {
       state.overviewController.abort();
     }
@@ -345,11 +314,6 @@
   }
 
   async function loadTable(options) {
-    if (!capabilityToken) {
-      showMissingCapability();
-      return false;
-    }
-
     const tabName = state.activeTab;
     const tab = state.tabs[tabName];
     const opts = options || {};
@@ -430,7 +394,6 @@
   function renderOverview(overview) {
     configurePagination(overview.defaultPageSize, overview.maxPageSize);
     const running = overview.collectorRunning === true || overview.collectorRunning === "true";
-    dom.accessBanner.hidden = true;
     dom.collectorState.classList.toggle("is-stopped", !running);
     dom.collectorStateText.textContent = running ? "正在运行" : "当前已停止";
     dom.liveBadge.classList.toggle("is-stopped", !running);
@@ -478,27 +441,12 @@
     showToast(friendlyError(error), true);
   }
 
-  function showMissingCapability() {
-    dom.accessBanner.hidden = false;
-    dom.collectorState.classList.add("is-stopped");
-    dom.collectorStateText.textContent = "缺少访问凭证";
-    dom.liveBadge.classList.add("is-stopped");
-    dom.liveBadgeText.textContent = "未授权";
-    dom.refreshAll.disabled = true;
-    dom.refreshTable.disabled = true;
-    const tab = state.tabs[state.activeTab];
-    tab.loading = false;
-    tab.loaded = true;
-    tab.error = AUTH_HELP;
-    renderTable();
-  }
-
   function friendlyError(error) {
     if (!error) {
       return "未知错误，请稍后重试。";
     }
-    if (error.status === 401 || error.status === 403) {
-      return "访问凭证无效或已经过期。" + AUTH_HELP;
+    if (error.status === 403) {
+      return "请求被拒绝，请确认正在通过本机地址访问。";
     }
     if (error instanceof TypeError) {
       return "无法连接采集服务，请确认服务仍在运行。";
@@ -1004,14 +952,14 @@
     const controller = new AbortController();
     state.previewController = controller;
     try {
-      const response = await authorizedFetch(attachment.previewUrl, {
+      const response = await sameOriginFetch(attachment.previewUrl, {
         method: "GET",
         headers: { Accept: mimeType },
         signal: controller.signal
       });
       if (!response.ok) {
-        const error = new Error(response.status === 401 || response.status === 403
-          ? "附件访问凭证无效或已经过期"
+        const error = new Error(response.status === 403
+          ? "附件请求被拒绝，请确认正在通过本机地址访问"
           : "附件读取失败（HTTP " + response.status + "）");
         error.status = response.status;
         throw error;
@@ -1238,10 +1186,6 @@
   }
 
   async function refreshAll() {
-    if (!capabilityToken) {
-      showMissingCapability();
-      return;
-    }
     dom.refreshAll.disabled = true;
     dom.refreshAll.classList.add("is-refreshing");
     state.detailCache.clear();
@@ -1252,10 +1196,6 @@
   }
 
   async function refreshCurrentTable() {
-    if (!capabilityToken) {
-      showMissingCapability();
-      return;
-    }
     dom.refreshTable.disabled = true;
     dom.refreshTable.classList.add("is-refreshing");
     const success = await loadTable({ clearDetails: true });
