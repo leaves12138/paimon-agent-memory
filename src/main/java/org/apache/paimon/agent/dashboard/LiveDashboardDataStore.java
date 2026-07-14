@@ -25,8 +25,6 @@ import java.util.function.Supplier;
 /** Merges the collector's immutable pending snapshot with rows already readable from Paimon. */
 public final class LiveDashboardDataStore implements DashboardDataStore {
 
-    private static final int CONTENT_PREVIEW_LENGTH = 240;
-
     private final DashboardDataStore uploaded;
     private final Supplier<PendingDataSnapshot> pendingData;
     private final int maxRows;
@@ -303,7 +301,7 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 message.sequenceNumber(),
                 message.role(),
                 message.eventType(),
-                preview(message.contentJson()),
+                DashboardContentPreview.preview(message.contentJson()),
                 message.contentJson().length(),
                 message.createdAt(),
                 message.ingestedAt(),
@@ -403,13 +401,6 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
             throw new IllegalArgumentException(
                     "pageSize must be between 1 and maxRows=" + maxRows);
         }
-    }
-
-    private static String preview(String contentJson) {
-        String compact = contentJson.replaceAll("\\s+", " ").trim();
-        return compact.length() <= CONTENT_PREVIEW_LENGTH
-                ? compact
-                : compact.substring(0, CONTENT_PREVIEW_LENGTH) + "\u2026";
     }
 
     private static String sessionKey(String sourceType, String sessionId) {

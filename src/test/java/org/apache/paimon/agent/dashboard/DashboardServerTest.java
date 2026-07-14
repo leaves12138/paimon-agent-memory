@@ -67,7 +67,11 @@ class DashboardServerTest {
                 .contains("text/html; charset=utf-8");
         assertThat(new String(index.body(), StandardCharsets.UTF_8))
                 .contains("Paimon 对话数据中心")
-                .contains("dashboard.css");
+                .contains("dashboard.css")
+                .contains("id=\"session-list\"")
+                .contains("id=\"message-list\"")
+                .contains("id=\"chat-pane\"")
+                .doesNotContain("id=\"sessions-tab\"", "id=\"messages-tab\"");
         assertSecurityHeaders(index);
 
         HttpResponse<byte[]> css = request("GET", "dashboard.css");
@@ -83,6 +87,8 @@ class DashboardServerTest {
         assertThat(new String(javascript.body(), StandardCharsets.UTF_8))
                 .contains("\"use strict\"")
                 .contains("/api")
+                .contains("selectSession")
+                .contains("loadOlderMessages")
                 .doesNotContain("Authorization", "dashboard-url", "capabilityToken");
 
         HttpResponse<byte[]> overview = request("GET", "api/overview");

@@ -10,7 +10,7 @@
     <link rel="stylesheet" href="./dashboard.css">
   </head>
   <body>
-    <a class="skip-link" href="#data-explorer">跳到数据列表</a>
+    <a class="skip-link" href="#data-explorer">跳到对话历史</a>
 
     <header class="topbar">
       <div class="brand" aria-label="Paimon 对话数据中心">
@@ -125,97 +125,127 @@
         </div>
       </section>
 
-      <section class="explorer-panel" id="data-explorer" aria-labelledby="explorer-title">
-        <div class="explorer-head">
-          <div class="section-heading">
+      <section class="conversation-workspace" id="data-explorer" aria-label="对话数据浏览器">
+        <aside class="session-sidebar" id="session-sidebar" aria-labelledby="session-sidebar-title">
+          <header class="workspace-pane-header session-sidebar-header">
             <div>
-              <p class="eyebrow">Data Explorer</p>
-              <h2 id="explorer-title">数据明细</h2>
+              <p class="eyebrow">Conversations</p>
+              <h2 id="session-sidebar-title">会话</h2>
             </div>
-            <span class="record-count" id="record-count">-- 条记录</span>
-          </div>
-          <div class="tabs" role="tablist" aria-label="数据表">
-            <button class="tab is-active" id="sessions-tab" type="button" role="tab" aria-selected="true" aria-controls="table-panel" data-tab="sessions">
-              <span>会话表</span>
-              <code>ai_chat_sessions</code>
-            </button>
-            <button class="tab" id="messages-tab" type="button" role="tab" aria-selected="false" aria-controls="table-panel" data-tab="messages" tabindex="-1">
-              <span>消息表</span>
-              <code>ai_chat_messages</code>
-            </button>
-          </div>
-        </div>
+            <span class="record-count" id="session-count" aria-live="polite">-- 个会话</span>
+          </header>
 
-        <div class="toolbar">
-          <label class="search-field">
-            <span class="search-symbol" aria-hidden="true"></span>
-            <span class="visually-hidden">搜索数据</span>
-            <input id="search-input" type="search" autocomplete="off" placeholder="搜索标题、会话 ID 或内容…">
-            <kbd>⌘ K</kbd>
-          </label>
-          <label class="select-field">
-            <span>来源</span>
-            <select id="source-filter" aria-label="按来源筛选">
-              <option value="">全部来源</option>
-              <option value="codex">Codex</option>
-              <option value="claude">Claude</option>
-            </select>
-          </label>
-          <div class="active-filter" id="session-filter-chip" hidden>
-            <span>会话</span>
-            <code id="session-filter-value"></code>
-            <button type="button" id="clear-session-filter" aria-label="清除会话筛选">×</button>
-          </div>
-          <button class="button button-quiet" id="refresh-table" type="button" aria-label="刷新当前表">
-            <span class="refresh-symbol" aria-hidden="true">↻</span>
-            <span>刷新</span>
-          </button>
-        </div>
-
-        <div class="table-panel" id="table-panel" role="tabpanel" aria-labelledby="sessions-tab" tabindex="0">
-          <div class="table-status" id="table-status" aria-live="polite"></div>
-          <div class="table-scroll">
-            <table>
-              <caption class="visually-hidden" id="table-caption">会话采集数据</caption>
-              <thead id="table-head"></thead>
-              <tbody id="table-body"></tbody>
-            </table>
-          </div>
-
-          <div class="table-state" id="loading-state" aria-live="polite" hidden>
-            <span class="loader" aria-hidden="true"></span>
-            <strong>正在读取数据</strong>
-            <p>正在汇总本地采集与 Paimon 上传记录…</p>
-          </div>
-          <div class="table-state" id="empty-state" hidden>
-            <span class="empty-glyph" aria-hidden="true"><span></span><span></span><span></span></span>
-            <strong>暂时没有匹配的数据</strong>
-            <p>可以调整搜索条件，或等待下一次采集完成。</p>
-            <button class="button button-quiet" id="clear-filters" type="button">清除筛选</button>
-          </div>
-          <div class="table-state table-error" id="error-state" role="alert" hidden>
-            <span class="error-mark" aria-hidden="true">!</span>
-            <strong>数据读取失败</strong>
-            <p id="table-error-message">请稍后重试。</p>
-            <button class="button button-quiet" id="retry-table" type="button">重新加载</button>
-          </div>
-
-          <footer class="pagination" id="pagination" hidden>
-            <label>
-              每页
-              <select id="page-size" aria-label="每页记录数" disabled>
-                <option value="">--</option>
-              </select>
-              条
+          <div class="session-toolbar">
+            <label class="workspace-search" for="session-search">
+              <span class="search-symbol" aria-hidden="true"></span>
+              <span class="visually-hidden">搜索会话</span>
+              <input id="session-search" type="search" autocomplete="off" placeholder="搜索标题、ID 或工作目录…">
+              <kbd aria-hidden="true">⌘ K</kbd>
             </label>
-            <span class="pagination-summary" id="pagination-summary"></span>
-            <nav class="page-controls" aria-label="分页">
-              <button type="button" id="previous-page" aria-label="上一页">‹</button>
-              <span id="page-numbers"></span>
-              <button type="button" id="next-page" aria-label="下一页">›</button>
-            </nav>
+            <label class="workspace-select" for="session-source-filter">
+              <span class="visually-hidden">按来源筛选会话</span>
+              <select id="session-source-filter" aria-label="按来源筛选会话">
+                <option value="">全部来源</option>
+                <option value="codex">Codex</option>
+                <option value="claude">Claude</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="pane-live-status" id="session-list-status" role="status" aria-live="polite" aria-atomic="true">尚未读取会话</div>
+          <div class="session-list-frame">
+            <ul class="session-list" id="session-list" aria-label="会话列表"></ul>
+
+            <div class="workspace-state" id="session-loading" role="status" aria-live="polite" hidden>
+              <span class="loader" aria-hidden="true"></span>
+              <strong>正在读取会话</strong>
+              <p>正在汇总本地采集与 Paimon 上传记录…</p>
+            </div>
+            <div class="workspace-state" id="session-empty" hidden>
+              <span class="empty-glyph" aria-hidden="true"><span></span><span></span><span></span></span>
+              <strong>暂时没有匹配的会话</strong>
+              <p>可以调整搜索条件，或等待下一次采集完成。</p>
+            </div>
+            <div class="workspace-state workspace-state-error" id="session-error" role="alert" hidden>
+              <span class="error-mark" aria-hidden="true">!</span>
+              <strong>会话读取失败</strong>
+              <p id="session-error-message">请稍后重试。</p>
+              <button class="button button-quiet" id="retry-sessions" type="button">重新加载</button>
+            </div>
+          </div>
+
+          <footer class="session-sidebar-footer">
+            <button class="button button-quiet load-more-button" id="load-more-sessions" type="button" hidden>加载更多会话</button>
           </footer>
-        </div>
+        </aside>
+
+        <section class="chat-pane" id="chat-pane" aria-label="聊天历史">
+          <div class="chat-empty" id="chat-empty">
+            <span class="chat-empty-glyph" aria-hidden="true"><span></span><span></span><span></span></span>
+            <h2>选择一个会话</h2>
+            <p>从左侧选择 Codex 或 Claude 会话，在这里查看完整对话与附件。</p>
+          </div>
+
+          <div class="chat-view" id="chat-view" hidden>
+            <header class="chat-header">
+              <button class="chat-back" id="chat-back" type="button" aria-label="返回会话列表">
+                <span aria-hidden="true">‹</span>
+                <span>会话</span>
+              </button>
+              <div class="chat-title-block">
+                <div class="chat-title-line">
+                  <h2 id="chat-title" tabindex="-1">会话详情</h2>
+                  <span class="source-badge is-unknown" id="chat-source">--</span>
+                  <span class="status-badge is-local" id="chat-status">--</span>
+                </div>
+                <p class="chat-path-row">
+                  <code id="chat-path">--</code>
+                  <span aria-hidden="true">·</span>
+                  <code id="chat-session-id">--</code>
+                </p>
+              </div>
+              <button class="button button-quiet chat-refresh" id="refresh-chat" type="button" aria-label="刷新当前会话">
+                <span class="refresh-symbol" aria-hidden="true">↻</span>
+                <span>刷新</span>
+              </button>
+            </header>
+
+            <div class="chat-subheader">
+              <span id="message-summary" aria-live="polite">-- 条消息</span>
+            </div>
+
+            <div class="chat-scroll" id="chat-scroll" tabindex="0">
+              <div class="chat-history">
+                <button class="button button-quiet load-older-button" id="load-older-messages" type="button" hidden>加载更早消息</button>
+                <ol class="message-list" id="message-list" role="log" aria-label="聊天历史" aria-live="off"></ol>
+
+                <div class="workspace-state message-state" id="message-loading" role="status" aria-live="polite" hidden>
+                  <span class="loader" aria-hidden="true"></span>
+                  <strong>正在读取消息</strong>
+                  <p>正在还原完整对话过程…</p>
+                </div>
+                <div class="workspace-state message-state" id="message-empty" hidden>
+                  <span class="empty-glyph" aria-hidden="true"><span></span><span></span><span></span></span>
+                  <strong>这个会话还没有消息</strong>
+                  <p>下一次采集完成后，新消息会显示在这里。</p>
+                </div>
+                <div class="workspace-state workspace-state-error message-state" id="message-error" role="alert" hidden>
+                  <span class="error-mark" aria-hidden="true">!</span>
+                  <strong>消息读取失败</strong>
+                  <p id="message-error-message">请稍后重试。</p>
+                  <button class="button button-quiet" id="retry-messages" type="button">重新加载</button>
+                </div>
+              </div>
+            </div>
+
+            <footer class="chat-footer">
+              <span id="chat-footer-count">--</span>
+              <span>只读视图 · 数据来自本地采集与 Paimon</span>
+            </footer>
+          </div>
+
+          <div class="visually-hidden" id="chat-live-status" role="status" aria-live="polite" aria-atomic="true"></div>
+        </section>
       </section>
     </main>
 

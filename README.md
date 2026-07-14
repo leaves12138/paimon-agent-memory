@@ -144,10 +144,11 @@ the collector and Dashboard in the same managed process; `bin/paimon-agent stop`
 `bin/paimon-agent run --once` always performs one collection cycle and exits without starting the
 Dashboard, regardless of this setting.
 
-Both table views merge the collector's current in-memory batch with rows already visible in
-Paimon. Every expandable session and message is marked `待上传` or `已上传`; pending attachment
-bytes can be previewed through the same size-limited, loopback-only endpoint. A standalone
-Dashboard has no access to another process's in-memory batch and therefore shows Paimon rows only.
+The conversation view merges the collector's current in-memory batch with rows already visible in
+Paimon. Sessions with a new local increment are marked `有待提交更新`, while individual messages
+are marked `待上传` or `已上传`. Pending attachment bytes can be previewed through the same
+size-limited, loopback-only endpoint. A standalone Dashboard has no access to another process's
+in-memory batch and therefore shows Paimon rows only.
 
 After starting the service, open the Dashboard directly with either loopback URL:
 
@@ -160,12 +161,14 @@ No token is required. `bin/paimon-agent dashboard-url` remains available as a co
 that prints the configured local address.
 
 The overview distinguishes uploaded rows from sessions and messages that still belong to an
-unfinished collector commit. The `ai_chat_sessions` and `ai_chat_messages` tabs expose both table
-schemas in searchable, paginated rows. Click a session or message row to expand its complete
-metadata and content. Attachment metadata is shown with its message; supported images are fetched
-from Paimon and previewed only after an explicit click. The preview is bounded by
+unfinished collector commit. The detail area follows a two-pane chat layout: searchable Codex and
+Claude sessions are listed on the left, and selecting one opens its chronological conversation on
+the right. Older messages are loaded in bounded pages without losing the current scroll position.
+Message JSON and attachment metadata are loaded only after an explicit detail click; supported
+images are then fetched from Paimon only when the user opens their preview. The preview is bounded by
 `dashboard.max-attachment-preview-size`, while `dashboard.page-size`,
-`dashboard.max-page-size`, and `dashboard.max-scan-rows` bound interactive table queries.
+`dashboard.max-page-size`, and `dashboard.max-scan-rows` bound interactive queries. On narrow
+screens the two panes become a session-list-to-chat navigation flow.
 
 To inspect the Paimon tables without running the collector, start a standalone read-only Dashboard
 in the foreground:

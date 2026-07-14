@@ -35,7 +35,6 @@ import java.util.TreeMap;
 /** Bounded, projection-aware dashboard reads over the Paimon chat tables. */
 public final class PaimonDashboardDataStore implements DashboardDataStore {
 
-    private static final int CONTENT_PREVIEW_LENGTH = 240;
     private static final int[] SESSION_COLUMNS =
             new int[] {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
     private static final int[] SESSION_OVERVIEW_COLUMNS = new int[] {0, 4, 8, 13};
@@ -511,17 +510,10 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                 row.isNullAt(3) ? 0L : row.getLong(3),
                 nullableString(row, 4),
                 nullableString(row, 5),
-                preview(contentJson),
+                DashboardContentPreview.preview(contentJson),
                 contentJson.length(),
                 nullableTimestamp(row, 7),
                 nullableTimestamp(row, 8));
-    }
-
-    private static String preview(String contentJson) {
-        String compact = contentJson.replaceAll("\\s+", " ").trim();
-        return compact.length() <= CONTENT_PREVIEW_LENGTH
-                ? compact
-                : compact.substring(0, CONTENT_PREVIEW_LENGTH) + "\u2026";
     }
 
     private static boolean matchesSessionExact(
