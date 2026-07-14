@@ -89,6 +89,9 @@ class DashboardServerTest {
                 .contains("/api")
                 .contains("selectSession")
                 .contains("loadOlderMessages")
+                .contains("refresh=true")
+                .contains("foundVisibleMessage")
+                .contains("MAX_AUTO_HIDDEN_TOOL_PAGES = 3")
                 .doesNotContain("Authorization", "dashboard-url", "capabilityToken");
 
         HttpResponse<byte[]> overview = request("GET", "api/overview");
@@ -128,7 +131,8 @@ class DashboardServerTest {
         HttpResponse<byte[]> sessions =
                 request(
                         "GET",
-                        "api/sessions?page=2&pageSize=3&sourceType=codex&query=demo&archived=false");
+                        "api/sessions?page=2&pageSize=3&sourceType=codex&query=demo"
+                                + "&archived=false&refresh=true");
         assertThat(sessions.statusCode()).isEqualTo(200);
         JsonNode sessionsBody = json(sessions);
         assertThat(sessionsBody.path("page").asInt()).isEqualTo(2);
@@ -147,12 +151,13 @@ class DashboardServerTest {
         assertThat(dataStore.lastSessionQuery.getArchived()).isFalse();
         assertThat(dataStore.lastSessionQuery.getPage()).isEqualTo(2);
         assertThat(dataStore.lastSessionQuery.getPageSize()).isEqualTo(3);
+        assertThat(dataStore.invalidations).isEqualTo(1);
 
         HttpResponse<byte[]> messages =
                 request(
                         "GET",
                         "api/messages?page=1&pageSize=4&sourceType=codex&sessionId=session-1"
-                                + "&role=user&eventType=message&query=hello");
+                                + "&role=user&eventType=message&query=hello&refresh=true");
         assertThat(messages.statusCode()).isEqualTo(200);
         JsonNode messagesBody = json(messages);
         JsonNode message = messagesBody.path("items").get(0);
@@ -165,6 +170,7 @@ class DashboardServerTest {
         assertThat(dataStore.lastMessageQuery.getRole()).isEqualTo("user");
         assertThat(dataStore.lastMessageQuery.getEventType()).isEqualTo("message");
         assertThat(dataStore.lastMessageQuery.getSearch()).isEqualTo("hello");
+        assertThat(dataStore.invalidations).isEqualTo(2);
 
         String key =
                 "sourceType=codex&sessionId=session-1&messageId=message-1&sequenceNo=7";
@@ -217,6 +223,10 @@ class DashboardServerTest {
                 request("GET", "api/messages?pageSize=6"),
                 400,
                 "pageSize exceeds dashboard.max-page-size=5");
+        assertError(
+                request("GET", "api/messages?refresh=now"),
+                400,
+                "refresh must be true or false");
 
         HttpResponse<byte[]> post = request("POST", "api/overview");
         assertError(post, 405, "Only GET and HEAD are supported");
@@ -409,6 +419,7 @@ class DashboardServerTest {
         private String lastDetailKey;
         private String lastAttachmentKey;
         private long lastAttachmentMaxBytes;
+        private int invalidations;
 
         @Override
         public DashboardOverview overview() {
@@ -517,6 +528,11 @@ class DashboardServerTest {
                             + index;
             lastAttachmentMaxBytes = maxBytes;
             return Optional.of(new AttachmentData(PNG, "image/png", "pixel demo.png"));
+        }
+
+        @Override
+        public void invalidate() {
+            invalidations++;
         }
 
         @Override

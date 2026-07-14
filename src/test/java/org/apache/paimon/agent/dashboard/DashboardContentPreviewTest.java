@@ -3,6 +3,7 @@ package org.apache.paimon.agent.dashboard;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class DashboardContentPreviewTest {
 
@@ -18,7 +19,7 @@ class DashboardContentPreviewTest {
                         + "\"role\":\"assistant\",\"content\":["
                         + "{\"type\":\"output_text\",\"text\":\"Here is the answer.\"}]}}";
 
-        assertThat(DashboardContentPreview.preview(user)).isEqualTo("hello world · 图片");
+        assertThat(DashboardContentPreview.preview(user)).isEqualTo("hello\nworld · 图片");
         assertThat(DashboardContentPreview.preview(assistant)).isEqualTo("Here is the answer.");
     }
 
@@ -79,7 +80,7 @@ class DashboardContentPreviewTest {
                         + "\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\","
                         + "\"input\":{\"command\":\"pwd\"}}]}}";
 
-        assertThat(DashboardContentPreview.preview(text)).isEqualTo("first line second line");
+        assertThat(DashboardContentPreview.preview(text)).isEqualTo("first line\nsecond line");
         assertThat(DashboardContentPreview.preview(tool))
                 .isEqualTo("调用工具 Bash: command=pwd");
     }
@@ -203,6 +204,18 @@ class DashboardContentPreviewTest {
     }
 
     @Test
+    void preservesMarkdownParagraphListAndFenceLineBreaks() {
+        String json =
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{"
+                        + "\"type\":\"text\",\"text\":\"# Result\\r\\n\\r\\n"
+                        + "- first\\n- second\\n\\n```java\\nint answer = 42;\\n```\"}]}}";
+
+        assertThat(DashboardContentPreview.previewMessage(json, "assistant", "message"))
+                .isEqualTo(
+                        "# Result\n\n- first\n- second\n\n```java\nint answer = 42;\n```");
+    }
+
+    @Test
     void fallsBackForMalformedJsonAndNeverExceedsLimit() {
         String malformed = "  {broken   " + "x".repeat(300) + "  ";
 
@@ -210,5 +223,38 @@ class DashboardContentPreviewTest {
 
         assertThat(preview).startsWith("{broken xx").endsWith("…");
         assertThat(preview.codePointCount(0, preview.length())).isEqualTo(240);
+    }
+
+    @Test
+    void supportsLongConversationPreviewsWhileKeepingToolEventsShort() {
+        String json =
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{"
+                        + "\"type\":\"text\",\"text\":\""
+                        + "x".repeat(5_000)
+                        + "\"}]}}";
+
+        String normal = DashboardContentPreview.preview(json);
+        String explicit = DashboardContentPreview.preview(json, 4_096);
+        String user = DashboardContentPreview.previewMessage(json, "user", "message");
+        String claudeAssistant =
+                DashboardContentPreview.previewMessage(json, "assistant", "assistant");
+        String assistant =
+                DashboardContentPreview.previewMessage(
+                        json, "assistant", "assistant_message");
+        String tool =
+                DashboardContentPreview.previewMessage(
+                        json, "assistant", "custom_tool_call");
+
+        assertThat(normal.codePointCount(0, normal.length())).isEqualTo(240);
+        assertThat(explicit).endsWith("…");
+        assertThat(explicit.codePointCount(0, explicit.length())).isEqualTo(4_096);
+        assertThat(user.codePointCount(0, user.length())).isEqualTo(4_096);
+        assertThat(claudeAssistant.codePointCount(0, claudeAssistant.length()))
+                .isEqualTo(4_096);
+        assertThat(assistant.codePointCount(0, assistant.length())).isEqualTo(4_096);
+        assertThat(tool.codePointCount(0, tool.length())).isEqualTo(240);
+        assertThat(DashboardContentPreview.messageLimit("tool", "message")).isEqualTo(240);
+        assertThatThrownBy(() -> DashboardContentPreview.preview(json, 0))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 }

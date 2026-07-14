@@ -225,7 +225,9 @@ public final class DashboardServer implements AutoCloseable {
     }
 
     private void handleOverview(HttpExchange exchange) throws Exception {
-        requireOnly(parameters(exchange), Collections.emptySet());
+        Map<String, List<String>> values = parameters(exchange);
+        requireOnly(values, Set.of("refresh"));
+        refreshIfRequested(values);
         DashboardOverview uploaded = withScanSlot(dataStore::overview);
         CollectorStatus status = collectorStatus.get();
         long durablePending = uploaded.getPendingSessionCount();
@@ -261,12 +263,15 @@ public final class DashboardServer implements AutoCloseable {
 
     private void handleSessions(HttpExchange exchange) throws Exception {
         Map<String, List<String>> values = parameters(exchange);
-        requireOnly(values, Set.of("page", "pageSize", "sourceType", "query", "archived"));
+        requireOnly(
+                values,
+                Set.of("page", "pageSize", "sourceType", "query", "archived", "refresh"));
         int page = positiveInt(single(values, "page", "1"), "page");
         int pageSize = pageSize(values);
         String sourceType = optionalFilter(values, "sourceType");
         String search = optionalFilter(values, "query");
         Boolean archived = optionalBoolean(values, "archived");
+        refreshIfRequested(values);
         DashboardPage<DashboardSession> result =
                 withScanSlot(
                         () ->
@@ -295,19 +300,26 @@ public final class DashboardServer implements AutoCloseable {
                         "sessionId",
                         "role",
                         "eventType",
-                        "query"));
+                        "query",
+                        "refresh"));
         int page = positiveInt(single(values, "page", "1"), "page");
         int pageSize = pageSize(values);
+        String sourceType = optionalFilter(values, "sourceType");
+        String sessionId = optionalFilter(values, "sessionId");
+        String role = optionalFilter(values, "role");
+        String eventType = optionalFilter(values, "eventType");
+        String search = optionalFilter(values, "query");
+        refreshIfRequested(values);
         DashboardPage<DashboardMessage> result =
                 withScanSlot(
                         () ->
                                 dataStore.listMessages(
                                         new MessageQuery(
-                                                optionalFilter(values, "sourceType"),
-                                                optionalFilter(values, "sessionId"),
-                                                optionalFilter(values, "role"),
-                                                optionalFilter(values, "eventType"),
-                                                optionalFilter(values, "query"),
+                                                sourceType,
+                                                sessionId,
+                                                role,
+                                                eventType,
+                                                search,
                                                 page,
                                                 pageSize)));
         List<Map<String, Object>> items = new ArrayList<>();
@@ -315,6 +327,13 @@ public final class DashboardServer implements AutoCloseable {
             items.add(message(message));
         }
         sendJson(exchange, 200, page(result, items));
+    }
+
+    private void refreshIfRequested(Map<String, List<String>> values)
+            throws BadRequestException {
+        if (Boolean.TRUE.equals(optionalBoolean(values, "refresh"))) {
+            dataStore.invalidate();
+        }
     }
 
     private void handleMessageDetail(HttpExchange exchange) throws Exception {

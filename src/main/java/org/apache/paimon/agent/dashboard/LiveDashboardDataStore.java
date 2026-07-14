@@ -14,12 +14,14 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /** Merges the collector's immutable pending snapshot with rows already readable from Paimon. */
@@ -30,6 +32,9 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
     private final int maxRows;
     private final ObjectMapper objectMapper;
 
+    private boolean pendingStateObserved;
+    private boolean pendingWasNonEmpty;
+    private long pendingCommitIdentifier = -1L;
     private volatile boolean closed;
 
     public LiveDashboardDataStore(
@@ -48,6 +53,7 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
     @Override
     public DashboardOverview overview() throws Exception {
         ensureOpen();
+        snapshot();
         return uploaded.overview();
     }
 
@@ -65,15 +71,36 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                                 query.getArchived(),
                                 1,
                                 maxRows));
+        Set<String> pendingSubagentKeys = new HashSet<>();
+        for (SessionBatch batch : pending.batches()) {
+            ChatSession session = batch.session();
+            if (session.subagentSourceJson() != null) {
+                pendingSubagentKeys.add(
+                        sessionKey(session.key().sourceType(), session.key().sessionId()));
+            }
+        }
         Map<String, DashboardSession> rows = new LinkedHashMap<>();
         for (DashboardSession session : uploadedPage.getItems()) {
-            rows.put(sessionKey(session.getSourceType(), session.getSessionId()), session);
+            String key = sessionKey(session.getSourceType(), session.getSessionId());
+            if (session.getSubagentSourceJson() == null
+                    && !pendingSubagentKeys.contains(key)) {
+                rows.put(key, session);
+            }
         }
         for (SessionBatch batch : pending.batches()) {
             ChatSession session = batch.session();
+            String key =
+                    sessionKey(session.key().sourceType(), session.key().sessionId());
+            if (pendingSubagentKeys.contains(key)) {
+                // A legacy uploaded row can still have a null marker until the schema backfill
+                // reaches it. The pending snapshot is newer, so use it as a tombstone for the
+                // sidebar instead of briefly showing the subagent as a top-level session.
+                rows.remove(key);
+                continue;
+            }
             if (matches(session, query)) {
                 DashboardSession row = pendingSession(session, pending.commitIdentifier());
-                rows.put(sessionKey(row.getSourceType(), row.getSessionId()), row);
+                rows.put(key, row);
             }
         }
 
@@ -268,9 +295,30 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 DashboardStorageStatus.PENDING);
     }
 
-    private PendingDataSnapshot snapshot() {
+    private synchronized PendingDataSnapshot snapshot() {
         PendingDataSnapshot value = pendingData.get();
-        return value == null ? PendingDataSnapshot.empty() : value;
+        value = value == null ? PendingDataSnapshot.empty() : value;
+        boolean nonEmpty = !value.isEmpty();
+        long commitIdentifier = nonEmpty ? value.commitIdentifier() : -1L;
+        if (pendingStateObserved
+                && pendingWasNonEmpty
+                && (!nonEmpty || commitIdentifier != pendingCommitIdentifier)) {
+            // pendingData() is synchronized with CollectorService.commitPending(). Once its
+            // commit identifier advances (or the buffer becomes empty), the Paimon commit has
+            // completed. Drop uploaded caches before removing the overlay, otherwise newly
+            // committed rows can disappear for the cache TTL.
+            uploaded.invalidate();
+        }
+        pendingStateObserved = true;
+        pendingWasNonEmpty = nonEmpty;
+        pendingCommitIdentifier = commitIdentifier;
+        return value;
+    }
+
+    @Override
+    public void invalidate() {
+        ensureOpen();
+        uploaded.invalidate();
     }
 
     private static DashboardSession pendingSession(ChatSession session, long commitIdentifier) {
@@ -290,6 +338,7 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 session.updatedAt(),
                 session.lastMessageAt(),
                 session.ingestedAt(),
+                session.subagentSourceJson(),
                 DashboardStorageStatus.PENDING);
     }
 
@@ -301,7 +350,8 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 message.sequenceNumber(),
                 message.role(),
                 message.eventType(),
-                DashboardContentPreview.preview(message.contentJson()),
+                DashboardContentPreview.previewMessage(
+                        message.contentJson(), message.role(), message.eventType()),
                 message.contentJson().length(),
                 message.createdAt(),
                 message.ingestedAt(),

@@ -5,6 +5,7 @@ import org.apache.paimon.agent.model.ChatSession;
 import org.apache.paimon.agent.model.SessionKey;
 import org.apache.paimon.agent.sink.ChatRepository;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,10 +17,12 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -44,21 +47,26 @@ public final class RestoreService {
 
     public RestoreSummary restore(RestoreOptions options) throws Exception {
         List<ChatSession> candidates = selectSessions(options);
-        int pendingSessions = 0;
+        Set<String> blockedByPending = pendingSessionsAndDescendants(options.type(), candidates);
         List<ChatSession> stableCandidates = new ArrayList<>();
         for (ChatSession session : candidates) {
-            if (session.hasPendingCommit()) {
-                pendingSessions++;
-                LOG.warn(
-                        "Skipping {} session {} because its Paimon commit is still pending; retry after collection completes",
-                        options.type(),
-                        session.key().sessionId());
+            if (blockedByPending.contains(session.key().sessionId())) {
+                if (options.type() == RestoreType.CODEX) {
+                    LOG.warn(
+                            "Skipping CODEX session {} because it or a Codex ancestor has a Paimon commit still pending; retry after collection completes",
+                            session.key().sessionId());
+                } else {
+                    LOG.warn(
+                            "Skipping {} session {} because its Paimon commit is still pending; retry after collection completes",
+                            options.type(),
+                            session.key().sessionId());
+                }
             } else {
                 stableCandidates.add(session);
             }
         }
         if (stableCandidates.isEmpty()) {
-            return new RestoreSummary(0, 0, pendingSessions);
+            return new RestoreSummary(0, 0, blockedByPending.size());
         }
 
         Files.createDirectories(options.dataDirectory());
@@ -74,8 +82,11 @@ public final class RestoreService {
 
         boolean complete = false;
         try (ConversationFormatRestorer format = createFormatRestorer(options)) {
+            // Keep the complete graph available to Codex even when a pending branch is skipped;
+            // the visible root still needs native V2 multi-agent metadata.
+            format.prepare(candidates);
             Map<String, ChatSession> selected = new HashMap<>();
-            int skippedSessions = pendingSessions;
+            int skippedSessions = blockedByPending.size();
             for (ChatSession session : stableCandidates) {
                 boolean exists = format.exists(session);
                 if (!options.overwrite() && exists) {
@@ -153,7 +164,9 @@ public final class RestoreService {
 
             List<ChatSession> orderedSessions = new ArrayList<>(selected.values());
             orderedSessions.sort(
-                    Comparator.comparing(
+                    Comparator.<ChatSession>comparingInt(
+                                    session -> restoreDepth(session, selected))
+                            .thenComparing(
                                     ChatSession::createdAt,
                                     Comparator.nullsLast(Comparator.naturalOrder()))
                             .thenComparing(session -> session.key().sessionId()));
@@ -185,27 +198,200 @@ public final class RestoreService {
     }
 
     private List<ChatSession> selectSessions(RestoreOptions options) throws Exception {
-        List<ChatSession> sessions =
-                repository.loadSessions().values().stream()
-                        .filter(
-                                session ->
-                                        options.type()
-                                                .sourceType()
-                                                .equals(session.key().sourceType()))
-                        .filter(
-                                session ->
-                                        options.sessionId() == null
-                                                || options.sessionId()
-                                                        .equals(session.key().sessionId()))
-                        .collect(Collectors.toList());
-        if (options.sessionId() != null && sessions.isEmpty()) {
+        Map<String, ChatSession> available = new LinkedHashMap<>();
+        for (ChatSession session : repository.loadSessions().values()) {
+            if (options.type().sourceType().equals(session.key().sourceType())) {
+                available.put(session.key().sessionId(), session);
+            }
+        }
+        if (options.sessionId() == null) {
+            if (options.type() == RestoreType.CODEX) {
+                validateCodexGraph(available);
+            }
+            return new ArrayList<>(available.values());
+        }
+
+        ChatSession requested = available.get(options.sessionId());
+        if (requested == null) {
             throw new IllegalArgumentException(
                     "No "
                             + options.type().sourceType()
                             + " session found with id "
                             + options.sessionId());
         }
-        return sessions;
+
+        if (options.type() != RestoreType.CODEX) {
+            return java.util.Collections.singletonList(requested);
+        }
+
+        Map<String, String> parents = validateCodexGraph(available);
+        String rootId = rootSessionId(requested.key().sessionId(), available, parents);
+        Map<String, ChatSession> selected = new LinkedHashMap<>();
+        selected.put(rootId, available.get(rootId));
+
+        // A Codex task can own hidden subagent threads. Restoring only the visible root must also
+        // install its native descendants so references and future resume behavior remain intact.
+        // Supplying a hidden child ID resolves to its complete visible root task as well.
+        ArrayDeque<String> pendingParents = new ArrayDeque<>();
+        pendingParents.add(rootId);
+        while (!pendingParents.isEmpty()) {
+            String parent = pendingParents.removeFirst();
+            for (ChatSession candidate : available.values()) {
+                String id = candidate.key().sessionId();
+                if (selected.containsKey(id)
+                        || !parent.equals(parents.get(id))) {
+                    continue;
+                }
+                selected.put(id, candidate);
+                pendingParents.addLast(id);
+            }
+        }
+        return new ArrayList<>(selected.values());
+    }
+
+    private Set<String> pendingSessionsAndDescendants(
+            RestoreType type, List<ChatSession> candidates) {
+        Set<String> blocked = new HashSet<>();
+        for (ChatSession session : candidates) {
+            if (session.hasPendingCommit()) {
+                blocked.add(session.key().sessionId());
+            }
+        }
+        if (type != RestoreType.CODEX || blocked.isEmpty()) {
+            return blocked;
+        }
+
+        boolean changed;
+        do {
+            changed = false;
+            for (ChatSession session : candidates) {
+                String parent = parentSessionId(session);
+                if (parent != null
+                        && blocked.contains(parent)
+                        && blocked.add(session.key().sessionId())) {
+                    changed = true;
+                }
+            }
+        } while (changed);
+        return blocked;
+    }
+
+    private Map<String, String> validateCodexGraph(Map<String, ChatSession> sessions) {
+        Map<String, String> parents = new HashMap<>();
+        for (ChatSession session : sessions.values()) {
+            String id = session.key().sessionId();
+            String parent = parentSessionId(session);
+            if (session.subagentSourceJson() != null && parent == null) {
+                throw new IllegalStateException(
+                        "Codex subagent session " + id + " is missing parent_thread_id");
+            }
+            if (parent != null && !sessions.containsKey(parent)) {
+                throw new IllegalStateException(
+                        "Codex subagent session "
+                                + id
+                                + " references missing parent session "
+                                + parent);
+            }
+            parents.put(id, parent);
+        }
+        for (String id : sessions.keySet()) {
+            rootSessionId(id, sessions, parents);
+        }
+        return parents;
+    }
+
+    private static String rootSessionId(
+            String sessionId,
+            Map<String, ChatSession> sessions,
+            Map<String, String> parents) {
+        Set<String> visited = new HashSet<>();
+        String current = sessionId;
+        while (visited.add(current)) {
+            String parent = parents.get(current);
+            if (parent == null) {
+                return current;
+            }
+            if (!sessions.containsKey(parent)) {
+                throw new IllegalStateException(
+                        "Codex subagent session "
+                                + current
+                                + " references missing parent session "
+                                + parent);
+            }
+            current = parent;
+        }
+        throw new IllegalStateException(
+                "Cycle in restored Codex subagent metadata at session " + sessionId);
+    }
+
+    private int restoreDepth(ChatSession session, Map<String, ChatSession> selected) {
+        int depth = 0;
+        Set<String> visited = new HashSet<>();
+        String current = session.key().sessionId();
+        while (visited.add(current)) {
+            ChatSession value = selected.get(current);
+            if (value == null) {
+                break;
+            }
+            String parent = parentSessionId(value);
+            if (parent == null || !selected.containsKey(parent)) {
+                return depth;
+            }
+            depth++;
+            current = parent;
+        }
+        throw new IllegalStateException(
+                "Cycle in restored Codex subagent metadata at session "
+                        + session.key().sessionId());
+    }
+
+    private String parentSessionId(ChatSession session) {
+        String value = session.subagentSourceJson();
+        if (value == null || value.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            JsonNode source = objectMapper.readTree(value);
+            if (source == null || !source.isObject()) {
+                throw new IOException("subagent source is not a JSON object");
+            }
+            return findText(source, "parent_thread_id");
+        } catch (IOException failure) {
+            throw new IllegalStateException(
+                    "Invalid Codex subagent source metadata for session "
+                            + session.key().sessionId(),
+                    failure);
+        }
+    }
+
+    private static String findText(JsonNode node, String field) {
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (node.isObject()) {
+            JsonNode direct = node.get(field);
+            if (direct != null && !direct.isNull() && direct.isValueNode()) {
+                String value = direct.asText();
+                if (!value.trim().isEmpty()) {
+                    return value;
+                }
+            }
+            java.util.Iterator<JsonNode> children = node.elements();
+            while (children.hasNext()) {
+                String value = findText(children.next(), field);
+                if (value != null) {
+                    return value;
+                }
+            }
+        } else if (node.isArray()) {
+            for (JsonNode child : node) {
+                String value = findText(child, field);
+                if (value != null) {
+                    return value;
+                }
+            }
+        }
+        return null;
     }
 
     private void verifyStableSnapshot(Map<String, ChatSession> selected) throws Exception {

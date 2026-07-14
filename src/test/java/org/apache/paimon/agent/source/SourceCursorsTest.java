@@ -11,15 +11,27 @@ class SourceCursorsTest {
         String earlier = SourceCursors.file(100L, "same-file", "duplicate-anchor");
         String boundary = SourceCursors.file(200L, "same-file", "duplicate-anchor");
 
-        assertThat(SourceCursors.samePosition(earlier, boundary)).isFalse();
-        assertThat(SourceCursors.samePosition(boundary, boundary)).isTrue();
+        assertThat(SourceCursors.samePhysicalPosition(earlier, boundary)).isFalse();
+        assertThat(SourceCursors.sameLogicalBoundary(earlier, boundary)).isFalse();
+        assertThat(SourceCursors.samePhysicalPosition(boundary, boundary)).isTrue();
+        assertThat(SourceCursors.sameLogicalBoundary(boundary, boundary)).isTrue();
     }
 
     @Test
-    void acceptsAnAnchorRemappedAcrossAReplacedFile() {
+    void treatsAPhysicalAdvanceAsProgressAfterFileReplacementEvenWithTheSameAnchor() {
         String oldFile = SourceCursors.file(200L, "old-file", "boundary-anchor");
         String newFile = SourceCursors.file(240L, "new-file", "boundary-anchor");
 
-        assertThat(SourceCursors.samePosition(oldFile, newFile)).isTrue();
+        assertThat(SourceCursors.samePhysicalPosition(oldFile, newFile)).isFalse();
+        assertThat(SourceCursors.sameLogicalBoundary(oldFile, newFile)).isTrue();
+    }
+
+    @Test
+    void acceptsTheSameAnchorRemappedAtTheSameOffsetAcrossAReplacedFile() {
+        String oldFile = SourceCursors.file(200L, "old-file", "boundary-anchor");
+        String newFile = SourceCursors.file(200L, "new-file", "boundary-anchor");
+
+        assertThat(SourceCursors.samePhysicalPosition(oldFile, newFile)).isFalse();
+        assertThat(SourceCursors.sameLogicalBoundary(oldFile, newFile)).isTrue();
     }
 }

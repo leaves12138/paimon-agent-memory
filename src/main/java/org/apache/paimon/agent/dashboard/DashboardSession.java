@@ -19,6 +19,7 @@ public final class DashboardSession {
     private final Instant updatedAt;
     private final Instant lastMessageAt;
     private final Instant ingestedAt;
+    private final String subagentSourceJson;
     private final DashboardStorageStatus storageStatus;
 
     public DashboardSession(
@@ -51,6 +52,7 @@ public final class DashboardSession {
                 updatedAt,
                 lastMessageAt,
                 ingestedAt,
+                null,
                 pendingCommitId == null
                         ? DashboardStorageStatus.UPLOADED
                         : DashboardStorageStatus.PENDING);
@@ -72,6 +74,42 @@ public final class DashboardSession {
             Instant lastMessageAt,
             Instant ingestedAt,
             DashboardStorageStatus storageStatus) {
+        this(
+                sourceType,
+                sessionId,
+                title,
+                cwd,
+                archived,
+                sourcePath,
+                sourceCursor,
+                lastCommitId,
+                pendingCommitId,
+                pendingCursor,
+                createdAt,
+                updatedAt,
+                lastMessageAt,
+                ingestedAt,
+                null,
+                storageStatus);
+    }
+
+    public DashboardSession(
+            String sourceType,
+            String sessionId,
+            String title,
+            String cwd,
+            boolean archived,
+            String sourcePath,
+            String sourceCursor,
+            long lastCommitId,
+            Long pendingCommitId,
+            String pendingCursor,
+            Instant createdAt,
+            Instant updatedAt,
+            Instant lastMessageAt,
+            Instant ingestedAt,
+            String subagentSourceJson,
+            DashboardStorageStatus storageStatus) {
         this.sourceType = sourceType;
         this.sessionId = sessionId;
         this.title = title;
@@ -86,6 +124,7 @@ public final class DashboardSession {
         this.updatedAt = updatedAt;
         this.lastMessageAt = lastMessageAt;
         this.ingestedAt = ingestedAt;
+        this.subagentSourceJson = subagentSourceJson;
         this.storageStatus = storageStatus;
     }
 
@@ -143,6 +182,10 @@ public final class DashboardSession {
 
     public Instant getIngestedAt() {
         return ingestedAt;
+    }
+
+    public String getSubagentSourceJson() {
+        return subagentSourceJson;
     }
 
     public DashboardStorageStatus getStorageStatus() {

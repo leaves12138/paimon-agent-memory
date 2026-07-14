@@ -12,6 +12,7 @@ import org.apache.paimon.agent.source.JsonlRecord;
 import org.apache.paimon.agent.source.JsonlTailReader;
 import org.apache.paimon.agent.source.IncrementalFiles;
 import org.apache.paimon.agent.source.ResolvedAttachments;
+import org.apache.paimon.agent.source.ScanFileSnapshot;
 import org.apache.paimon.agent.source.SourceCursors;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -78,12 +79,35 @@ public final class CodexConversationSource implements ConversationSource {
             int maxRecords,
             Set<SessionKey> onlySessions)
             throws Exception {
+        try (ScanCycle cycle = openScanCycle()) {
+            return cycle.scan(checkpoints, maxRecords, onlySessions);
+        }
+    }
+
+    @Override
+    public ScanCycle openScanCycle() throws Exception {
+        ScanWindow window = captureScanWindow();
+        return new ScanCycle() {
+            @Override
+            public List<SessionBatch> scan(
+                    Map<SessionKey, ChatSession> checkpoints,
+                    int maxRecords,
+                    Set<SessionKey> onlySessions)
+                    throws Exception {
+                return scanWindow(window, checkpoints, maxRecords, onlySessions);
+            }
+        };
+    }
+
+    private ScanWindow captureScanWindow() throws Exception {
         if (!Files.isDirectory(codexHome)) {
             LOG.warn("Codex home does not exist: {}", codexHome);
-            return java.util.Collections.emptyList();
+            return new ScanWindow(
+                    java.util.Collections.emptyList(), java.util.Collections.emptyMap());
         }
 
         Map<String, CodexThread> threads = loadThreads();
+        applyCanonicalRolloutMetadata(threads);
         addUnindexedRollouts(threads);
         List<CodexThread> ordered =
                 threads.values().stream()
@@ -92,10 +116,32 @@ public final class CodexConversationSource implements ConversationSource {
                                         CodexThread::updatedAt,
                                         Comparator.nullsLast(Comparator.reverseOrder())))
                         .collect(Collectors.toList());
+        Map<Path, ScanFileSnapshot> files = new HashMap<>();
+        for (CodexThread thread : ordered) {
+            try {
+                ScanFileSnapshot snapshot = ScanFileSnapshot.capture(thread.rolloutPath);
+                if (snapshot != null) {
+                    files.put(thread.rolloutPath, snapshot);
+                }
+            } catch (IOException e) {
+                LOG.debug(
+                        "Codex rollout disappeared while opening the scan cycle: {}",
+                        thread.rolloutPath,
+                        e);
+            }
+        }
+        return new ScanWindow(ordered, files);
+    }
 
+    private List<SessionBatch> scanWindow(
+            ScanWindow window,
+            Map<SessionKey, ChatSession> checkpoints,
+            int maxRecords,
+            Set<SessionKey> onlySessions)
+            throws Exception {
         List<SessionBatch> batches = new ArrayList<>();
         int remaining = maxRecords;
-        int threadCount = ordered.size();
+        int threadCount = window.threads.size();
         int threadStart = threadCount == 0 ? 0 : Math.floorMod(nextThreadIndex, threadCount);
         if (threadCount > 0) {
             nextThreadIndex = (threadStart + 1) % threadCount;
@@ -104,7 +150,8 @@ public final class CodexConversationSource implements ConversationSource {
             if (remaining <= 0) {
                 break;
             }
-            CodexThread thread = ordered.get((threadStart + threadOffset) % threadCount);
+            CodexThread thread =
+                    window.threads.get((threadStart + threadOffset) % threadCount);
             SessionKey key = new SessionKey(SOURCE_TYPE, thread.sessionId);
             if (!onlySessions.isEmpty() && !onlySessions.contains(key)) {
                 continue;
@@ -112,7 +159,12 @@ public final class CodexConversationSource implements ConversationSource {
             ChatSession previous = checkpoints.get(key);
             SessionBatch batch;
             try {
-                batch = scanThread(thread, previous, remaining);
+                batch =
+                        scanThread(
+                                thread,
+                                window.files.get(thread.rolloutPath),
+                                previous,
+                                remaining);
             } catch (AttachmentResolver.RetryableAttachmentException | IOException failure) {
                 if (isInterruptedFailure(failure)) {
                     throw failure;
@@ -132,20 +184,28 @@ public final class CodexConversationSource implements ConversationSource {
         return batches;
     }
 
-    private SessionBatch scanThread(CodexThread thread, ChatSession previous, int maxRecords)
+    private SessionBatch scanThread(
+            CodexThread thread,
+            ScanFileSnapshot fileSnapshot,
+            ChatSession previous,
+            int maxRecords)
             throws IOException {
+        if (fileSnapshot != null && !fileSnapshot.canRead(thread.rolloutPath)) {
+            LOG.debug(
+                    "Codex rollout {} changed identity or was truncated during this scan cycle; "
+                            + "deferring it to the next wake-up",
+                    thread.rolloutPath);
+            return null;
+        }
         SourceCursors.FileCursor priorCursor =
                 SourceCursors.parseFileCursor(previous == null ? null : previous.sourceCursor());
         SourceCursors.FileCursor targetCursor =
                 SourceCursors.parseFileCursor(
                         previous == null ? null : previous.pendingCursor());
         long startOffset = priorCursor.offset();
-        String currentFileKey =
-                Files.isRegularFile(thread.rolloutPath)
-                        ? IncrementalFiles.fileKey(thread.rolloutPath)
-                        : null;
-        if (Files.isRegularFile(thread.rolloutPath)
-                && (Files.size(thread.rolloutPath) < startOffset
+        String currentFileKey = fileSnapshot == null ? null : fileSnapshot.fileKey();
+        if (fileSnapshot != null
+                && (fileSnapshot.size() < startOffset
                         || (priorCursor.fileKey() != null
                                 && !java.util.Objects.equals(
                                         priorCursor.fileKey(), currentFileKey))
@@ -156,7 +216,8 @@ public final class CodexConversationSource implements ConversationSource {
                             tailReader,
                             thread.rolloutPath,
                             priorCursor.anchor(),
-                            priorCursor.offset());
+                            priorCursor.offset(),
+                            fileSnapshot.size());
             if (recovered < 0) {
                 LOG.warn(
                         "Codex rollout was rewritten and its checkpoint anchor disappeared; "
@@ -168,11 +229,17 @@ public final class CodexConversationSource implements ConversationSource {
         }
         long targetOffset = -1L;
         if (previous != null && previous.hasPendingCommit()) {
+            if (fileSnapshot == null) {
+                LOG.warn(
+                        "Pending Codex source file is unavailable for session {}; recovery is paused",
+                        thread.sessionId);
+                return null;
+            }
             targetOffset = targetCursor.offset();
             if ((targetCursor.fileKey() != null
                             && !java.util.Objects.equals(
                                     targetCursor.fileKey(), currentFileKey))
-                    || (Files.isRegularFile(thread.rolloutPath)
+                    || (fileSnapshot != null
                             && !IncrementalFiles.anchorMatchesAtOffset(
                                     thread.rolloutPath, targetCursor))) {
                 targetOffset =
@@ -180,7 +247,8 @@ public final class CodexConversationSource implements ConversationSource {
                                 tailReader,
                                 thread.rolloutPath,
                                 targetCursor.anchor(),
-                                targetCursor.offset());
+                                targetCursor.offset(),
+                                fileSnapshot.size());
                 if (targetOffset < 0) {
                     LOG.warn(
                             "Pending Codex boundary disappeared for session {}; recovery is paused",
@@ -190,8 +258,12 @@ public final class CodexConversationSource implements ConversationSource {
             }
         }
         List<JsonlRecord> records =
-                Files.isRegularFile(thread.rolloutPath)
-                        ? tailReader.read(thread.rolloutPath, startOffset, maxRecords)
+                fileSnapshot != null
+                        ? tailReader.read(
+                                thread.rolloutPath,
+                                startOffset,
+                                maxRecords,
+                                fileSnapshot.size())
                         : java.util.Collections.emptyList();
 
         SessionKey key = new SessionKey(SOURCE_TYPE, thread.sessionId);
@@ -284,8 +356,18 @@ public final class CodexConversationSource implements ConversationSource {
         }
 
         long lastCommitId = previous == null ? -1L : previous.lastCommitId();
-        Instant createdAt = thread.createdAt != null ? thread.createdAt : fileTime(thread.rolloutPath, true);
-        Instant updatedAt = thread.updatedAt != null ? thread.updatedAt : fileTime(thread.rolloutPath, false);
+        Instant createdAt =
+                thread.createdAt != null
+                        ? thread.createdAt
+                        : fileSnapshot == null ? null : fileSnapshot.creationTime();
+        Instant updatedAt =
+                thread.updatedAt != null
+                        ? thread.updatedAt
+                        : fileSnapshot == null ? null : fileSnapshot.lastModifiedTime();
+        String subagentSourceJson =
+                thread.sessionSourceKnown
+                        ? thread.subagentSourceJson
+                        : previous == null ? null : previous.subagentSourceJson();
         ChatSession session =
                 new ChatSession(
                         key,
@@ -298,7 +380,8 @@ public final class CodexConversationSource implements ConversationSource {
                         createdAt,
                         updatedAt,
                         lastMessageAt,
-                        now);
+                        now,
+                        subagentSourceJson);
 
         boolean cursorChanged = processedOffset != startOffset;
         boolean pendingBoundaryReached =
@@ -337,6 +420,14 @@ public final class CodexConversationSource implements ConversationSource {
                             + (columns.contains("updated_at_ms")
                                     ? "updated_at_ms"
                                     : "NULL AS updated_at_ms")
+                            + ", "
+                            + (columns.contains("source")
+                                    ? "source AS session_source"
+                                    : "NULL AS session_source")
+                            + ", "
+                            + (columns.contains("thread_source")
+                                    ? "thread_source"
+                                    : "NULL AS thread_source")
                             + " FROM threads";
             try (Statement statement = connection.createStatement()) {
                 statement.execute("PRAGMA query_only=ON");
@@ -352,6 +443,16 @@ public final class CodexConversationSource implements ConversationSource {
                                 nullableLong(rows, "created_at_ms", "created_at");
                         long updatedMillis =
                                 nullableLong(rows, "updated_at_ms", "updated_at");
+                        String rawSource = rows.getString("session_source");
+                        String threadSource = rows.getString("thread_source");
+                        boolean sourceKnown =
+                                !isBlank(rawSource) || "subagent".equals(threadSource);
+                        String subagentSourceJson =
+                                canonicalSubagentSource(rawSource);
+                        if (subagentSourceJson == null
+                                && "subagent".equals(threadSource)) {
+                            subagentSourceJson = legacySubagentSource();
+                        }
                         result.put(
                                 id,
                                 new CodexThread(
@@ -361,7 +462,9 @@ public final class CodexConversationSource implements ConversationSource {
                                         rows.getString("cwd"),
                                         rows.getInt("archived") != 0,
                                         epochMillis(createdMillis),
-                                        epochMillis(updatedMillis)));
+                                        epochMillis(updatedMillis),
+                                        subagentSourceJson,
+                                        sourceKnown));
                     }
                 }
             }
@@ -369,6 +472,21 @@ public final class CodexConversationSource implements ConversationSource {
             LOG.warn("Unable to read Codex thread metadata from {}", database, e);
         }
         return result;
+    }
+
+    private void applyCanonicalRolloutMetadata(Map<String, CodexThread> threads) {
+        for (Map.Entry<String, CodexThread> entry :
+                new ArrayList<>(threads.entrySet())) {
+            CodexThread current = entry.getValue();
+            CodexThread discovered = discoverThread(current.rolloutPath, current.archived);
+            if (discovered != null
+                    && discovered.sessionSourceKnown
+                    && current.sessionId.equals(discovered.sessionId)) {
+                threads.put(
+                        entry.getKey(),
+                        current.withSessionSource(discovered.subagentSourceJson));
+            }
+        }
     }
 
     private static Set<String> threadColumns(Connection connection) throws Exception {
@@ -428,13 +546,41 @@ public final class CodexConversationSource implements ConversationSource {
                             text(payload, "cwd"),
                             archived,
                             parseInstant(firstNonBlank(text(payload, "timestamp"), text(event, "timestamp"))),
-                            fileTime(path, false));
+                            fileTime(path, false),
+                            canonicalSubagentSource(payload.get("source")),
+                            payload.has("source"));
                 }
             }
         } catch (Exception e) {
             LOG.debug("Unable to inspect Codex rollout {}", path, e);
         }
         return null;
+    }
+
+    private String canonicalSubagentSource(String rawSource) {
+        if (isBlank(rawSource) || !rawSource.trim().startsWith("{")) {
+            return null;
+        }
+        try {
+            return canonicalSubagentSource(objectMapper.readTree(rawSource));
+        } catch (IOException ignored) {
+            return null;
+        }
+    }
+
+    private static String canonicalSubagentSource(JsonNode source) {
+        if (source == null || !source.isObject()) {
+            return null;
+        }
+        JsonNode subagent = source.get("subagent");
+        if (subagent == null) {
+            subagent = source.get("subAgent");
+        }
+        return subagent == null || subagent.isNull() ? null : subagent.toString();
+    }
+
+    private String legacySubagentSource() {
+        return objectMapper.createObjectNode().put("other", "legacy").toString();
     }
 
     private Path findStateDatabase() {
@@ -653,7 +799,9 @@ public final class CodexConversationSource implements ConversationSource {
                 || !java.util.Objects.equals(previous.cwd(), current.cwd())
                 || previous.archived() != current.archived()
                 || !java.util.Objects.equals(previous.sourcePath(), current.sourcePath())
-                || !java.util.Objects.equals(previous.updatedAt(), current.updatedAt());
+                || !java.util.Objects.equals(previous.updatedAt(), current.updatedAt())
+                || !java.util.Objects.equals(
+                        previous.subagentSourceJson(), current.subagentSourceJson());
     }
 
     private static long nullableLong(ResultSet rows, String millisColumn, String secondsColumn)
@@ -786,6 +934,17 @@ public final class CodexConversationSource implements ConversationSource {
         }
     }
 
+    private static final class ScanWindow {
+        private final List<CodexThread> threads;
+        private final Map<Path, ScanFileSnapshot> files;
+
+        private ScanWindow(
+                List<CodexThread> threads, Map<Path, ScanFileSnapshot> files) {
+            this.threads = threads;
+            this.files = files;
+        }
+    }
+
     private static final class CodexThread {
         private final String sessionId;
         private final Path rolloutPath;
@@ -794,6 +953,8 @@ public final class CodexConversationSource implements ConversationSource {
         private final boolean archived;
         private final Instant createdAt;
         private final Instant updatedAt;
+        private final String subagentSourceJson;
+        private final boolean sessionSourceKnown;
 
         private CodexThread(
                 String sessionId,
@@ -802,7 +963,9 @@ public final class CodexConversationSource implements ConversationSource {
                 String cwd,
                 boolean archived,
                 Instant createdAt,
-                Instant updatedAt) {
+                Instant updatedAt,
+                String subagentSourceJson,
+                boolean sessionSourceKnown) {
             this.sessionId = sessionId;
             this.rolloutPath = rolloutPath;
             this.title = title;
@@ -810,6 +973,21 @@ public final class CodexConversationSource implements ConversationSource {
             this.archived = archived;
             this.createdAt = createdAt;
             this.updatedAt = updatedAt;
+            this.subagentSourceJson = subagentSourceJson;
+            this.sessionSourceKnown = sessionSourceKnown;
+        }
+
+        private CodexThread withSessionSource(String value) {
+            return new CodexThread(
+                    sessionId,
+                    rolloutPath,
+                    title,
+                    cwd,
+                    archived,
+                    createdAt,
+                    updatedAt,
+                    value,
+                    true);
         }
 
         private Instant updatedAt() {

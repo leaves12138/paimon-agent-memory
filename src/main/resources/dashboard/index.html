@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
     <meta name="referrer" content="no-referrer">
-    <meta name="description" content="Paimon AI 对话数据采集与上传状态看板">
+    <meta name="description" content="Paimon AI 对话历史">
     <title>Paimon 对话数据中心</title>
     <link rel="stylesheet" href="./dashboard.css">
   </head>
@@ -16,155 +16,72 @@
       <div class="brand" aria-label="Paimon 对话数据中心">
         <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
         <span class="brand-copy">
-          <strong>Paimon</strong>
-          <small>AI Conversation Archive</small>
+          <strong>Paimon Agent Memory</strong>
+          <small>Conversation archive</small>
         </span>
       </div>
       <div class="topbar-actions">
-        <div class="freshness" id="freshness" aria-live="polite">
+        <div class="collector-state" id="collector-state" role="status" aria-live="polite">
+          <span class="status-orbit" aria-hidden="true"><span></span></span>
+          <span id="collector-state-text">连接中</span>
+        </div>
+        <div class="freshness" id="freshness">
           <span class="freshness-label">数据时间</span>
           <time id="generated-at">--</time>
         </div>
-        <button class="button button-primary" id="refresh-all" type="button">
+        <button class="icon-button refresh-all" id="refresh-all" type="button" aria-label="刷新全部数据" title="刷新全部数据">
           <span class="refresh-symbol" aria-hidden="true">↻</span>
-          <span>刷新数据</span>
         </button>
       </div>
     </header>
 
+    <section class="error-banner" id="global-error" role="alert" hidden>
+      <span class="error-mark" aria-hidden="true">!</span>
+      <div>
+        <strong>最近一次采集发生异常</strong>
+        <p id="global-error-message"></p>
+      </div>
+    </section>
+
     <main class="page-shell">
-      <section class="hero" aria-labelledby="page-title">
-        <div>
-          <p class="eyebrow">对话数据采集中心</p>
-          <h1 id="page-title">数据流转，一目了然</h1>
-          <p class="hero-copy">集中查看 Codex 与 Claude 的本地采集结果、待提交数据和已写入 Paimon 的会话历史。</p>
-        </div>
-        <div class="collector-state" id="collector-state" role="status" aria-live="polite">
-          <span class="status-orbit" aria-hidden="true"><span></span></span>
-          <span>
-            <small>采集服务</small>
-            <strong id="collector-state-text">状态获取中</strong>
-          </span>
-        </div>
-      </section>
-
-      <section class="error-banner" id="global-error" role="alert" hidden>
-        <span class="error-mark" aria-hidden="true">!</span>
-        <div>
-          <strong>最近一次采集发生异常</strong>
-          <p id="global-error-message"></p>
-        </div>
-      </section>
-
-      <section class="metric-grid" aria-label="采集概览">
-        <article class="metric-card metric-card-uploaded">
-          <div class="metric-card-top">
-            <span class="metric-label">已上传会话</span>
-            <span class="metric-icon" aria-hidden="true">✓</span>
-          </div>
-          <strong class="metric-value" id="uploaded-sessions">--</strong>
-          <p>已写入 <code id="sessions-table-card">ai_chat_sessions</code></p>
-        </article>
-        <article class="metric-card metric-card-uploaded">
-          <div class="metric-card-top">
-            <span class="metric-label">已上传消息</span>
-            <span class="metric-icon" aria-hidden="true">✓</span>
-          </div>
-          <strong class="metric-value" id="uploaded-messages">--</strong>
-          <p>已写入 <code id="messages-table-card">ai_chat_messages</code></p>
-        </article>
-        <article class="metric-card metric-card-pending">
-          <div class="metric-card-top">
-            <span class="metric-label">待提交会话</span>
-            <span class="metric-icon" aria-hidden="true">…</span>
-          </div>
-          <strong class="metric-value" id="pending-sessions">--</strong>
-          <p>已采集，等待下一次提交</p>
-        </article>
-        <article class="metric-card metric-card-pending">
-          <div class="metric-card-top">
-            <span class="metric-label">待提交消息</span>
-            <span class="metric-icon" aria-hidden="true">…</span>
-          </div>
-          <strong class="metric-value" id="pending-messages">--</strong>
-          <p>包含文本与附件数据</p>
-        </article>
-      </section>
-
-      <section class="pipeline-panel" aria-label="运行与存储状态">
-        <div class="pipeline-copy">
-          <div class="section-heading compact-heading">
-            <div>
-              <p class="eyebrow">Pipeline</p>
-              <h2>采集运行状态</h2>
-            </div>
-            <span class="live-badge" id="live-badge"><span aria-hidden="true"></span><span id="live-badge-text">连接中</span></span>
-          </div>
-          <div class="pipeline-times">
-            <div>
-              <span>最近扫描</span>
-              <time id="last-scan-at">--</time>
-            </div>
-            <div>
-              <span>最近提交</span>
-              <time id="last-commit-at">--</time>
-            </div>
-          </div>
-        </div>
-        <div class="pipeline-progress">
-          <div class="progress-summary">
-            <span>消息上传进度</span>
-            <strong id="upload-progress-label">--</strong>
-          </div>
-          <progress class="progress-track" aria-label="消息上传进度" max="100" value="0" id="upload-progress">0%</progress>
-          <div class="catalog-meta">
-            <span><small>Database</small><code id="database-name">--</code></span>
-            <span><small>Sessions</small><code id="sessions-table-name">--</code></span>
-            <span><small>Messages</small><code id="messages-table-name">--</code></span>
-          </div>
-        </div>
-      </section>
-
       <section class="conversation-workspace" id="data-explorer" aria-label="对话数据浏览器">
         <aside class="session-sidebar" id="session-sidebar" aria-labelledby="session-sidebar-title">
           <header class="workspace-pane-header session-sidebar-header">
             <div>
-              <p class="eyebrow">Conversations</p>
-              <h2 id="session-sidebar-title">会话</h2>
+              <h1 id="session-sidebar-title">对话历史</h1>
+              <span class="record-count" id="session-count" aria-live="polite">-- 个会话</span>
             </div>
-            <span class="record-count" id="session-count" aria-live="polite">-- 个会话</span>
           </header>
 
           <div class="session-toolbar">
             <label class="workspace-search" for="session-search">
               <span class="search-symbol" aria-hidden="true"></span>
               <span class="visually-hidden">搜索会话</span>
-              <input id="session-search" type="search" autocomplete="off" placeholder="搜索标题、ID 或工作目录…">
+              <input id="session-search" type="search" autocomplete="off" placeholder="搜索会话">
               <kbd aria-hidden="true">⌘ K</kbd>
             </label>
             <label class="workspace-select" for="session-source-filter">
               <span class="visually-hidden">按来源筛选会话</span>
               <select id="session-source-filter" aria-label="按来源筛选会话">
-                <option value="">全部来源</option>
+                <option value="">全部</option>
                 <option value="codex">Codex</option>
                 <option value="claude">Claude</option>
               </select>
             </label>
           </div>
 
-          <div class="pane-live-status" id="session-list-status" role="status" aria-live="polite" aria-atomic="true">尚未读取会话</div>
+          <div class="pane-live-status visually-hidden" id="session-list-status" role="status" aria-live="polite" aria-atomic="true">尚未读取会话</div>
           <div class="session-list-frame">
-            <ul class="session-list" id="session-list" aria-label="会话列表"></ul>
+            <ul class="session-list" id="session-list" aria-label="按项目分组的会话列表"></ul>
 
             <div class="workspace-state" id="session-loading" role="status" aria-live="polite" hidden>
               <span class="loader" aria-hidden="true"></span>
               <strong>正在读取会话</strong>
-              <p>正在汇总本地采集与 Paimon 上传记录…</p>
             </div>
             <div class="workspace-state" id="session-empty" hidden>
               <span class="empty-glyph" aria-hidden="true"><span></span><span></span><span></span></span>
-              <strong>暂时没有匹配的会话</strong>
-              <p>可以调整搜索条件，或等待下一次采集完成。</p>
+              <strong>没有匹配的会话</strong>
+              <p>调整搜索条件，或等待下一次采集。</p>
             </div>
             <div class="workspace-state workspace-state-error" id="session-error" role="alert" hidden>
               <span class="error-mark" aria-hidden="true">!</span>
@@ -183,14 +100,13 @@
           <div class="chat-empty" id="chat-empty">
             <span class="chat-empty-glyph" aria-hidden="true"><span></span><span></span><span></span></span>
             <h2>选择一个会话</h2>
-            <p>从左侧选择 Codex 或 Claude 会话，在这里查看完整对话与附件。</p>
+            <p>从左侧选择 Codex 或 Claude 会话。</p>
           </div>
 
           <div class="chat-view" id="chat-view" hidden>
             <header class="chat-header">
               <button class="chat-back" id="chat-back" type="button" aria-label="返回会话列表">
-                <span aria-hidden="true">‹</span>
-                <span>会话</span>
+                <span aria-hidden="true">‹</span><span>会话</span>
               </button>
               <div class="chat-title-block">
                 <div class="chat-title-line">
@@ -204,14 +120,17 @@
                   <code id="chat-session-id">--</code>
                 </p>
               </div>
-              <button class="button button-quiet chat-refresh" id="refresh-chat" type="button" aria-label="刷新当前会话">
+              <button class="icon-button chat-refresh" id="refresh-chat" type="button" aria-label="刷新当前会话" title="刷新当前会话">
                 <span class="refresh-symbol" aria-hidden="true">↻</span>
-                <span>刷新</span>
               </button>
             </header>
 
             <div class="chat-subheader">
               <span id="message-summary" aria-live="polite">-- 条消息</span>
+              <label class="tool-toggle" for="show-tools-toggle">
+                <input id="show-tools-toggle" type="checkbox">
+                <span>显示工具调用</span>
+              </label>
             </div>
 
             <div class="chat-scroll" id="chat-scroll" tabindex="0">
@@ -222,12 +141,11 @@
                 <div class="workspace-state message-state" id="message-loading" role="status" aria-live="polite" hidden>
                   <span class="loader" aria-hidden="true"></span>
                   <strong>正在读取消息</strong>
-                  <p>正在还原完整对话过程…</p>
                 </div>
                 <div class="workspace-state message-state" id="message-empty" hidden>
                   <span class="empty-glyph" aria-hidden="true"><span></span><span></span><span></span></span>
-                  <strong>这个会话还没有消息</strong>
-                  <p>下一次采集完成后，新消息会显示在这里。</p>
+                  <strong id="message-empty-title">这个会话还没有消息</strong>
+                  <p id="message-empty-description">下一次采集完成后，新消息会显示在这里。</p>
                 </div>
                 <div class="workspace-state workspace-state-error message-state" id="message-error" role="alert" hidden>
                   <span class="error-mark" aria-hidden="true">!</span>
@@ -249,22 +167,35 @@
       </section>
     </main>
 
+    <div class="overview-runtime-data visually-hidden" aria-hidden="true">
+      <span id="live-badge"><span id="live-badge-text">连接中</span></span>
+      <span id="uploaded-sessions">--</span>
+      <span id="uploaded-messages">--</span>
+      <span id="pending-sessions">--</span>
+      <span id="pending-messages">--</span>
+      <code id="sessions-table-card">--</code>
+      <code id="messages-table-card">--</code>
+      <time id="last-scan-at">--</time>
+      <time id="last-commit-at">--</time>
+      <progress id="upload-progress" max="100" value="0"></progress>
+      <span id="upload-progress-label">--</span>
+      <code id="database-name">--</code>
+      <code id="sessions-table-name">--</code>
+      <code id="messages-table-name">--</code>
+    </div>
+
     <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
 
     <div class="preview-modal" id="preview-modal" role="dialog" aria-modal="true" aria-labelledby="preview-title" hidden>
       <div class="preview-backdrop" data-close-preview></div>
       <div class="preview-dialog">
         <header>
-          <div>
-            <p class="eyebrow">Attachment Preview</p>
-            <h2 id="preview-title">附件预览</h2>
-          </div>
+          <div><p class="eyebrow">Attachment Preview</p><h2 id="preview-title">附件预览</h2></div>
           <button type="button" class="modal-close" id="close-preview" aria-label="关闭附件预览">×</button>
         </header>
         <div class="preview-canvas">
           <div class="preview-loading" id="preview-loading" aria-live="polite">
-            <span class="loader" aria-hidden="true"></span>
-            <strong>正在安全加载附件</strong>
+            <span class="loader" aria-hidden="true"></span><strong>正在安全加载附件</strong>
           </div>
           <img id="preview-image" alt="" hidden>
         </div>

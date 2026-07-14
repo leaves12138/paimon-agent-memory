@@ -24,6 +24,9 @@ public interface DashboardDataStore extends AutoCloseable {
             long maxBytes)
             throws Exception;
 
+    /** Invalidates any read caches so the next query observes the latest committed snapshot. */
+    default void invalidate() {}
+
     @Override
     default void close() throws Exception {}
 }

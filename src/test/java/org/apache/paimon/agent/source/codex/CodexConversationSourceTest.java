@@ -4,6 +4,7 @@ import org.apache.paimon.agent.model.SessionBatch;
 import org.apache.paimon.agent.model.ChatSession;
 import org.apache.paimon.agent.model.SessionKey;
 import org.apache.paimon.agent.source.AttachmentResolver;
+import org.apache.paimon.agent.source.ConversationSource;
 import org.apache.paimon.agent.source.IncrementalFiles;
 import org.apache.paimon.agent.source.SourceCursors;
 
@@ -16,6 +17,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.Statement;
@@ -60,6 +62,99 @@ class CodexConversationSourceTest {
 
         assertThat(first).singleElement().satisfies(batch -> assertThat(batch.session().key().sessionId()).isEqualTo("hot"));
         assertThat(second).singleElement().satisfies(batch -> assertThat(batch.session().key().sessionId()).isEqualTo("cool"));
+    }
+
+    @Test
+    void scanCycleStopsAtTheEofCapturedWhenTheWakeUpStarted() throws Exception {
+        Path directory = tempDir.resolve("sessions/2026/01/01");
+        Files.createDirectories(directory);
+        Path rollout = directory.resolve("growing.jsonl");
+        Files.writeString(rollout, canonicalUser("before") + "\n");
+        createStateDatabase(new ThreadRow("growing", rollout, "Growing", 1));
+        ObjectMapper mapper = new ObjectMapper();
+        CodexConversationSource source =
+                new CodexConversationSource(
+                        tempDir, mapper, new AttachmentResolver(mapper, true, false, 1024));
+
+        SessionBatch first;
+        try (ConversationSource.ScanCycle cycle = source.openScanCycle()) {
+            Files.writeString(
+                    rollout,
+                    canonicalUser("after") + "\n",
+                    StandardOpenOption.APPEND);
+            first = cycle.scan(Collections.emptyMap(), 1, Collections.emptySet()).get(0);
+
+            assertThat(
+                            cycle.scan(
+                                    Collections.singletonMap(
+                                            first.session().key(), first.session()),
+                                    100,
+                                    Collections.emptySet()))
+                    .isEmpty();
+        }
+
+        List<SessionBatch> nextWake =
+                source.scan(
+                        Collections.singletonMap(first.session().key(), first.session()), 100);
+        assertThat(nextWake).singleElement();
+        assertThat(nextWake.get(0).messages()).singleElement();
+        assertThat(nextWake.get(0).messages().get(0).contentJson()).contains("after");
+    }
+
+    @Test
+    void usesFirstSessionMetaForUnindexedSubagentAndBackfillsAtEof() throws Exception {
+        Path directory = tempDir.resolve("sessions/2026/01/01");
+        Files.createDirectories(directory);
+        Path rollout = directory.resolve("subagent.jsonl");
+        String childMeta =
+                "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_meta\","
+                        + "\"payload\":{\"id\":\"child\",\"cwd\":\"/tmp/project\","
+                        + "\"source\":{\"subagent\":{\"thread_spawn\":{"
+                        + "\"depth\":1,\"parent_thread_id\":\"root\","
+                        + "\"agent_path\":\"/root/audit\"}}}}}";
+        String copiedParentMeta =
+                "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_meta\","
+                        + "\"payload\":{\"id\":\"root\",\"cwd\":\"/tmp/project\","
+                        + "\"source\":\"vscode\"}}";
+        Files.writeString(
+                rollout,
+                childMeta + "\n" + copiedParentMeta + "\n" + canonicalUser("work") + "\n",
+                StandardCharsets.UTF_8);
+        ObjectMapper mapper = new ObjectMapper();
+        CodexConversationSource source =
+                new CodexConversationSource(
+                        tempDir, mapper, new AttachmentResolver(mapper, true, false, 1024));
+
+        SessionBatch collected = source.scan(Collections.emptyMap(), 100).get(0);
+        String expected =
+                "{\"thread_spawn\":{\"depth\":1,\"parent_thread_id\":\"root\","
+                        + "\"agent_path\":\"/root/audit\"}}";
+        assertThat(collected.session().key().sessionId()).isEqualTo("child");
+        assertThat(collected.session().subagentSourceJson()).isEqualTo(expected);
+
+        ChatSession legacyCheckpoint =
+                new ChatSession(
+                        collected.session().key(),
+                        collected.session().title(),
+                        collected.session().cwd(),
+                        collected.session().archived(),
+                        collected.session().sourcePath(),
+                        collected.session().sourceCursor(),
+                        collected.session().lastCommitId(),
+                        collected.session().createdAt(),
+                        collected.session().updatedAt(),
+                        collected.session().lastMessageAt(),
+                        collected.session().ingestedAt());
+        List<SessionBatch> backfill =
+                source.scan(
+                        Collections.singletonMap(
+                                legacyCheckpoint.key(), legacyCheckpoint),
+                        100);
+
+        assertThat(backfill).singleElement();
+        assertThat(backfill.get(0).sourceRecordsRead()).isZero();
+        assertThat(backfill.get(0).messages()).isEmpty();
+        assertThat(backfill.get(0).session().subagentSourceJson()).isEqualTo(expected);
     }
 
     @Test
@@ -207,7 +302,7 @@ class CodexConversationSourceTest {
         assertThat(recovered.get(0).messages()).hasSize(1);
         assertThat(recovered.get(0).messages().get(0).role()).isEqualTo("user");
         assertThat(
-                        SourceCursors.samePosition(
+                        SourceCursors.sameLogicalBoundary(
                                 recovered.get(0).session().sourceCursor(),
                                 unfinished.pendingCursor()))
                 .isTrue();

@@ -24,6 +24,7 @@ import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.Schema;
+import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.StreamTableCommit;
@@ -39,6 +40,7 @@ import org.apache.paimon.types.RowType;
 import org.apache.hadoop.conf.Configuration;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -50,10 +52,15 @@ import java.util.Set;
 public final class PaimonChatRepository implements ChatRepository {
 
     private static final String WRITER_ID_OPTION = "paimon-agent.writer-id";
+    private static final String MORAX_BTREE_INDEX_ENABLED_OPTION =
+            "morax.btree-index.enabled";
+    private static final String MORAX_BTREE_INDEX_COLUMN_OPTION =
+            "global-index.btree.index-column";
+    private static final String MORAX_BTREE_INDEX_COLUMN = "session_id";
+    private static final String SUBAGENT_SOURCE_JSON_COLUMN = "subagent_source_json";
 
     private final AgentConfiguration configuration;
     private final ProjectConfig project;
-
     private Catalog catalog;
     private Table sessionsTable;
     private Table messagesTable;
@@ -61,7 +68,6 @@ public final class PaimonChatRepository implements ChatRepository {
     private StreamTableCommit sessionsCommit;
     private StreamWriteBuilder messagesBuilder;
     private StreamTableCommit messagesCommit;
-
     public PaimonChatRepository(AgentConfiguration configuration) {
         this.configuration = configuration;
         this.project = configuration.project();
@@ -120,6 +126,14 @@ public final class PaimonChatRepository implements ChatRepository {
 
         sessionsTable = catalog.getTable(sessionsIdentifier);
         messagesTable = catalog.getTable(messagesIdentifier);
+        if (writer) {
+            // Validate both ownership and the exact legacy/current layouts before applying any
+            // schema mutation. A differently configured collector must never upgrade this pair.
+            validateSessionsTableForUpgrade(sessionsTable);
+            validateMessagesTable(messagesTable);
+            validateTableOwnership(true);
+            ensureSessionsSubagentSourceColumn(sessionsIdentifier);
+        }
         validateSessionsTable(sessionsTable);
         validateMessagesTable(messagesTable);
         validateTableOwnership(writer);
@@ -127,6 +141,8 @@ public final class PaimonChatRepository implements ChatRepository {
         if (!writer) {
             return;
         }
+
+        ensureMessagesMoraxBtreeOptions(messagesIdentifier);
 
         sessionsBuilder =
                 sessionsTable
@@ -176,7 +192,7 @@ public final class PaimonChatRepository implements ChatRepository {
 
     private void validateExistingWriterTable(Table table, boolean sessions) {
         if (sessions) {
-            validateSessionsTable(table);
+            validateSessionsTableForUpgrade(table);
         } else {
             validateMessagesTable(table);
         }
@@ -335,7 +351,16 @@ public final class PaimonChatRepository implements ChatRepository {
     }
 
     private Schema sessionsSchema() {
-        return Schema.newBuilder()
+        return sessionsSchema(true);
+    }
+
+    private Schema legacySessionsSchema() {
+        return sessionsSchema(false);
+    }
+
+    private Schema sessionsSchema(boolean includeSubagentSource) {
+        Schema.Builder builder =
+                Schema.newBuilder()
                 .column("source_type", DataTypes.STRING())
                 .column("session_id", DataTypes.STRING())
                 .column("title", DataTypes.STRING())
@@ -349,7 +374,11 @@ public final class PaimonChatRepository implements ChatRepository {
                 .column("created_at", DataTypes.TIMESTAMP(3))
                 .column("updated_at", DataTypes.TIMESTAMP(3))
                 .column("last_message_at", DataTypes.TIMESTAMP(3))
-                .column("ingested_at", DataTypes.TIMESTAMP(3))
+                .column("ingested_at", DataTypes.TIMESTAMP(3));
+        if (includeSubagentSource) {
+            builder.column(SUBAGENT_SOURCE_JSON_COLUMN, DataTypes.STRING());
+        }
+        return builder
                 .primaryKey("source_type", "session_id")
                 .option(CoreOptions.BUCKET.key(), "1")
                 .option(WRITER_ID_OPTION, project.collectorId())
@@ -371,8 +400,60 @@ public final class PaimonChatRepository implements ChatRepository {
                 .option(CoreOptions.BUCKET.key(), "-1")
                 .option(CoreOptions.ROW_TRACKING_ENABLED.key(), "true")
                 .option(CoreOptions.DATA_EVOLUTION_ENABLED.key(), "true")
+                .option(MORAX_BTREE_INDEX_ENABLED_OPTION, "true")
+                .option(MORAX_BTREE_INDEX_COLUMN_OPTION, MORAX_BTREE_INDEX_COLUMN)
                 .option(WRITER_ID_OPTION, project.collectorId())
                 .build();
+    }
+
+    private void ensureSessionsSubagentSourceColumn(Identifier sessionsIdentifier)
+            throws Exception {
+        boolean present =
+                sessionsTable.rowType().getFields().stream()
+                        .anyMatch(field -> SUBAGENT_SOURCE_JSON_COLUMN.equals(field.name()));
+        if (!present) {
+            catalog.alterTable(
+                    sessionsIdentifier,
+                    Collections.singletonList(
+                            SchemaChange.addColumn(
+                                    SUBAGENT_SOURCE_JSON_COLUMN, DataTypes.STRING())),
+                    false);
+            sessionsTable = catalog.getTable(sessionsIdentifier);
+
+            // Reload and revalidate before any writer is constructed. This also catches a
+            // concurrent or server-side alteration which did not produce the requested layout.
+            validateSessionsTable(sessionsTable);
+            validateTableOwnership(true);
+        }
+    }
+
+    private void ensureMessagesMoraxBtreeOptions(Identifier messagesIdentifier)
+            throws Exception {
+        List<SchemaChange> changes = new ArrayList<>();
+        if (!"true".equals(messagesTable.options().get(MORAX_BTREE_INDEX_ENABLED_OPTION))) {
+            changes.add(SchemaChange.setOption(MORAX_BTREE_INDEX_ENABLED_OPTION, "true"));
+        }
+        if (!MORAX_BTREE_INDEX_COLUMN.equals(
+                messagesTable.options().get(MORAX_BTREE_INDEX_COLUMN_OPTION))) {
+            changes.add(
+                    SchemaChange.setOption(
+                            MORAX_BTREE_INDEX_COLUMN_OPTION, MORAX_BTREE_INDEX_COLUMN));
+        }
+        if (!changes.isEmpty()) {
+            catalog.alterTable(messagesIdentifier, changes, false);
+            messagesTable = catalog.getTable(messagesIdentifier);
+
+            // Never continue with write builders unless the altered table still has the exact
+            // version-1 structure and belongs to this collector.
+            validateMessagesTable(messagesTable);
+            validateTableOwnership(true);
+        }
+        if (!"true".equals(messagesTable.options().get(MORAX_BTREE_INDEX_ENABLED_OPTION))
+                || !MORAX_BTREE_INDEX_COLUMN.equals(
+                        messagesTable.options().get(MORAX_BTREE_INDEX_COLUMN_OPTION))) {
+            throw new IllegalStateException(
+                    "ai_chat_messages must enable the Morax BTree index for session_id");
+        }
     }
 
     private void validateTableOwnership(boolean writer) {
@@ -417,7 +498,8 @@ public final class PaimonChatRepository implements ChatRepository {
                 timestamp(session.createdAt()),
                 timestamp(session.updatedAt()),
                 timestamp(session.lastMessageAt()),
-                timestamp(session.ingestedAt()));
+                timestamp(session.ingestedAt()),
+                string(session.subagentSourceJson()));
     }
 
     private static GenericRow toMessageRow(ChatMessage message) {
@@ -455,7 +537,8 @@ public final class PaimonChatRepository implements ChatRepository {
                 nullableTimestamp(row, 10),
                 nullableTimestamp(row, 11),
                 nullableTimestamp(row, 12),
-                nullableTimestamp(row, 13));
+                nullableTimestamp(row, 13),
+                nullableString(row, 14));
     }
 
     private static ChatMessage fromMessageRow(InternalRow row) {
@@ -499,6 +582,24 @@ public final class PaimonChatRepository implements ChatRepository {
     }
 
     private void validateSessionsTable(Table table) {
+        validateSessionsTableStructure(table);
+        requireRowType(table.rowType(), sessionsSchema().rowType(), "ai_chat_sessions");
+    }
+
+    private void validateSessionsTableForUpgrade(Table table) {
+        validateSessionsTableStructure(table);
+        RowType actual = table.rowType();
+        if (!rowTypeMatches(actual, sessionsSchema().rowType())
+                && !rowTypeMatches(actual, legacySessionsSchema().rowType())) {
+            throw new IllegalStateException(
+                    "ai_chat_sessions row type must be the current schema or the legacy schema without "
+                            + SUBAGENT_SOURCE_JSON_COLUMN
+                            + ", but found "
+                            + actual);
+        }
+    }
+
+    private void validateSessionsTableStructure(Table table) {
         if (!table.partitionKeys().isEmpty()) {
             throw new IllegalStateException("ai_chat_sessions must not be partitioned");
         }
@@ -510,7 +611,6 @@ public final class PaimonChatRepository implements ChatRepository {
         if (!"1".equals(table.options().get(CoreOptions.BUCKET.key()))) {
             throw new IllegalStateException("ai_chat_sessions must use bucket=1");
         }
-        requireRowType(table.rowType(), sessionsSchema().rowType(), "ai_chat_sessions");
     }
 
     private void validateMessagesTable(Table table) {
@@ -535,21 +635,28 @@ public final class PaimonChatRepository implements ChatRepository {
     }
 
     private static void requireRowType(RowType actual, RowType expected, String tableName) {
+        if (rowTypeMatches(actual, expected)) {
+            return;
+        }
+        throw new IllegalStateException(
+                tableName + " row type must be " + expected + " but found " + actual);
+    }
+
+    private static boolean rowTypeMatches(RowType actual, RowType expected) {
         List<DataField> actualFields = actual.getFields();
         List<DataField> expectedFields = expected.getFields();
         if (actualFields.size() != expectedFields.size()) {
-            throw new IllegalStateException(
-                    tableName + " row type must be " + expected + " but found " + actual);
+            return false;
         }
         for (int index = 0; index < actualFields.size(); index++) {
             DataField actualField = actualFields.get(index);
             DataField expectedField = expectedFields.get(index);
             if (!actualField.name().equals(expectedField.name())
                     || !actualField.type().equals(expectedField.type())) {
-                throw new IllegalStateException(
-                        tableName + " row type must be " + expected + " but found " + actual);
+                return false;
             }
         }
+        return true;
     }
 
     private void ensureInitialized() {

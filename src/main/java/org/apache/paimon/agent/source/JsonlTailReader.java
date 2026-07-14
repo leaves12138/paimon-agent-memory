@@ -18,9 +18,31 @@ public final class JsonlTailReader {
 
     public List<JsonlRecord> read(Path path, long requestedOffset, int maxRecords)
             throws IOException {
-        long fileSize = Files.size(path);
-        long offset = requestedOffset >= 0 && requestedOffset <= fileSize ? requestedOffset : 0L;
+        return read(path, requestedOffset, maxRecords, Long.MAX_VALUE);
+    }
+
+    /** Reads at most through the byte boundary captured when a collector wake-up began. */
+    public List<JsonlRecord> read(
+            Path path, long requestedOffset, int maxRecords, long endOffset) throws IOException {
+        if (endOffset < 0) {
+            throw new IllegalArgumentException("end offset must not be negative");
+        }
+        long actualFileSize = Files.size(path);
+        boolean bounded = endOffset != Long.MAX_VALUE;
+        if (bounded && actualFileSize < endOffset) {
+            throw new IOException(
+                    "JSONL file was truncated below the captured scan boundary: " + path);
+        }
+        long fileSize = Math.min(actualFileSize, endOffset);
+        if (bounded && requestedOffset > actualFileSize) {
+            throw new IOException("JSONL cursor is beyond the current file size: " + path);
+        }
+        long offset = requestedOffset >= 0 && requestedOffset <= actualFileSize ? requestedOffset : 0L;
         List<JsonlRecord> records = new ArrayList<>();
+
+        if (offset >= fileSize || maxRecords <= 0) {
+            return records;
+        }
 
         try (SeekableByteChannel channel =
                 Files.newByteChannel(path, StandardOpenOption.READ)) {
@@ -30,7 +52,12 @@ public final class JsonlTailReader {
             long lineStart = offset;
             long absolutePosition = offset;
 
-            while (records.size() < maxRecords && channel.read(buffer) >= 0) {
+            while (records.size() < maxRecords && absolutePosition < fileSize) {
+                buffer.clear();
+                buffer.limit((int) Math.min(buffer.capacity(), fileSize - absolutePosition));
+                if (channel.read(buffer) < 0) {
+                    break;
+                }
                 buffer.flip();
                 while (buffer.hasRemaining() && records.size() < maxRecords) {
                     byte value = buffer.get();
@@ -48,7 +75,6 @@ public final class JsonlTailReader {
                         line.write(value);
                     }
                 }
-                buffer.clear();
             }
 
             if (records.size() < maxRecords && line.size() > 0) {

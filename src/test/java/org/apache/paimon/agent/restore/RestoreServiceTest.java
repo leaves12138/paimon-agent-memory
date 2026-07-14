@@ -216,6 +216,250 @@ class RestoreServiceTest {
     }
 
     @Test
+    void restoresCompleteCodexRootGraphWhenNestedSubagentIsRequested() throws Exception {
+        String rootId = "019f5952-14cd-7d21-a7f7-87b31cb62da6";
+        String childId = "019f608e-7cb4-76f0-b006-89a317303fdb";
+        String grandchildId = "019f608f-1d79-77f0-9e61-4b25cae10e5c";
+        SessionKey rootKey = new SessionKey("codex", rootId);
+        SessionKey childKey = new SessionKey("codex", childId);
+        SessionKey grandchildKey = new SessionKey("codex", grandchildId);
+        ChatSession root = session(rootKey, "Visible root", tempDir.toString());
+        String subagentSource =
+                "{\"thread_spawn\":{\"parent_thread_id\":\""
+                        + rootId
+                        + "\",\"depth\":1,\"agent_path\":\"/root/reviewer\","
+                        + "\"agent_nickname\":\"Dirac\",\"agent_role\":\"reviewer\"}}";
+        ChatSession child =
+                session(childKey, "Internal reviewer", tempDir.toString())
+                        .withSubagentSourceJson(subagentSource);
+        String nestedSubagentSource =
+                "{\"thread_spawn\":{\"parent_thread_id\":\""
+                        + childId
+                        + "\",\"depth\":2,\"agent_path\":\"/root/reviewer/audit\","
+                        + "\"agent_nickname\":\"Noether\",\"agent_role\":\"auditor\"}}";
+        ChatSession grandchild =
+                session(grandchildKey, "Nested audit", tempDir.toString())
+                        .withSubagentSourceJson(nestedSubagentSource);
+        ChatMessage rootPrompt =
+                message(
+                        rootKey,
+                        "root-prompt",
+                        1L,
+                        "user",
+                        "response_item",
+                        codexPrompt("root prompt"),
+                        Collections.emptyList());
+        ChatMessage childPrompt =
+                message(
+                        childKey,
+                        "child-prompt",
+                        1L,
+                        "user",
+                        "response_item",
+                        codexPrompt("child prompt"),
+                        Collections.emptyList());
+        ChatMessage grandchildPrompt =
+                message(
+                        grandchildKey,
+                        "grandchild-prompt",
+                        1L,
+                        "user",
+                        "response_item",
+                        codexPrompt("grandchild prompt"),
+                        Collections.emptyList());
+        Path codexHome = tempDir.resolve("subagent-codex-home");
+        initializeCodexState(codexHome);
+
+        RestoreSummary summary =
+                new RestoreService(
+                                new FakeRepository(
+                                        java.util.Arrays.asList(root, child, grandchild),
+                                        rootPrompt,
+                                        childPrompt,
+                                        grandchildPrompt),
+                                mapper)
+                        .restore(
+                                new RestoreOptions(
+                                        RestoreType.CODEX,
+                                        codexHome,
+                                        tempDir.resolve("subagent-data"),
+                                        null,
+                                        grandchildId,
+                                        false));
+
+        assertThat(summary.restoredSessions()).isEqualTo(3);
+        assertThat(summary.restoredMessages()).isEqualTo(3);
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                java.sql.PreparedStatement statement =
+                        connection.prepareStatement(
+                                "SELECT source, thread_source, agent_path, agent_nickname, "
+                                        + "agent_role FROM threads WHERE id = ?")) {
+            statement.setString(1, childId);
+            try (ResultSet row = statement.executeQuery()) {
+                assertThat(row.next()).isTrue();
+                assertThat(mapper.readTree(row.getString("source")).path("subagent"))
+                        .isEqualTo(mapper.readTree(subagentSource));
+                assertThat(row.getString("thread_source")).isEqualTo("subagent");
+                assertThat(row.getString("agent_path")).isEqualTo("/root/reviewer");
+                assertThat(row.getString("agent_nickname")).isEqualTo("Dirac");
+                assertThat(row.getString("agent_role")).isEqualTo("reviewer");
+            }
+        }
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                java.sql.PreparedStatement statement =
+                        connection.prepareStatement(
+                                "SELECT parent_thread_id, status FROM thread_spawn_edges "
+                                        + "WHERE child_thread_id = ?")) {
+            statement.setString(1, childId);
+            try (ResultSet row = statement.executeQuery()) {
+                assertThat(row.next()).isTrue();
+                assertThat(row.getString("parent_thread_id")).isEqualTo(rootId);
+                assertThat(row.getString("status")).isEqualTo("open");
+            }
+        }
+
+        Path childRollout;
+        try (Stream<Path> files = Files.walk(codexHome.resolve("sessions"))) {
+            childRollout =
+                    files.filter(path -> path.getFileName().toString().endsWith(childId + ".jsonl"))
+                            .findFirst()
+                            .orElseThrow();
+        }
+        JsonNode childMeta =
+                mapper.readTree(Files.readAllLines(childRollout, StandardCharsets.UTF_8).get(0));
+        assertThat(childMeta.path("payload").path("source").path("subagent"))
+                .isEqualTo(mapper.readTree(subagentSource));
+        assertThat(childMeta.path("payload").path("thread_source").asText())
+                .isEqualTo("subagent");
+        assertThat(childMeta.path("payload").path("session_id").asText()).isEqualTo(rootId);
+        assertThat(childMeta.path("payload").path("multi_agent_version").asText())
+                .isEqualTo("v2");
+        UUID childWindow =
+                UUID.fromString(
+                        childMeta
+                                .path("payload")
+                                .path("context_window")
+                                .path("window_id")
+                                .asText());
+        assertThat(childWindow.version()).isEqualTo(7);
+        assertThat(childWindow.variant()).isEqualTo(2);
+        assertThat(childMeta.path("payload").path("parent_thread_id").asText())
+                .isEqualTo(rootId);
+
+        Path rootRollout;
+        Path grandchildRollout;
+        try (Stream<Path> files = Files.walk(codexHome.resolve("sessions"))) {
+            List<Path> rollouts = files.filter(Files::isRegularFile).collect(Collectors.toList());
+            rootRollout =
+                    rollouts.stream()
+                            .filter(path -> path.getFileName().toString().endsWith(rootId + ".jsonl"))
+                            .findFirst()
+                            .orElseThrow();
+            grandchildRollout =
+                    rollouts.stream()
+                            .filter(
+                                    path ->
+                                            path.getFileName()
+                                                    .toString()
+                                                    .endsWith(grandchildId + ".jsonl"))
+                            .findFirst()
+                            .orElseThrow();
+        }
+        JsonNode rootMeta =
+                mapper.readTree(Files.readAllLines(rootRollout, StandardCharsets.UTF_8).get(0));
+        assertThat(rootMeta.path("payload").path("session_id").asText()).isEqualTo(rootId);
+        assertThat(rootMeta.path("payload").path("multi_agent_version").asText())
+                .isEqualTo("v2");
+        assertThat(
+                        UUID.fromString(
+                                        rootMeta
+                                                .path("payload")
+                                                .path("context_window")
+                                                .path("window_id")
+                                                .asText())
+                                .version())
+                .isEqualTo(7);
+        JsonNode grandchildMeta =
+                mapper.readTree(
+                        Files.readAllLines(grandchildRollout, StandardCharsets.UTF_8).get(0));
+        assertThat(grandchildMeta.path("payload").path("session_id").asText())
+                .isEqualTo(rootId);
+        assertThat(grandchildMeta.path("payload").path("parent_thread_id").asText())
+                .isEqualTo(childId);
+        assertThat(grandchildMeta.path("payload").path("multi_agent_version").asText())
+                .isEqualTo("v2");
+    }
+
+    @Test
+    void skipsPendingCodexBranchWithoutRestoringOrphanDescendants() throws Exception {
+        String rootId = "019f6100-0000-7000-8000-000000000001";
+        String childId = "019f6100-0000-7000-8000-000000000002";
+        String grandchildId = "019f6100-0000-7000-8000-000000000003";
+        SessionKey rootKey = new SessionKey("codex", rootId);
+        ChatSession root = session(rootKey, "Stable root", tempDir.toString());
+        ChatSession pendingChild =
+                session(new SessionKey("codex", childId), "Pending child", tempDir.toString())
+                        .withSubagentSourceJson(
+                                "{\"thread_spawn\":{\"parent_thread_id\":\""
+                                        + rootId
+                                        + "\",\"depth\":1}}")
+                        .withPendingBoundary(9L, "cursor-pending");
+        ChatSession stableGrandchild =
+                session(
+                                new SessionKey("codex", grandchildId),
+                                "Stable grandchild",
+                                tempDir.toString())
+                        .withSubagentSourceJson(
+                                "{\"thread_spawn\":{\"parent_thread_id\":\""
+                                        + childId
+                                        + "\",\"depth\":2}}");
+        ChatMessage rootPrompt =
+                message(
+                        rootKey,
+                        "root-only",
+                        1L,
+                        "user",
+                        "response_item",
+                        codexPrompt("stable root"),
+                        Collections.emptyList());
+        Path codexHome = tempDir.resolve("pending-branch-codex-home");
+        initializeCodexState(codexHome);
+
+        RestoreSummary summary =
+                new RestoreService(
+                                new FakeRepository(
+                                        java.util.Arrays.asList(
+                                                root, pendingChild, stableGrandchild),
+                                        rootPrompt),
+                                mapper)
+                        .restore(
+                                new RestoreOptions(
+                                        RestoreType.CODEX,
+                                        codexHome,
+                                        tempDir.resolve("pending-branch-data"),
+                                        null,
+                                        rootId,
+                                        false));
+
+        assertThat(summary.restoredSessions()).isEqualTo(1);
+        assertThat(summary.restoredMessages()).isEqualTo(1);
+        assertThat(summary.skippedSessions()).isEqualTo(2);
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                Statement statement = connection.createStatement();
+                ResultSet rows = statement.executeQuery("SELECT id FROM threads")) {
+            assertThat(rows.next()).isTrue();
+            assertThat(rows.getString(1)).isEqualTo(rootId);
+            assertThat(rows.next()).isFalse();
+        }
+    }
+
+    @Test
     void restoresClaudeProjectTranscriptAndRepairsBrokenParentChain() throws Exception {
         String sessionId = UUID.randomUUID().toString();
         String firstUuid = UUID.randomUUID().toString();
@@ -744,6 +988,15 @@ class RestoreServiceTest {
                 created.plusSeconds(61));
     }
 
+    private static String codexPrompt(String text) {
+        return "{\"timestamp\":\"2026-01-01T00:00:00Z\","
+                + "\"type\":\"response_item\",\"payload\":{\"type\":\"message\","
+                + "\"role\":\"user\",\"content\":[{\"type\":\"input_text\","
+                + "\"text\":\""
+                + text
+                + "\"}]}}";
+    }
+
     private static void initializeCodexState(Path codexHome) throws Exception {
         Files.createDirectories(codexHome);
         try (Connection connection =
@@ -758,7 +1011,13 @@ class RestoreServiceTest {
                             + "created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, "
                             + "source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, "
                             + "title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, "
-                            + "approval_mode TEXT NOT NULL, preview TEXT NOT NULL DEFAULT '')");
+                            + "approval_mode TEXT NOT NULL, preview TEXT NOT NULL DEFAULT '', "
+                            + "thread_source TEXT, agent_path TEXT, agent_nickname TEXT, "
+                            + "agent_role TEXT)");
+            statement.execute(
+                    "CREATE TABLE thread_spawn_edges ("
+                            + "parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL "
+                            + "PRIMARY KEY, status TEXT NOT NULL)");
         }
     }
 
@@ -790,6 +1049,13 @@ class RestoreServiceTest {
 
         private FakeRepository(ChatSession session, ChatMessage... messages) {
             this.sessions.put(session.key(), session);
+            Collections.addAll(this.messages, messages);
+        }
+
+        private FakeRepository(List<ChatSession> sessions, ChatMessage... messages) {
+            for (ChatSession session : sessions) {
+                this.sessions.put(session.key(), session);
+            }
             Collections.addAll(this.messages, messages);
         }
 

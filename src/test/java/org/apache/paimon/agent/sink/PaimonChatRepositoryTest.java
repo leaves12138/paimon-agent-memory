@@ -16,6 +16,7 @@ import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.source.ReadBuilder;
 
@@ -38,7 +39,113 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PaimonChatRepositoryTest {
 
+    private static final Identifier SESSIONS_IDENTIFIER =
+            Identifier.create("ai_memory", "ai_chat_sessions");
+    private static final Identifier MESSAGES_IDENTIFIER =
+            Identifier.create("ai_memory", "ai_chat_messages");
+    private static final String SUBAGENT_SOURCE_JSON_COLUMN = "subagent_source_json";
+    private static final String MORAX_BTREE_INDEX_ENABLED_OPTION =
+            "morax.btree-index.enabled";
+    private static final String MORAX_BTREE_INDEX_COLUMN_OPTION =
+            "global-index.btree.index-column";
+
     @TempDir Path tempDir;
+
+    @Test
+    void createsSessionsTableWithNullableSubagentSourceColumn() throws Exception {
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
+            repository.initialize();
+            assertThat(repository.sessionsTableForRead().rowType().getFields())
+                    .extracting(field -> field.name())
+                    .endsWith(SUBAGENT_SOURCE_JSON_COLUMN);
+            assertThat(
+                            repository
+                                    .sessionsTableForRead()
+                                    .rowType()
+                                    .getFields()
+                                    .get(14)
+                                    .type()
+                                    .isNullable())
+                    .isTrue();
+        }
+    }
+
+    @Test
+    void onlyTheOwningWriterAddsSubagentColumnToLegacySessionsTable() throws Exception {
+        SessionKey key = new SessionKey("codex", "legacy-root");
+        Instant instant = Instant.parse("2026-01-01T00:00:00Z");
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
+            repository.initialize();
+            repository.commit(
+                    0L,
+                    Collections.singletonList(
+                            new SessionBatch(
+                                    session(key, instant, instant), Collections.emptyList())));
+        }
+        dropSubagentSourceColumn();
+        assertSubagentSourceColumnAbsent();
+
+        try (PaimonChatRepository restoreReader =
+                new PaimonChatRepository(configuration("restore-machine"))) {
+            assertThatThrownBy(restoreReader::initializeForRestore)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining(SUBAGENT_SOURCE_JSON_COLUMN);
+        }
+        assertSubagentSourceColumnAbsent();
+
+        try (PaimonChatRepository foreignWriter =
+                new PaimonChatRepository(configuration("another-writer"))) {
+            assertThatThrownBy(foreignWriter::initialize)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("only one writer per table pair");
+        }
+        assertSubagentSourceColumnAbsent();
+
+        try (PaimonChatRepository owningWriter = new PaimonChatRepository(configuration())) {
+            owningWriter.initialize();
+            assertThat(owningWriter.sessionsTableForRead().rowType().getFields())
+                    .extracting(field -> field.name())
+                    .endsWith(SUBAGENT_SOURCE_JSON_COLUMN);
+            assertThat(owningWriter.loadSessions().get(key).subagentSourceJson()).isNull();
+        }
+    }
+
+    @Test
+    void createsMessagesTableWithMoraxBtreeOptions() throws Exception {
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
+            repository.initialize();
+            assertMoraxBtreeOptions(repository.messagesTableForRead().options());
+        }
+    }
+
+    @Test
+    void onlyTheOwningWriterUpgradesLegacyMessagesTable() throws Exception {
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
+            repository.initialize();
+        }
+        removeMoraxBtreeOptions();
+
+        try (PaimonChatRepository restoreReader =
+                new PaimonChatRepository(configuration("restore-machine"))) {
+            restoreReader.initializeForRestore();
+            assertMoraxBtreeOptionsAbsent(restoreReader.messagesTableForRead().options());
+        }
+        assertMoraxBtreeOptionsAbsent(loadMessagesOptions());
+
+        try (PaimonChatRepository foreignWriter =
+                new PaimonChatRepository(configuration("another-writer"))) {
+            assertThatThrownBy(foreignWriter::initialize)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("only one writer per table pair");
+        }
+        assertMoraxBtreeOptionsAbsent(loadMessagesOptions());
+
+        try (PaimonChatRepository owningWriter = new PaimonChatRepository(configuration())) {
+            owningWriter.initialize();
+            assertMoraxBtreeOptions(owningWriter.messagesTableForRead().options());
+        }
+        assertMoraxBtreeOptions(loadMessagesOptions());
+    }
 
     @Test
     void readsMessagesWithSourceAndSessionFiltersAndRoundTripsArrayBlob() throws Exception {
@@ -60,7 +167,8 @@ class PaimonChatRepositoryTest {
                         createdAt,
                         createdAt,
                         createdAt,
-                        ingestedAt);
+                        ingestedAt,
+                        "{\"thread_spawn\":{\"parent_thread_id\":\"root\",\"depth\":1}}");
         ChatMessage selectedMessage =
                 new ChatMessage(
                         "m1",
@@ -100,6 +208,8 @@ class PaimonChatRepositoryTest {
             assertThat(repository.loadSessions().get(selectedKey).lastCommitId()).isZero();
             assertThat(repository.loadSessions().get(selectedKey).pendingCommitId()).isNull();
             assertThat(repository.loadSessions().get(selectedKey).pendingCursor()).isNull();
+            assertThat(repository.loadSessions().get(selectedKey).subagentSourceJson())
+                    .isEqualTo(selectedSession.subagentSourceJson());
 
             List<ChatMessage> selected = new ArrayList<>();
             repository.forEachMessage(
@@ -175,8 +285,6 @@ class PaimonChatRepositoryTest {
             assertThat(restoreReader.loadSessions()).containsKey(selectedKey);
         }
 
-        Identifier messagesIdentifier =
-                Identifier.create("ai_memory", "ai_chat_messages");
         try (Catalog catalog =
                 CatalogFactory.createCatalog(
                         CatalogContext.create(
@@ -186,7 +294,7 @@ class PaimonChatRepositoryTest {
                                                 "filesystem",
                                                 "warehouse",
                                                 tempDir.toString()))))) {
-            catalog.dropTable(messagesIdentifier, false);
+            catalog.dropTable(MESSAGES_IDENTIFIER, false);
         }
         try (PaimonChatRepository differentWriter =
                 new PaimonChatRepository(configuration("half-pair-writer"))) {
@@ -203,7 +311,7 @@ class PaimonChatRepositoryTest {
                                                 "filesystem",
                                                 "warehouse",
                                                 tempDir.toString()))))) {
-            assertThatThrownBy(() -> catalog.getTable(messagesIdentifier))
+            assertThatThrownBy(() -> catalog.getTable(MESSAGES_IDENTIFIER))
                     .isInstanceOf(Catalog.TableNotExistException.class);
         }
     }
@@ -221,6 +329,60 @@ class PaimonChatRepositoryTest {
                 createdAt,
                 createdAt,
                 ingestedAt);
+    }
+
+    private void removeMoraxBtreeOptions() throws Exception {
+        try (Catalog catalog = localCatalog()) {
+            catalog.alterTable(
+                    MESSAGES_IDENTIFIER,
+                    Arrays.asList(
+                            SchemaChange.removeOption(MORAX_BTREE_INDEX_ENABLED_OPTION),
+                            SchemaChange.removeOption(MORAX_BTREE_INDEX_COLUMN_OPTION)),
+                    false);
+        }
+    }
+
+    private void dropSubagentSourceColumn() throws Exception {
+        try (Catalog catalog = localCatalog()) {
+            catalog.alterTable(
+                    SESSIONS_IDENTIFIER,
+                    Collections.singletonList(
+                            SchemaChange.dropColumn(SUBAGENT_SOURCE_JSON_COLUMN)),
+                    false);
+        }
+    }
+
+    private void assertSubagentSourceColumnAbsent() throws Exception {
+        try (Catalog catalog = localCatalog()) {
+            assertThat(catalog.getTable(SESSIONS_IDENTIFIER).rowType().getFields())
+                    .extracting(field -> field.name())
+                    .doesNotContain(SUBAGENT_SOURCE_JSON_COLUMN);
+        }
+    }
+
+    private Map<String, String> loadMessagesOptions() throws Exception {
+        try (Catalog catalog = localCatalog()) {
+            return new LinkedHashMap<>(catalog.getTable(MESSAGES_IDENTIFIER).options());
+        }
+    }
+
+    private Catalog localCatalog() {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("metastore", "filesystem");
+        options.put("warehouse", tempDir.toString());
+        return CatalogFactory.createCatalog(CatalogContext.create(Options.fromMap(options)));
+    }
+
+    private static void assertMoraxBtreeOptions(Map<String, String> options) {
+        assertThat(options)
+                .containsEntry(MORAX_BTREE_INDEX_ENABLED_OPTION, "true")
+                .containsEntry(MORAX_BTREE_INDEX_COLUMN_OPTION, "session_id");
+    }
+
+    private static void assertMoraxBtreeOptionsAbsent(Map<String, String> options) {
+        assertThat(options)
+                .doesNotContainKeys(
+                        MORAX_BTREE_INDEX_ENABLED_OPTION, MORAX_BTREE_INDEX_COLUMN_OPTION);
     }
 
     private static ChatMessage message(

@@ -9,6 +9,11 @@ import org.apache.paimon.agent.model.ChatSession;
 import org.apache.paimon.agent.model.SessionBatch;
 import org.apache.paimon.agent.model.SessionKey;
 import org.apache.paimon.agent.sink.PaimonChatRepository;
+import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.stats.SimpleStats;
+import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.Split;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -22,6 +27,13 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -41,7 +53,9 @@ class PaimonDashboardDataStoreTest {
         SessionKey claudeKey = new SessionKey("claude", "claude-session");
         byte[] image = new byte[] {1, 2, 3, 4};
         String contentJson =
-                "{\"payload\":{\"text\":\"hello full-search needle\"},"
+                "{\"payload\":{\"text\":\"hello full-search needle "
+                        + "x".repeat(500)
+                        + "\"},"
                         + "\"_paimon_attachments\":[{\"index\":0,\"file_name\":\"tiny.png\","
                         + "\"mime_type\":\"image/png\",\"status\":\"stored\",\"size\":4,"
                         + "\"sha256\":\"digest\"}]}";
@@ -122,6 +136,8 @@ class PaimonDashboardDataStoreTest {
                 assertThat(messages.getItems().get(0).getMessageId())
                         .isEqualTo("message-image");
                 assertThat(messages.getItems().get(0).getContentPreview()).contains("needle");
+                assertThat(messages.getItems().get(0).getContentPreview().length())
+                        .isGreaterThan(240);
 
                 DashboardMessageDetail detail =
                         store.messageDetail("codex", "codex-session", "message-image", 10L)
@@ -204,6 +220,181 @@ class PaimonDashboardDataStoreTest {
                                         null, null, null, null, null, 1, 1));
                 assertThat(boundedMessages.getItems()).hasSize(1);
                 assertThat(boundedMessages.isTruncated()).isTrue();
+                DashboardPage<DashboardMessage> filteredMessages =
+                        bounded.listMessages(
+                                new MessageQuery(
+                                        "codex",
+                                        "codex-session",
+                                        "user",
+                                        "message",
+                                        null,
+                                        1,
+                                        1));
+                assertThat(filteredMessages.getItems())
+                        .extracting(DashboardMessage::getMessageId)
+                        .containsExactly("message-image");
+                assertThat(filteredMessages.isTruncated()).isFalse();
+            }
+        }
+    }
+
+    @Test
+    void filtersSubagentsBeforeSessionSearchPaginationAndTotalsButKeepsOverviewAllRows()
+            throws Exception {
+        Instant time = Instant.parse("2026-01-03T00:00:00Z");
+        SessionKey rootKey = new SessionKey("codex", "root-session");
+        SessionKey childKey = new SessionKey("codex", "child-session");
+        ChatSession root = session(rootKey, "Visible root", false, time);
+        ChatSession child =
+                session(
+                        childKey,
+                        "Hidden subagent needle",
+                        false,
+                        time.plusSeconds(1),
+                        "{\"thread_spawn\":{\"parent_thread_id\":\"root-session\"}}");
+
+        try (PaimonChatRepository repository =
+                        new PaimonChatRepository(configuration())) {
+            repository.initialize();
+            repository.commit(
+                    0L,
+                    Arrays.asList(
+                            new SessionBatch(root, Collections.emptyList()),
+                            new SessionBatch(child, Collections.emptyList())));
+
+            try (PaimonDashboardDataStore store =
+                    new PaimonDashboardDataStore(repository, 100)) {
+                DashboardOverview overview = store.overview();
+                assertThat(overview.getSessionCount()).isEqualTo(2L);
+                assertThat(overview.getActiveSessionCount()).isEqualTo(2L);
+                assertThat(overview.getSessionCountBySource()).containsEntry("codex", 2L);
+
+                DashboardPage<DashboardSession> visible =
+                        store.listSessions(new SessionQuery(null, null, null, 1, 1));
+                assertThat(visible.getTotal()).isEqualTo(1L);
+                assertThat(visible.isHasMore()).isFalse();
+                assertThat(visible.getItems())
+                        .extracting(DashboardSession::getSessionId)
+                        .containsExactly("root-session");
+
+                DashboardPage<DashboardSession> hiddenSearch =
+                        store.listSessions(
+                                new SessionQuery(
+                                        "codex", "subagent needle", false, 1, 10));
+                assertThat(hiddenSearch.getTotal()).isZero();
+                assertThat(hiddenSearch.getItems()).isEmpty();
+            }
+        }
+    }
+
+    @Test
+    void keepsSourcesIsolatedWhenSessionAndMessageKeysCollide() throws Exception {
+        AgentConfiguration configuration = configuration();
+        Instant time = Instant.parse("2026-02-01T00:00:00Z");
+        SessionKey codexKey = new SessionKey("codex", "shared-session");
+        SessionKey claudeKey = new SessionKey("claude", "shared-session");
+        String codexContent =
+                "{\"payload\":{\"text\":\"codex-only\"},"
+                        + "\"_paimon_attachments\":[{\"index\":0,\"file_name\":\"codex.bin\","
+                        + "\"mime_type\":\"application/octet-stream\",\"status\":\"stored\","
+                        + "\"size\":3}]}";
+        String claudeContent =
+                "{\"payload\":{\"text\":\"claude-only\"},"
+                        + "\"_paimon_attachments\":[{\"index\":0,\"file_name\":\"claude.bin\","
+                        + "\"mime_type\":\"application/octet-stream\",\"status\":\"stored\","
+                        + "\"size\":2}]}";
+        ChatMessage codexMessage =
+                new ChatMessage(
+                        "shared-message",
+                        codexKey,
+                        7L,
+                        "user",
+                        "message",
+                        codexContent,
+                        Collections.singletonList(
+                                AttachmentPayload.of(new byte[] {1, 2, 3})),
+                        time,
+                        time);
+        ChatMessage claudeMessage =
+                new ChatMessage(
+                        "shared-message",
+                        claudeKey,
+                        7L,
+                        "user",
+                        "message",
+                        claudeContent,
+                        Collections.singletonList(AttachmentPayload.of(new byte[] {8, 9})),
+                        time,
+                        time);
+
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration)) {
+            repository.initialize();
+            repository.commit(
+                    0L,
+                    Arrays.asList(
+                            new SessionBatch(
+                                    session(codexKey, "Codex collision", false, time),
+                                    Collections.singletonList(codexMessage)),
+                            new SessionBatch(
+                                    session(claudeKey, "Claude collision", false, time),
+                                    Collections.singletonList(claudeMessage))));
+
+            try (PaimonDashboardDataStore store =
+                    new PaimonDashboardDataStore(repository, 100)) {
+                DashboardPage<DashboardMessage> codex =
+                        store.listMessages(
+                                new MessageQuery(
+                                        "codex",
+                                        "shared-session",
+                                        "user",
+                                        "message",
+                                        null,
+                                        1,
+                                        10));
+                assertThat(codex.getTotal()).isEqualTo(1L);
+                assertThat(codex.getItems().get(0).getSourceType()).isEqualTo("codex");
+                assertThat(codex.getItems().get(0).getContentPreview())
+                        .contains("codex-only")
+                        .doesNotContain("claude-only");
+
+                DashboardPage<DashboardMessage> claude =
+                        store.listMessages(
+                                new MessageQuery(
+                                        "claude",
+                                        "shared-session",
+                                        "user",
+                                        "message",
+                                        null,
+                                        1,
+                                        10));
+                assertThat(claude.getTotal()).isEqualTo(1L);
+                assertThat(claude.getItems().get(0).getSourceType()).isEqualTo("claude");
+                assertThat(claude.getItems().get(0).getContentPreview())
+                        .contains("claude-only")
+                        .doesNotContain("codex-only");
+
+                DashboardMessageDetail detail =
+                        store.messageDetail(
+                                        "codex",
+                                        "shared-session",
+                                        "shared-message",
+                                        7L)
+                                .orElseThrow(AssertionError::new);
+                assertThat(detail.getContentJson()).isEqualTo(codexContent);
+                assertThat(detail.getAttachments()).hasSize(1);
+                assertThat(detail.getAttachments().get(0).getFileName()).isEqualTo("codex.bin");
+
+                AttachmentData attachment =
+                        store.attachment(
+                                        "codex",
+                                        "shared-session",
+                                        "shared-message",
+                                        7L,
+                                        0,
+                                        10L)
+                                .orElseThrow(AssertionError::new);
+                assertThat(attachment.getBytes()).containsExactly(1, 2, 3);
+                assertThat(attachment.getFileName()).isEqualTo("codex.bin");
             }
         }
     }
@@ -233,8 +424,287 @@ class PaimonDashboardDataStoreTest {
         }
     }
 
+    @Test
+    void closeInterruptsReadersAndOnlyThenClosesOwnedRepository() throws Exception {
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
+            repository.initialize();
+            ExecutorService readers = Executors.newFixedThreadPool(2);
+            CountDownLatch readerStarted = new CountDownLatch(1);
+            CountDownLatch blockReader = new CountDownLatch(1);
+            AtomicBoolean readerExited = new AtomicBoolean();
+            AtomicBoolean readerInterrupted = new AtomicBoolean();
+            AtomicBoolean repositoryClosed = new AtomicBoolean();
+            AtomicBoolean repositoryClosedWhileReaderRunning = new AtomicBoolean();
+            PaimonDashboardDataStore store =
+                    new PaimonDashboardDataStore(
+                            repository.sessionsTableForRead(),
+                            repository.messagesTableForRead(),
+                            10,
+                            () -> {
+                                repositoryClosedWhileReaderRunning.set(!readerExited.get());
+                                repositoryClosed.set(true);
+                            },
+                            readers,
+                            25L);
+            readers.execute(
+                    () -> {
+                        readerStarted.countDown();
+                        try {
+                            blockReader.await();
+                        } catch (InterruptedException expected) {
+                            readerInterrupted.set(true);
+                            Thread.currentThread().interrupt();
+                        } finally {
+                            readerExited.set(true);
+                        }
+                    });
+
+            try {
+                assertThat(readerStarted.await(5, TimeUnit.SECONDS)).isTrue();
+                store.close();
+
+                assertThat(readerInterrupted).isTrue();
+                assertThat(readerExited).isTrue();
+                assertThat(repositoryClosed).isTrue();
+                assertThat(repositoryClosedWhileReaderRunning).isFalse();
+            } finally {
+                blockReader.countDown();
+                readers.shutdownNow();
+                readers.awaitTermination(5, TimeUnit.SECONDS);
+                store.close();
+            }
+        }
+    }
+
+    @Test
+    void closeLeavesOwnedRepositoryOpenUntilStubbornReaderActuallyExits() throws Exception {
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
+            repository.initialize();
+            ExecutorService readers = Executors.newFixedThreadPool(2);
+            CountDownLatch readerStarted = new CountDownLatch(1);
+            CountDownLatch releaseReader = new CountDownLatch(1);
+            CountDownLatch readerExited = new CountDownLatch(1);
+            AtomicBoolean repositoryClosed = new AtomicBoolean();
+            PaimonDashboardDataStore store =
+                    new PaimonDashboardDataStore(
+                            repository.sessionsTableForRead(),
+                            repository.messagesTableForRead(),
+                            10,
+                            () -> repositoryClosed.set(true),
+                            readers,
+                            20L);
+            readers.execute(
+                    () -> {
+                        readerStarted.countDown();
+                        try {
+                            boolean released = false;
+                            while (!released) {
+                                try {
+                                    releaseReader.await();
+                                    released = true;
+                                } catch (InterruptedException ignored) {
+                                    // Simulates a reader blocked in code which does not honor the
+                                    // cancellation interrupt promptly.
+                                }
+                            }
+                        } finally {
+                            readerExited.countDown();
+                        }
+                    });
+
+            try {
+                assertThat(readerStarted.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(store::close)
+                        .isInstanceOf(IllegalStateException.class)
+                        .hasMessageContaining("remains open");
+                assertThat(repositoryClosed).isFalse();
+                assertThat(readerExited.getCount()).isEqualTo(1L);
+
+                releaseReader.countDown();
+                assertThat(readerExited.await(5, TimeUnit.SECONDS)).isTrue();
+                store.close();
+                assertThat(repositoryClosed).isTrue();
+            } finally {
+                releaseReader.countDown();
+                readers.shutdownNow();
+                readers.awaitTermination(5, TimeUnit.SECONDS);
+                store.close();
+            }
+        }
+    }
+
+    @Test
+    void parallelCancellationWaitsForActualRunnerExitInsteadOfFutureState() throws Exception {
+        ExecutorService readers = Executors.newSingleThreadExecutor();
+        CountDownLatch readerStarted = new CountDownLatch(1);
+        CountDownLatch cancellationObserved = new CountDownLatch(1);
+        CountDownLatch releaseReader = new CountDownLatch(1);
+        CountDownLatch readerExited = new CountDownLatch(1);
+        AtomicReference<Throwable> waitFailure = new AtomicReference<>();
+        Future<?> future =
+                readers.submit(
+                        () -> {
+                            readerStarted.countDown();
+                            try {
+                                boolean released = false;
+                                while (!released) {
+                                    try {
+                                        releaseReader.await();
+                                        released = true;
+                                    } catch (InterruptedException ignored) {
+                                        cancellationObserved.countDown();
+                                    }
+                                }
+                            } finally {
+                                readerExited.countDown();
+                            }
+                        });
+
+        try {
+            assertThat(readerStarted.await(5, TimeUnit.SECONDS)).isTrue();
+            Thread waiter =
+                    new Thread(
+                            () -> {
+                                try {
+                                    PaimonDashboardDataStore.cancelAndAwaitParallelTasks(
+                                            Collections.singletonList(future), readerExited, 5_000L);
+                                } catch (Throwable failure) {
+                                    waitFailure.set(failure);
+                                }
+                            },
+                            "parallel-cancellation-test");
+            waiter.start();
+
+            assertThat(cancellationObserved.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(future.isCancelled()).isTrue();
+            assertThat(readerExited.getCount()).isEqualTo(1L);
+            assertThat(waiter.isAlive()).isTrue();
+
+            releaseReader.countDown();
+            waiter.join(5_000L);
+            assertThat(waiter.isAlive()).isFalse();
+            assertThat(waitFailure.get()).isNull();
+            assertThat(readerExited.getCount()).isZero();
+        } finally {
+            releaseReader.countDown();
+            readers.shutdownNow();
+            readers.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void parallelCancellationTimesOutWhenRunnerIgnoresInterrupts() throws Exception {
+        ExecutorService readers = Executors.newSingleThreadExecutor();
+        CountDownLatch readerStarted = new CountDownLatch(1);
+        CountDownLatch releaseReader = new CountDownLatch(1);
+        CountDownLatch readerExited = new CountDownLatch(1);
+        Future<?> future =
+                readers.submit(
+                        () -> {
+                            readerStarted.countDown();
+                            try {
+                                boolean released = false;
+                                while (!released) {
+                                    try {
+                                        releaseReader.await();
+                                        released = true;
+                                    } catch (InterruptedException ignored) {
+                                        // Keep running past Future.cancel(true).
+                                    }
+                                }
+                            } finally {
+                                readerExited.countDown();
+                            }
+                        });
+
+        try {
+            assertThat(readerStarted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(
+                            () ->
+                                    PaimonDashboardDataStore.cancelAndAwaitParallelTasks(
+                                            Collections.singletonList(future), readerExited, 20L))
+                    .isInstanceOf(java.util.concurrent.TimeoutException.class)
+                    .hasMessageContaining("did not terminate");
+            assertThat(readerExited.getCount()).isEqualTo(1L);
+        } finally {
+            releaseReader.countDown();
+            assertThat(readerExited.await(5, TimeUnit.SECONDS)).isTrue();
+            readers.shutdownNow();
+            readers.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void splitsIndependentDataEvolutionRangesWithoutSeparatingOverlappingFiles() {
+        List<DataFileMeta> files =
+                Arrays.asList(
+                        dataFile("data-0.parquet", 0L),
+                        dataFile("blob-0.blob", 0L),
+                        dataFile("data-1.parquet", 10L),
+                        dataFile("blob-1.blob", 10L),
+                        dataFile("data-2.parquet", 20L),
+                        dataFile("blob-2.blob", 20L));
+        DataSplit planned =
+                DataSplit.builder()
+                        .withSnapshot(1L)
+                        .withPartition(BinaryRow.EMPTY_ROW)
+                        .withBucket(0)
+                        .withBucketPath("bucket-0")
+                        .withDataFiles(files)
+                        .rawConvertible(false)
+                        .build();
+
+        List<Split> independent =
+                PaimonDashboardDataStore.independentMessageSplits(
+                        Collections.singletonList(planned));
+
+        assertThat(independent).hasSize(3);
+        List<DataFileMeta> splitFiles =
+                independent.stream()
+                        .map(DataSplit.class::cast)
+                        .flatMap(split -> split.dataFiles().stream())
+                        .collect(Collectors.toList());
+        assertThat(splitFiles).containsExactlyInAnyOrderElementsOf(files);
+        assertThat(independent)
+                .allSatisfy(
+                        split -> {
+                            List<DataFileMeta> grouped = ((DataSplit) split).dataFiles();
+                            assertThat(grouped).hasSize(2);
+                            assertThat(grouped)
+                                    .extracting(DataFileMeta::firstRowId)
+                                    .containsOnly(grouped.get(0).firstRowId());
+                        });
+    }
+
+    private static DataFileMeta dataFile(String fileName, long firstRowId) {
+        return DataFileMeta.forAppend(
+                fileName,
+                100L,
+                10L,
+                SimpleStats.EMPTY_STATS,
+                firstRowId,
+                firstRowId + 9L,
+                0L,
+                Collections.emptyList(),
+                null,
+                null,
+                null,
+                null,
+                firstRowId,
+                null);
+    }
+
     private static ChatSession session(
             SessionKey key, String title, boolean archived, Instant time) {
+        return session(key, title, archived, time, null);
+    }
+
+    private static ChatSession session(
+            SessionKey key,
+            String title,
+            boolean archived,
+            Instant time,
+            String subagentSourceJson) {
         return new ChatSession(
                 key,
                 title,
@@ -246,7 +716,8 @@ class PaimonDashboardDataStoreTest {
                 time,
                 time,
                 time,
-                time);
+                time,
+                subagentSourceJson);
     }
 
     private AgentConfiguration configuration() {

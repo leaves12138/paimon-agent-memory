@@ -63,13 +63,25 @@ public final class SourceCursors {
         }
     }
 
-    public static boolean samePosition(String first, String second) {
+    /** Compares the physical file identity and byte offset used to detect scan progress. */
+    public static boolean samePhysicalPosition(String first, String second) {
+        FileCursor left = parseFileCursor(first);
+        FileCursor right = parseFileCursor(second);
+        return left.offset() == right.offset()
+                && Objects.equals(left.fileKey(), right.fileKey());
+    }
+
+    /**
+     * Compares logical record boundaries, including an anchor remapped into a replacement file.
+     */
+    public static boolean sameLogicalBoundary(String first, String second) {
         FileCursor left = parseFileCursor(first);
         FileCursor right = parseFileCursor(second);
 
         // An anchor identifies line content, not a unique occurrence. Repeated JSON events and
-        // blank lines are valid, so positions in the same file must match by byte offset. Anchors
-        // are only a cross-file identity after a source has explicitly remapped a replaced file.
+        // blank lines are valid, so offsets define boundaries within one file. Across a file
+        // replacement, however, the source has explicitly remapped the durable anchor and its byte
+        // offset may legitimately differ.
         if (Objects.equals(left.fileKey(), right.fileKey())
                 || left.fileKey() == null
                 || right.fileKey() == null) {

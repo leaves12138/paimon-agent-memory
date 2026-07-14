@@ -2,6 +2,7 @@ package org.apache.paimon.agent.source.claude;
 
 import org.apache.paimon.agent.model.SessionBatch;
 import org.apache.paimon.agent.source.AttachmentResolver;
+import org.apache.paimon.agent.source.ConversationSource;
 import org.apache.paimon.agent.source.IncrementalFiles;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -59,6 +60,42 @@ class ClaudeConversationSourceTest {
     }
 
     @Test
+    void scanCycleStopsAtTheEofCapturedWhenTheWakeUpStarted() throws Exception {
+        Path project = tempDir.resolve("projects/-tmp-project");
+        Files.createDirectories(project);
+        Path transcript = project.resolve("growing.jsonl");
+        Files.writeString(transcript, claudeUser("growing", "before") + "\n");
+        ObjectMapper mapper = new ObjectMapper();
+        ClaudeConversationSource source =
+                new ClaudeConversationSource(
+                        tempDir, mapper, new AttachmentResolver(mapper, true, false, 1024));
+
+        SessionBatch first;
+        try (ConversationSource.ScanCycle cycle = source.openScanCycle()) {
+            Files.writeString(
+                    transcript,
+                    claudeUser("growing", "after") + "\n",
+                    StandardOpenOption.APPEND);
+            first = cycle.scan(Collections.emptyMap(), 1, Collections.emptySet()).get(0);
+
+            assertThat(
+                            cycle.scan(
+                                    Collections.singletonMap(
+                                            first.session().key(), first.session()),
+                                    100,
+                                    Collections.emptySet()))
+                    .isEmpty();
+        }
+
+        List<SessionBatch> nextWake =
+                source.scan(
+                        Collections.singletonMap(first.session().key(), first.session()), 100);
+        assertThat(nextWake).singleElement();
+        assertThat(nextWake.get(0).messages()).singleElement();
+        assertThat(nextWake.get(0).messages().get(0).contentJson()).contains("after");
+    }
+
+    @Test
     void readsMainTranscriptAndExtractsNestedBase64Image() throws Exception {
         Path project = tempDir.resolve("projects/-tmp-project");
         Files.createDirectories(project);
@@ -92,6 +129,7 @@ class ClaudeConversationSourceTest {
 
         assertThat(batches).hasSize(1);
         assertThat(batches.get(0).session().title()).isEqualTo("Image chat");
+        assertThat(batches.get(0).session().subagentSourceJson()).isNull();
         assertThat(batches.get(0).messages()).hasSize(2);
         assertThat(batches.get(0).messages().get(0).attachments().get(0).bytes())
                 .isEqualTo("jpeg".getBytes(StandardCharsets.UTF_8));

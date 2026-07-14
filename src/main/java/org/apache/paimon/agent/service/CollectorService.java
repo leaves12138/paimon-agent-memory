@@ -18,7 +18,9 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -27,12 +29,15 @@ import java.util.concurrent.TimeUnit;
 public final class CollectorService implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(CollectorService.class);
+    private static final long DEFAULT_SHUTDOWN_TIMEOUT_MILLIS = 30_000L;
 
     private final ProjectConfig config;
     private final List<ConversationSource> sources;
     private final ChatRepository repository;
     private final PendingBatchStore batchStore;
     private final ScheduledExecutorService executor;
+    private final long shutdownTimeoutMillis;
+    private final Object closeLifecycleLock = new Object();
     private final Map<SessionKey, ChatSession> committedSessions;
     private final Map<SessionKey, PendingBatch> pending;
     private final Instant startedAt;
@@ -40,8 +45,9 @@ public final class CollectorService implements AutoCloseable {
     private long nextCommitIdentifier;
     private int nextSourceIndex;
     private boolean pendingFrozen;
-    private boolean closed;
-    private boolean running;
+    private volatile boolean closed;
+    private boolean resourcesClosed;
+    private volatile boolean running;
     private Instant lastScanAt;
     private Instant lastCommitAt;
     private Instant lastErrorAt;
@@ -52,7 +58,7 @@ public final class CollectorService implements AutoCloseable {
             List<ConversationSource> sources,
             ChatRepository repository)
             throws Exception {
-        this(config, sources, repository, null);
+        this(config, sources, repository, null, DEFAULT_SHUTDOWN_TIMEOUT_MILLIS);
     }
 
     public CollectorService(
@@ -61,10 +67,24 @@ public final class CollectorService implements AutoCloseable {
             ChatRepository repository,
             PendingBatchStore batchStore)
             throws Exception {
+        this(config, sources, repository, batchStore, DEFAULT_SHUTDOWN_TIMEOUT_MILLIS);
+    }
+
+    CollectorService(
+            ProjectConfig config,
+            List<ConversationSource> sources,
+            ChatRepository repository,
+            PendingBatchStore batchStore,
+            long shutdownTimeoutMillis)
+            throws Exception {
         this.config = config;
         this.sources = new ArrayList<>(sources);
         this.repository = repository;
         this.batchStore = batchStore;
+        if (shutdownTimeoutMillis <= 0L) {
+            throw new IllegalArgumentException("shutdownTimeoutMillis must be positive");
+        }
+        this.shutdownTimeoutMillis = shutdownTimeoutMillis;
         this.executor =
                 Executors.newSingleThreadScheduledExecutor(
                         runnable -> {
@@ -156,30 +176,23 @@ public final class CollectorService implements AutoCloseable {
                 TimeUnit.MILLISECONDS);
         executor.scheduleWithFixedDelay(
                 this::safeCommit,
-                config.commitInterval().toMillis(),
+                // The single-thread executor runs the initial scan registered above first, then
+                // immediately flushes its final partial chunk. Later flushes use the configured
+                // cadence independently from source scans.
+                0,
                 config.commitInterval().toMillis(),
                 TimeUnit.MILLISECONDS);
     }
 
     public void runOnce() throws Exception {
         synchronized (this) {
+            if (closed) {
+                throw new IllegalStateException("Collector service is already closed");
+            }
             running = true;
         }
         try {
-            Map<SessionKey, String> previousRecoveryProgress = incompleteRecoveryProgress();
-            while (true) {
-                scan();
-                Map<SessionKey, String> currentRecoveryProgress = incompleteRecoveryProgress();
-                if (currentRecoveryProgress == null) {
-                    break;
-                }
-                if (currentRecoveryProgress.equals(previousRecoveryProgress)) {
-                    LOG.warn(
-                            "Pending recovery made no progress; leaving its durable boundary for a later run");
-                    break;
-                }
-                previousRecoveryProgress = currentRecoveryProgress;
-            }
+            drainSources();
             commit();
         } catch (Exception failure) {
             recordError(failure);
@@ -191,49 +204,113 @@ public final class CollectorService implements AutoCloseable {
         }
     }
 
-    private void safeScan() {
+    void safeScan() {
         try {
-            scan();
-        } catch (Throwable error) {
+            drainSources();
+        } catch (Exception error) {
             recordError(error);
             LOG.error("Conversation scan failed; checkpoints were not advanced", error);
         }
     }
 
-    private void safeCommit() {
+    /** Repeats bounded source reads in the same wake-up until every source reports no progress. */
+    private void drainSources() throws Exception {
+        // A frozen batch may already have appended messages in Paimon. Retry that exact batch
+        // before touching any local source: opening a missing or unreadable source must never
+        // prevent an otherwise self-contained WAL retry from completing.
+        retryFrozenCommit();
+
+        List<ConversationSource.ScanCycle> cycles = new ArrayList<>(sources.size());
         try {
+            for (ConversationSource source : sources) {
+                cycles.add(
+                        Objects.requireNonNull(
+                                source.openScanCycle(),
+                                "Conversation source returned a null scan cycle: "
+                                        + source.sourceType()));
+            }
+
+            int progressedPasses = 0;
+            while (scan(cycles)) {
+                progressedPasses++;
+                // Each pass remains bounded by the configured source and in-memory chunk sizes. A
+                // full buffer is committed by scanInternal before the next pass continues.
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedException("Conversation backlog drain was interrupted");
+                }
+            }
+            if (progressedPasses > 1) {
+                LOG.info(
+                        "Caught up conversation sources in {} bounded scan passes during one "
+                                + "wake-up",
+                        progressedPasses);
+            }
+        } finally {
+            for (int index = cycles.size() - 1; index >= 0; index--) {
+                cycles.get(index).close();
+            }
+        }
+    }
+
+    void safeCommit() {
+        try {
+            // A commit wake-up that unfreezes an uncertain boundary also completes the backlog
+            // captured for that same wake-up instead of waiting for the next scan interval.
+            if (retryFrozenCommit()) {
+                drainSources();
+            }
             commit();
-        } catch (Throwable error) {
+        } catch (Exception error) {
             recordError(error);
             LOG.error(
-                    "Paimon commit {} failed; the same commit identifier will be retried",
+                    "Paimon commit or post-recovery catch-up {} failed; the same frozen commit "
+                            + "identifier will be retried when applicable",
                     nextCommitIdentifier,
                     error);
         }
     }
 
-    private synchronized void scan() throws Exception {
+    /** Returns true only when this call successfully completed a previously frozen commit. */
+    private synchronized boolean retryFrozenCommit() throws Exception {
+        if (closed || !pendingFrozen) {
+            return false;
+        }
+        LOG.info(
+                "Retrying frozen commit {} before opening conversation sources",
+                nextCommitIdentifier);
+        commitPending();
+        if (pendingFrozen) {
+            throw new IllegalStateException(
+                    "Frozen commit " + nextCommitIdentifier + " could not be completed");
+        }
+        return true;
+    }
+
+    private synchronized boolean scan(List<ConversationSource.ScanCycle> cycles)
+            throws Exception {
         if (closed) {
-            return;
+            return false;
         }
         try {
-            if (scanInternal()) {
-                lastScanAt = Instant.now();
-                lastError = null;
-                lastErrorAt = null;
-            }
+            ScanResult result = scanInternal(cycles);
+            lastScanAt = Instant.now();
+            lastError = null;
+            lastErrorAt = null;
+            return result == ScanResult.PROGRESSED;
         } catch (Exception failure) {
             recordError(failure);
             throw failure;
         }
     }
 
-    private boolean scanInternal() throws Exception {
+    private ScanResult scanInternal(List<ConversationSource.ScanCycle> cycles) throws Exception {
         if (pendingFrozen) {
-            LOG.warn(
-                    "Commit {} is awaiting retry; source scanning remains frozen at its fixed boundary",
+            LOG.info(
+                    "Retrying frozen commit {} before continuing this wake-up's source scan",
                     nextCommitIdentifier);
-            return false;
+            // Failure preserves the exact frozen batch and aborts this scan. Success advances the
+            // checkpoint before any later source record is read.
+            commitPending();
         }
         Set<SessionKey> recoverySessions = durableRecoverySessions();
         Map<SessionKey, ChatSession> effectiveCheckpoints = new HashMap<>(committedSessions);
@@ -252,27 +329,33 @@ public final class CollectorService implements AutoCloseable {
         }
 
         int remainingBuffer = Math.max(1, config.maxBufferRecords() - pendingMessageCount());
-        int sourceCount = sources.size();
+        int sourceCount = cycles.size();
         int sourceStart = sourceCount == 0 ? 0 : Math.floorMod(nextSourceIndex, sourceCount);
         if (sourceCount > 0) {
             nextSourceIndex = (sourceStart + 1) % sourceCount;
         }
+        boolean madeProgress = false;
         for (int sourceOffset = 0; sourceOffset < sourceCount; sourceOffset++) {
             if (remainingBuffer <= 0) {
                 break;
             }
-            ConversationSource source = sources.get((sourceStart + sourceOffset) % sourceCount);
+            ConversationSource.ScanCycle cycle =
+                    cycles.get((sourceStart + sourceOffset) % sourceCount);
             int remainingSources = sourceCount - sourceOffset;
             int fairShare = divideRoundingUp(remainingBuffer, remainingSources);
             List<SessionBatch> batches =
-                    source.scan(
+                    cycle.scan(
                             effectiveCheckpoints,
                             Math.min(config.maxScanRecordsPerSource(), fairShare),
                             recoverySessions);
             for (SessionBatch batch : batches) {
+                if (!batchMakesProgress(batch, effectiveCheckpoints, recoverySessions)) {
+                    continue;
+                }
                 merge(batch);
                 effectiveCheckpoints.put(batch.session().key(), batch.session());
                 remainingBuffer -= batch.messages().size();
+                madeProgress = true;
             }
         }
 
@@ -283,16 +366,51 @@ public final class CollectorService implements AutoCloseable {
                         nextCommitIdentifier,
                         pending.size(),
                         recoverySessions.size());
-                return true;
+                return madeProgress ? ScanResult.PROGRESSED : ScanResult.IDLE;
             }
             commit();
-            return true;
+            return ScanResult.PROGRESSED;
         }
 
         if (pendingMessageCount() >= config.maxBufferRecords()) {
             commit();
+            return ScanResult.PROGRESSED;
         }
-        return true;
+        return madeProgress ? ScanResult.PROGRESSED : ScanResult.IDLE;
+    }
+
+    private boolean batchMakesProgress(
+            SessionBatch batch,
+            Map<SessionKey, ChatSession> effectiveCheckpoints,
+            Set<SessionKey> recoverySessions) {
+        SessionKey key = batch.session().key();
+        ChatSession previous = effectiveCheckpoints.get(key);
+        boolean establishesRecovery = recoverySessions.contains(key) && !pending.containsKey(key);
+        boolean advancesCursor =
+                previous == null
+                        || !SourceCursors.samePhysicalPosition(
+                                previous.sourceCursor(), batch.session().sourceCursor());
+        boolean updatesMetadata = previous == null || sessionStateChanged(previous, batch.session());
+        if (establishesRecovery || advancesCursor || updatesMetadata) {
+            return true;
+        }
+        if (batch.sourceRecordsRead() > 0 || !batch.messages().isEmpty()) {
+            throw new IllegalStateException(
+                    "Source returned records without advancing session cursor for " + key);
+        }
+        return false;
+    }
+
+    private static boolean sessionStateChanged(ChatSession previous, ChatSession current) {
+        return !Objects.equals(previous.title(), current.title())
+                || !Objects.equals(previous.cwd(), current.cwd())
+                || previous.archived() != current.archived()
+                || !Objects.equals(previous.sourcePath(), current.sourcePath())
+                || !Objects.equals(previous.createdAt(), current.createdAt())
+                || !Objects.equals(previous.updatedAt(), current.updatedAt())
+                || !Objects.equals(previous.lastMessageAt(), current.lastMessageAt())
+                || !Objects.equals(
+                        previous.subagentSourceJson(), current.subagentSourceJson());
     }
 
     private void merge(SessionBatch batch) {
@@ -470,7 +588,7 @@ public final class CollectorService implements AutoCloseable {
             ChatSession durable = committedSessions.get(key);
             if (recovered == null
                     || durable == null
-                    || !SourceCursors.samePosition(
+                    || !SourceCursors.sameLogicalBoundary(
                             recovered.session.sourceCursor(), durable.pendingCursor())) {
                 return false;
             }
@@ -488,71 +606,113 @@ public final class CollectorService implements AutoCloseable {
         return recoverySessions;
     }
 
-    /** Returns null when no more recovery scanning is needed, otherwise its progress signature. */
-    private synchronized Map<SessionKey, String> incompleteRecoveryProgress() {
-        Set<SessionKey> recoverySessions = durableRecoverySessions();
-        if (recoverySessions.isEmpty() || recoveryComplete(recoverySessions)) {
-            return null;
-        }
-        Map<SessionKey, String> progress = new HashMap<>();
-        for (SessionKey key : recoverySessions) {
-            PendingBatch batch = pending.get(key);
-            progress.put(key, batch == null ? null : batch.session.sourceCursor());
-        }
-        return progress;
-    }
-
     @Override
     public void close() throws Exception {
-        synchronized (this) {
-            if (closed) {
+        synchronized (closeLifecycleLock) {
+            if (resourcesClosed) {
                 return;
             }
+            // Do not acquire the service monitor to publish the stop signal. A source scan holds
+            // that monitor while it updates pending state and can itself be the operation which
+            // needs shutdownNow's interrupt in order to terminate.
             closed = true;
             running = false;
-        }
 
-        // Do not hold the service monitor while waiting: an already-dispatched scheduled task
-        // may be waiting to enter scan() or commit(). Both methods now return immediately once
-        // closed, while an operation that started earlier is allowed to finish safely.
-        executor.shutdown();
-        InterruptedException interrupted = null;
-        try {
-            if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
+            executor.shutdown();
+
+            // Never close a Catalog while a previously dispatched task can still use it. A timed
+            // out close leaves resources open so a later close call can finish safely.
+            ExecutorShutdown collectorShutdown =
+                    shutdownAndAwait(executor, "collector executor");
+            if (!collectorShutdown.terminated) {
+                Exception shutdownFailure = executorShutdownFailure("collector executor");
+                InterruptedException interrupted = collectorShutdown.interrupted;
+                if (interrupted != null) {
+                    Thread.currentThread().interrupt();
+                    shutdownFailure = appendFailure(shutdownFailure, interrupted);
+                }
+                throw shutdownFailure;
             }
-        } catch (InterruptedException e) {
-            interrupted = e;
-            executor.shutdownNow();
-        }
 
-        Exception failure = null;
-        synchronized (this) {
-            try {
-                commitPending();
-            } catch (Exception e) {
-                failure = e;
+            Exception failure = null;
+            synchronized (this) {
+                try {
+                    commitPending();
+                } catch (Exception e) {
+                    failure = e;
+                }
             }
             try {
                 repository.close();
             } catch (Exception e) {
-                if (failure == null) {
-                    failure = e;
+                failure = appendFailure(failure, e);
+            }
+            resourcesClosed = true;
+
+            InterruptedException interrupted = collectorShutdown.interrupted;
+            if (interrupted != null) {
+                Thread.currentThread().interrupt();
+                failure = appendFailure(failure, interrupted);
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+    }
+
+    private ExecutorShutdown shutdownAndAwait(
+            ExecutorService service, String description) {
+        service.shutdown();
+        InterruptedException interrupted = null;
+        boolean terminated = false;
+        try {
+            terminated =
+                    service.awaitTermination(shutdownTimeoutMillis, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            interrupted = e;
+        }
+        if (!terminated) {
+            service.shutdownNow();
+            try {
+                terminated =
+                        service.awaitTermination(
+                                shutdownTimeoutMillis, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                if (interrupted == null) {
+                    interrupted = e;
                 } else {
-                    failure.addSuppressed(e);
+                    interrupted.addSuppressed(e);
                 }
             }
         }
-        if (interrupted != null) {
-            Thread.currentThread().interrupt();
-            if (failure == null) {
-                failure = interrupted;
-            } else {
-                failure.addSuppressed(interrupted);
-            }
+        if (!terminated) {
+            LOG.error("{} did not terminate after cancellation", description);
         }
-        if (failure != null) {
-            throw failure;
+        return new ExecutorShutdown(terminated, interrupted);
+    }
+
+    private static Exception executorShutdownFailure(String description) {
+        return new IllegalStateException(
+                description
+                        + " did not terminate; repository resources remain open to avoid "
+                        + "a concurrent close");
+    }
+
+    private static Exception appendFailure(Exception current, Exception added) {
+        if (current == null) {
+            return added;
+        }
+        current.addSuppressed(added);
+        return current;
+    }
+
+    private static final class ExecutorShutdown {
+        private final boolean terminated;
+        private final InterruptedException interrupted;
+
+        private ExecutorShutdown(boolean terminated, InterruptedException interrupted) {
+            this.terminated = terminated;
+            this.interrupted = interrupted;
         }
     }
 
@@ -575,5 +735,10 @@ public final class CollectorService implements AutoCloseable {
             this.startingCursor = startingCursor;
             this.startingCommitId = startingCommitId;
         }
+    }
+
+    private enum ScanResult {
+        IDLE,
+        PROGRESSED
     }
 }

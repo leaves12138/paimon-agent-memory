@@ -52,4 +52,45 @@ class IncrementalFilesTest {
                         .length;
         assertThat(remapped).isEqualTo(expected);
     }
+
+    @Test
+    void boundedAnchorSearchIgnoresMatchingLinesAppendedAfterTheWakeUp() throws Exception {
+        Path transcript = tempDir.resolve("growing.jsonl");
+        String prefix = "{\"event\":\"prefix\"}";
+        String anchor = "{\"event\":\"anchor\"}";
+        Files.writeString(transcript, prefix + '\n');
+        long boundary = Files.size(transcript);
+        Files.writeString(transcript, anchor + '\n', StandardOpenOption.APPEND);
+
+        String digest = IncrementalFiles.lineAnchor(anchor);
+        assertThat(
+                        IncrementalFiles.findOffsetAfterAnchor(
+                                new JsonlTailReader(), transcript, digest, 0L, boundary))
+                .isEqualTo(-1L);
+        assertThat(
+                        IncrementalFiles.findOffsetAfterAnchor(
+                                new JsonlTailReader(), transcript, digest, 0L))
+                .isEqualTo(Files.size(transcript));
+    }
+
+    @Test
+    void boundedAnchorSearchKeepsMatchBeforePartialEofLine() throws Exception {
+        Path transcript = tempDir.resolve("partial-tail.jsonl");
+        String prefix = "{\"event\":\"prefix\"}";
+        String anchor = "{\"event\":\"anchor\"}";
+        String partialTail = "{\"event\":\"still-writing";
+        Files.writeString(transcript, prefix + '\n' + anchor + '\n' + partialTail);
+        long boundary = Files.size(transcript);
+        long expectedOffset =
+                (prefix + '\n' + anchor + '\n').getBytes(StandardCharsets.UTF_8).length;
+
+        assertThat(
+                        IncrementalFiles.findOffsetAfterAnchor(
+                                new JsonlTailReader(),
+                                transcript,
+                                IncrementalFiles.lineAnchor(anchor),
+                                expectedOffset,
+                                boundary))
+                .isEqualTo(expectedOffset);
+    }
 }

@@ -29,6 +29,7 @@ This is a normal primary-key table containing the current sidebar state. Its pri
 | `updated_at` | TIMESTAMP(3) | Source update time |
 | `last_message_at` | TIMESTAMP(3) | Last collected message time |
 | `ingested_at` | TIMESTAMP(3) | Collector update time |
+| `subagent_source_json` | STRING | Native Codex subagent metadata; null for visible root sessions and Claude |
 
 ### `ai_chat_messages`
 
@@ -111,9 +112,13 @@ Independent collectors need different database or table names. Restore is read-o
 the tables with a different configured ID.
 
 The scan and commit intervals accept `ms`, `s`, `m`, `h`, `d`, or ISO-8601 duration syntax.
-Attachment sizes accept `B`, `KB`, `MB`, or `GB`. The commit interval is the regular flush cadence;
-reaching `collector.buffer.max-records` triggers an earlier commit to keep the in-memory backlog
-bounded by record count.
+Attachment sizes accept `B`, `KB`, `MB`, or `GB`. `collector.scan.max-records-per-source` is an
+internal per-read chunk size, not a per-wake-up limit. Each wake-up freezes the current transcript
+set and byte EOFs, then repeats bounded reads until every enabled source reaches those boundaries;
+records appended while it is running belong to the next wake-up. The commit interval is the regular flush cadence;
+reaching `collector.buffer.max-records` triggers an earlier commit, then the same wake-up continues
+scanning until it has caught up. Startup queues one immediate flush after the initial catch-up, so a
+large existing history does not leave its final partial chunk waiting for the first commit interval.
 
 ## Source behavior
 
@@ -121,7 +126,9 @@ Codex session metadata comes from `~/.codex/state_5.sqlite`, and transcripts com
 `threads.rollout_path`. The collector stores canonical `response_item.message` events, tool calls,
 and generated images. It deliberately ignores duplicate `event_msg.user_message` and
 `event_msg.agent_message` projections. Codex images, generated images, and files under
-`~/.codex/attachments` are copied into the BLOB array.
+`~/.codex/attachments` are copied into the BLOB array. Native Codex subagent source metadata is
+stored on the session row so hidden worker threads remain attached to their parent task instead of
+appearing as duplicate sidebar conversations.
 
 Claude Code transcripts are discovered from top-level files under
 `~/.claude/projects/<encoded-project>/<session-id>.jsonl`. `sessions-index.json` is optional title
@@ -147,7 +154,8 @@ Dashboard, regardless of this setting.
 The conversation view merges the collector's current in-memory batch with rows already visible in
 Paimon. Sessions with a new local increment are marked `有待提交更新`, while individual messages
 are marked `待上传` or `已上传`. Pending attachment bytes can be previewed through the same
-size-limited, loopback-only endpoint. A standalone Dashboard has no access to another process's
+size-limited, loopback-only endpoint. Codex subagent threads are hidden from the session sidebar,
+matching the native Codex task list. A standalone Dashboard has no access to another process's
 in-memory batch and therefore shows Paimon rows only.
 
 After starting the service, open the Dashboard directly with either loopback URL:
@@ -169,6 +177,17 @@ images are then fetched from Paimon only when the user opens their preview. The 
 `dashboard.max-attachment-preview-size`, while `dashboard.page-size`,
 `dashboard.max-page-size`, and `dashboard.max-scan-rows` bound interactive queries. On narrow
 screens the two panes become a session-list-to-chat navigation flow.
+
+Session and message list reads push equality filters into Paimon, exclude attachment BLOB bytes,
+and keep a bounded five-minute in-process query cache. Collector commits invalidate the cache, and
+the refresh controls force an immediate reload. The first page loads only the session list;
+overview statistics and message history no longer compete for the same initial request. Data
+Evolution message scans use smaller read-only splits so indexed rows spread across historical files
+can be read in parallel. `ai_chat_messages` enables Morax-managed incremental BTree indexing and
+compaction for `session_id` through the table options `morax.btree-index.enabled=true` and
+`global-index.btree.index-column=session_id`. The Dashboard reads with
+`global-index.search-mode=full`, so rows appended after the latest asynchronous index commit remain
+visible through a raw-data fallback. The index is an optimization, not a correctness requirement.
 
 To inspect the Paimon tables without running the collector, start a standalone read-only Dashboard
 in the foreground:
@@ -195,8 +214,9 @@ local and remote port so the Dashboard's strict Host validation is preserved.
 
 ## Build
 
-This project currently depends on the `ARRAY<BLOB>` implementation from Apache Paimon PR #8181.
-Install the local Paimon branch first, using JDK 11:
+This project currently depends on the `ARRAY<BLOB>` implementation introduced by Apache Paimon
+PR #8181 plus the local follow-up on `codex/list-blob-support`. Install that branch first, using
+JDK 11:
 
 ```bash
 cd <path-to-incubator-paimon2>
@@ -206,7 +226,8 @@ export PATH="$JAVA_HOME/bin:$PATH"
 mvn -pl paimon-bundle,paimon-filesystems/paimon-oss -am -DskipTests install
 ```
 
-This version was verified against local Paimon commit `f48a594fd4` on that branch.
+This version was verified against local Paimon commit `56b3c213ce87318c0d099a396eabf5964a6df8cd`
+on that branch.
 
 Then build and test the collector:
 
@@ -238,6 +259,12 @@ two files under `config/`, especially the Catalog endpoint and installation-uniq
 Catalog credentials can be placed in `paimon.properties`, so both configuration files are packaged
 with mode `0600`; the `config/` and `data/` directories use mode `0700`. Tar ownership is normalized
 to `root:root`; when a non-root user extracts the package, the files are owned by that user instead.
+
+When upgrading a version-1 installation whose `ai_chat_sessions` table predates
+`subagent_source_json`, stop the old daemon and start the new collector first with the same
+`collector.id`. The owning writer validates both tables, adds the nullable column, and backfills
+Codex metadata. Run standalone `dashboard` or `restore` commands only after that writer upgrade has
+completed; read-only commands deliberately never alter the table schema.
 
 The control script keeps the PID, process log, exact pending-commit WAL, and local restore/cache
 data under `data/`:
@@ -275,7 +302,12 @@ row. The original `response_item` events remain intact, while the restore adds d
 `task_started`, `user_message`, `agent_message`, and `task_complete` wrappers so Codex can rebuild
 browsable turns. When `--overwrite` is used, the old rollout is privately backed up and restored if
 the SQLite update fails. `--target-project` rewrites the restored cwd; otherwise an existing source
-cwd is reused, with the target Codex home's parent as the safe fallback.
+cwd is reused, with the target Codex home's parent as the safe fallback. Selecting a visible Codex
+task also restores all of its stored subagent descendants, writes their native `source` metadata
+and spawn edges, and keeps those worker threads hidden from the destination sidebar. Supplying a
+subagent ID resolves to its complete visible root task. Restored multi-agent tasks retain Codex V2
+metadata, root-session identity, direct-parent links, and a native context-window identifier;
+pending parent branches are skipped together so no orphan worker thread is installed.
 
 For Claude, the default target honors `CLAUDE_CONFIG_DIR` and otherwise uses `~/.claude`.
 `--target-project` rewrites the remote `cwd` to a project path on this machine and places the
@@ -301,7 +333,9 @@ tool runtime state, or resumable in-flight work. Restart Codex or Claude Code af
 
 The script validates that the selected Java runtime is version 11. Configuration and data paths
 can be overridden with `PAIMON_AGENT_PAIMON_CONFIG`, `PAIMON_AGENT_PROJECT_CONFIG`, and
-`PAIMON_AGENT_DATA_DIR`; JVM options can be supplied through `PAIMON_AGENT_JAVA_OPTS`. The
+`PAIMON_AGENT_DATA_DIR`. The launcher uses a conservative `-Xms256m -Xmx1024m` heap by default so
+the daemon does not reserve a workstation-sized heap. Additional JVM options (including an
+overriding `-Xmx`) can be supplied through `PAIMON_AGENT_JAVA_OPTS`. The
 start/stop control-lock wait and graceful-stop wait can be changed with
 `PAIMON_AGENT_CONTROL_TIMEOUT` and `PAIMON_AGENT_STOP_TIMEOUT`, respectively.
 

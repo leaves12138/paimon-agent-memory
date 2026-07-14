@@ -51,6 +51,8 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
     private final ObjectMapper objectMapper;
     private final Map<String, Path> existingRollouts = new HashMap<>();
     private final String cliVersion;
+    private Map<String, String> rootSessionIds = new HashMap<>();
+    private Set<String> multiAgentRootIds = new HashSet<>();
 
     CodexFormatRestorer(Path codexHome, ObjectMapper objectMapper) throws Exception {
         this(codexHome, null, objectMapper);
@@ -74,6 +76,26 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
         rejectSymbolicStateSidecars();
         validateStateDatabase();
         this.cliVersion = loadLatestCliVersion();
+    }
+
+    @Override
+    public void prepare(List<ChatSession> sessions) throws Exception {
+        Map<String, ChatSession> byId = new HashMap<>();
+        for (ChatSession session : sessions) {
+            byId.put(session.key().sessionId(), session);
+        }
+
+        Map<String, String> roots = new HashMap<>();
+        Set<String> multiAgentRoots = new HashSet<>();
+        for (ChatSession session : sessions) {
+            String rootId = resolveRootSessionId(session, byId);
+            roots.put(session.key().sessionId(), rootId);
+            if (subagentMetadata(session) != null) {
+                multiAgentRoots.add(rootId);
+            }
+        }
+        rootSessionIds = roots;
+        multiAgentRootIds = multiAgentRoots;
     }
 
     @Override
@@ -234,18 +256,44 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
 
     private String sessionMeta(ChatSession session, Instant createdAt, String cwd)
             throws Exception {
+        SubagentMetadata subagent = subagentMetadata(session);
         ObjectNode root = objectMapper.createObjectNode();
         root.put("timestamp", createdAt.toString());
         root.put("type", "session_meta");
         ObjectNode payload = root.putObject("payload");
         payload.put("id", session.key().sessionId());
-        payload.put("session_id", session.key().sessionId());
+        payload.put(
+                "session_id",
+                subagent == null
+                        ? session.key().sessionId()
+                        : requiredRootSessionId(session));
         payload.put("timestamp", createdAt.toString());
         payload.put("cwd", cwd);
         payload.put("originator", "Codex Desktop");
         payload.put("cli_version", cliVersion);
-        payload.put("source", "vscode");
-        payload.put("thread_source", "user");
+        payload.putObject("context_window")
+                .put(
+                        "window_id",
+                        restoredContextWindowId(
+                                session.key().sessionId(), createdAt));
+        if (subagent == null) {
+            payload.put("source", "vscode");
+            payload.put("thread_source", "user");
+        } else {
+            ObjectNode source = payload.putObject("source");
+            source.set("subagent", subagent.source.deepCopy());
+            payload.put("thread_source", "subagent");
+            putNullable(payload, "agent_path", subagent.agentPath);
+            putNullable(payload, "agent_nickname", subagent.agentNickname);
+            putNullable(payload, "agent_role", subagent.agentRole);
+            if (!isBlank(subagent.parentThreadId)) {
+                payload.put("parent_thread_id", subagent.parentThreadId);
+                payload.put("forked_from_id", subagent.parentThreadId);
+            }
+        }
+        if (subagent != null || multiAgentRootIds.contains(session.key().sessionId())) {
+            payload.put("multi_agent_version", "v2");
+        }
         payload.put("model_provider", "openai");
         payload.putObject("base_instructions").put("text", "");
         payload.putArray("dynamic_tools");
@@ -524,13 +572,22 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
                             "Codex session appeared during restore: "
                                     + session.key().sessionId());
                 }
+                SubagentMetadata subagent = subagentMetadata(session);
                 Map<String, Object> values =
-                        threadValues(session, rollout, cwd, preview, createdAt, updatedAt);
+                        threadValues(
+                                session,
+                                rollout,
+                                cwd,
+                                preview,
+                                createdAt,
+                                updatedAt,
+                                subagent);
                 if (exists) {
                     updateThread(connection, columns, values);
                 } else {
                     insertThread(connection, columns, values);
                 }
+                updateThreadSpawnEdge(connection, session.key().sessionId(), subagent);
                 connection.commit();
             } catch (Exception e) {
                 connection.rollback();
@@ -545,7 +602,9 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
             String cwd,
             String preview,
             Instant createdAt,
-            Instant updatedAt) {
+            Instant updatedAt,
+            SubagentMetadata subagent)
+            throws Exception {
         long createdMillis = createdAt.toEpochMilli();
         long updatedMillis = updatedAt.toEpochMilli();
         Map<String, Object> values = new LinkedHashMap<>();
@@ -553,7 +612,7 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
         values.put("rollout_path", rollout.toAbsolutePath().normalize().toString());
         values.put("created_at", createdMillis / 1000L);
         values.put("updated_at", updatedMillis / 1000L);
-        values.put("source", "vscode");
+        values.put("source", threadSourceJson(subagent));
         values.put("model_provider", "openai");
         values.put("cwd", cwd);
         values.put("title", isBlank(session.title()) ? preview : session.title());
@@ -568,12 +627,170 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
         values.put("memory_mode", "enabled");
         values.put("created_at_ms", createdMillis);
         values.put("updated_at_ms", updatedMillis);
-        values.put("thread_source", "user");
+        values.put("thread_source", subagent == null ? "user" : "subagent");
+        values.put("agent_path", subagent == null ? null : subagent.agentPath);
+        values.put("agent_nickname", subagent == null ? null : subagent.agentNickname);
+        values.put("agent_role", subagent == null ? null : subagent.agentRole);
         values.put("preview", preview);
         values.put("recency_at", updatedMillis / 1000L);
         values.put("recency_at_ms", updatedMillis);
         values.put("history_mode", "legacy");
         return values;
+    }
+
+    private String threadSourceJson(SubagentMetadata subagent) throws Exception {
+        if (subagent == null) {
+            return "vscode";
+        }
+        ObjectNode source = objectMapper.createObjectNode();
+        source.set("subagent", subagent.source.deepCopy());
+        return objectMapper.writeValueAsString(source);
+    }
+
+    private String requiredRootSessionId(ChatSession session) throws IOException {
+        String rootId = rootSessionIds.get(session.key().sessionId());
+        if (isBlank(rootId)) {
+            throw new IOException(
+                    "Codex restore graph was not prepared for subagent session "
+                            + session.key().sessionId());
+        }
+        return rootId;
+    }
+
+    private String resolveRootSessionId(
+            ChatSession session, Map<String, ChatSession> sessions) throws IOException {
+        Set<String> visited = new HashSet<>();
+        ChatSession current = session;
+        while (visited.add(current.key().sessionId())) {
+            SubagentMetadata subagent = subagentMetadata(current);
+            if (subagent == null) {
+                return current.key().sessionId();
+            }
+            if (isBlank(subagent.parentThreadId)) {
+                throw new IOException(
+                        "Codex subagent session "
+                                + current.key().sessionId()
+                                + " is missing parent_thread_id");
+            }
+            ChatSession parent = sessions.get(subagent.parentThreadId);
+            if (parent == null) {
+                throw new IOException(
+                        "Codex subagent session "
+                                + current.key().sessionId()
+                                + " references missing parent session "
+                                + subagent.parentThreadId);
+            }
+            current = parent;
+        }
+        throw new IOException(
+                "Cycle in Codex subagent restore graph at session "
+                        + session.key().sessionId());
+    }
+
+    private static String restoredContextWindowId(String sessionId, Instant createdAt) {
+        byte[] digest;
+        try {
+            digest =
+                    MessageDigest.getInstance("SHA-256")
+                            .digest(
+                                    ("paimon-context-window:" + sessionId)
+                                            .getBytes(StandardCharsets.UTF_8));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
+        long timestampMillis = Math.max(0L, createdAt.toEpochMilli()) & 0x0000ffffffffffffL;
+        long randomA = ((digest[0] & 0xffL) << 4) | ((digest[1] & 0xf0L) >>> 4);
+        long mostSignificant = (timestampMillis << 16) | 0x7000L | randomA;
+        long randomB = 0L;
+        for (int index = 2; index < 10; index++) {
+            randomB = (randomB << 8) | (digest[index] & 0xffL);
+        }
+        long leastSignificant =
+                (randomB & 0x3fffffffffffffffL) | 0x8000000000000000L;
+        return new UUID(mostSignificant, leastSignificant).toString();
+    }
+
+    private SubagentMetadata subagentMetadata(ChatSession session) throws IOException {
+        String value = session.subagentSourceJson();
+        if (isBlank(value)) {
+            return null;
+        }
+        JsonNode source = objectMapper.readTree(value);
+        if (source == null || !source.isObject()) {
+            throw new IOException(
+                    "Invalid Codex subagent source metadata for session "
+                            + session.key().sessionId());
+        }
+        return new SubagentMetadata(
+                source,
+                findText(source, "parent_thread_id"),
+                findText(source, "agent_path"),
+                findText(source, "agent_nickname"),
+                findText(source, "agent_role"));
+    }
+
+    private static String findText(JsonNode node, String field) {
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (node.isObject()) {
+            JsonNode direct = node.get(field);
+            if (direct != null && !direct.isNull() && direct.isValueNode()) {
+                String value = direct.asText();
+                if (!isBlank(value)) {
+                    return value;
+                }
+            }
+            java.util.Iterator<JsonNode> children = node.elements();
+            while (children.hasNext()) {
+                String value = findText(children.next(), field);
+                if (!isBlank(value)) {
+                    return value;
+                }
+            }
+        } else if (node.isArray()) {
+            for (JsonNode child : node) {
+                String value = findText(child, field);
+                if (!isBlank(value)) {
+                    return value;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static void putNullable(ObjectNode target, String field, String value) {
+        if (value == null) {
+            target.putNull(field);
+        } else {
+            target.put(field, value);
+        }
+    }
+
+    private static void updateThreadSpawnEdge(
+            Connection connection, String childThreadId, SubagentMetadata subagent)
+            throws Exception {
+        if (!tableExists(connection, "thread_spawn_edges")) {
+            return;
+        }
+        try (PreparedStatement delete =
+                connection.prepareStatement(
+                        "DELETE FROM thread_spawn_edges WHERE child_thread_id = ?")) {
+            delete.setString(1, childThreadId);
+            delete.executeUpdate();
+        }
+        if (subagent == null || isBlank(subagent.parentThreadId)) {
+            return;
+        }
+        try (PreparedStatement insert =
+                connection.prepareStatement(
+                        "INSERT INTO thread_spawn_edges "
+                                + "(parent_thread_id, child_thread_id, status) VALUES (?, ?, ?)")) {
+            insert.setString(1, subagent.parentThreadId);
+            insert.setString(2, childThreadId);
+            insert.setString(3, "open");
+            insert.executeUpdate();
+        }
     }
 
     private static void insertThread(
@@ -872,6 +1089,27 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
             this.type = type;
             this.notNull = notNull;
             this.defaultValue = defaultValue;
+        }
+    }
+
+    private static final class SubagentMetadata {
+        private final JsonNode source;
+        private final String parentThreadId;
+        private final String agentPath;
+        private final String agentNickname;
+        private final String agentRole;
+
+        private SubagentMetadata(
+                JsonNode source,
+                String parentThreadId,
+                String agentPath,
+                String agentNickname,
+                String agentRole) {
+            this.source = source;
+            this.parentThreadId = parentThreadId;
+            this.agentPath = agentPath;
+            this.agentNickname = agentNickname;
+            this.agentRole = agentRole;
         }
     }
 

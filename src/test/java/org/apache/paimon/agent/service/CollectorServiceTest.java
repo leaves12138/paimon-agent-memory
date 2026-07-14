@@ -9,10 +9,12 @@ import org.apache.paimon.agent.model.SessionBatch;
 import org.apache.paimon.agent.model.SessionKey;
 import org.apache.paimon.agent.sink.ChatRepository;
 import org.apache.paimon.agent.source.ConversationSource;
+import org.apache.paimon.agent.source.SourceCursors;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -24,6 +26,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -49,11 +54,335 @@ class CollectorServiceTest {
             service.runOnce();
         }
 
-        assertThat(calls).containsExactly("first", "second");
-        assertThat(budgets).containsExactly(1, 1);
+        assertThat(calls).containsExactly("first", "second", "second", "first");
+        assertThat(budgets).containsExactly(1, 1, 1, 2);
         assertThat(repository.committedBatches)
                 .extracting(batch -> batch.session().key())
                 .containsExactly(firstKey, secondKey);
+    }
+
+    @Test
+    void drainsAllChunksAndCommitsBoundedBatchesInOneWakeUp() throws Exception {
+        SessionKey key = new SessionKey("codex", "large-session");
+        List<Integer> budgets = new ArrayList<>();
+        FakeRepository repository = new FakeRepository();
+        ConversationSource source = cursorDrainingSource(key, 11, true, budgets);
+
+        try (CollectorService service =
+                new CollectorService(
+                        config(3, 4), Collections.singletonList(source), repository)) {
+            service.runOnce();
+            assertThat(service.pendingData().batches()).isEmpty();
+        }
+
+        assertThat(budgets).hasSizeGreaterThan(4).allMatch(budget -> budget <= 3);
+        assertThat(repository.committedIdentifiers).containsExactly(0L, 1L, 2L);
+        assertThat(repository.commits)
+                .allSatisfy(
+                        commit ->
+                                assertThat(
+                                                commit.stream()
+                                                        .mapToInt(batch -> batch.messages().size())
+                                                        .sum())
+                                        .isLessThanOrEqualTo(4));
+        assertThat(repository.commits.stream()
+                        .flatMap(List::stream)
+                        .flatMap(batch -> batch.messages().stream())
+                        .map(ChatMessage::messageId))
+                .containsExactly(
+                        "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10");
+        assertThat(repository.committedBatches.get(0).session().sourceCursor())
+                .isEqualTo("byte:11");
+    }
+
+    @Test
+    void commitsSubagentMetadataBackfillWithoutNewSourceRecords() throws Exception {
+        SessionKey key = new SessionKey("codex", "subagent-session");
+        ChatSession existing =
+                new ChatSession(
+                        key,
+                        "child task",
+                        "/tmp",
+                        false,
+                        "/tmp/subagent-session.jsonl",
+                        "byte:42",
+                        7L,
+                        Instant.EPOCH,
+                        Instant.EPOCH,
+                        Instant.EPOCH,
+                        Instant.EPOCH);
+        String subagentSource =
+                "{\"thread_spawn\":{\"parent_thread_id\":\"root-session\",\"depth\":1}}";
+        ConversationSource source =
+                new ConversationSource() {
+                    @Override
+                    public String sourceType() {
+                        return "codex";
+                    }
+
+                    @Override
+                    public List<SessionBatch> scan(
+                            Map<SessionKey, ChatSession> checkpoints,
+                            int maxRecords,
+                            Set<SessionKey> onlySessions) {
+                        ChatSession checkpoint = checkpoints.get(key);
+                        if (checkpoint.subagentSourceJson() != null) {
+                            return Collections.emptyList();
+                        }
+                        return Collections.singletonList(
+                                new SessionBatch(
+                                        checkpoint.withSubagentSourceJson(subagentSource),
+                                        Collections.emptyList(),
+                                        0,
+                                        checkpoint.sourceCursor(),
+                                        checkpoint.lastCommitId()));
+                    }
+                };
+        FakeRepository repository = new FakeRepository(existing);
+
+        try (CollectorService service =
+                new CollectorService(
+                        config(), Collections.singletonList(source), repository)) {
+            service.runOnce();
+        }
+
+        assertThat(repository.committedBatches).hasSize(1);
+        assertThat(repository.committedBatches.get(0).session().subagentSourceJson())
+                .isEqualTo(subagentSource);
+        assertThat(repository.committedBatches.get(0).messages()).isEmpty();
+    }
+
+    @Test
+    void timedOutCollectorWorkerLeavesResourcesOpenUntilASecondSafeClose()
+            throws Exception {
+        FakeRepository repository = new FakeRepository();
+        CountDownLatch collectorStarted = new CountDownLatch(1);
+        CountDownLatch collectorInterrupted = new CountDownLatch(1);
+        CountDownLatch releaseCollector = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean blockCollector =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        ConversationSource source =
+                new ConversationSource() {
+                    @Override
+                    public String sourceType() {
+                        return "codex";
+                    }
+
+                    @Override
+                    public List<SessionBatch> scan(
+                            Map<SessionKey, ChatSession> checkpoints,
+                            int maxRecords,
+                            Set<SessionKey> onlySessions) {
+                        if (!blockCollector.get()) {
+                            return Collections.emptyList();
+                        }
+                        collectorStarted.countDown();
+                        while (releaseCollector.getCount() > 0L) {
+                            try {
+                                releaseCollector.await();
+                            } catch (InterruptedException ignored) {
+                                collectorInterrupted.countDown();
+                            }
+                        }
+                        return Collections.emptyList();
+                    }
+                };
+        CollectorService service =
+                new CollectorService(
+                        config(),
+                        Collections.singletonList(source),
+                        repository,
+                        null,
+                        50L);
+        service.runOnce();
+
+        blockCollector.set(true);
+        service.start();
+        assertThat(collectorStarted.await(5, TimeUnit.SECONDS)).isTrue();
+        try {
+            assertThatThrownBy(service::close)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("collector executor did not terminate");
+            assertThat(collectorInterrupted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(repository.closed).isFalse();
+        } finally {
+            releaseCollector.countDown();
+            service.close();
+        }
+
+        assertThat(repository.closed).isTrue();
+    }
+
+    @Test
+    void safeScanDoesNotSwallowVirtualMachineErrors() throws Exception {
+        FakeRepository repository = new FakeRepository();
+        VirtualMachineError fatal = new TestVirtualMachineError();
+        ConversationSource source =
+                new ConversationSource() {
+                    @Override
+                    public String sourceType() {
+                        return "codex";
+                    }
+
+                    @Override
+                    public List<SessionBatch> scan(
+                            Map<SessionKey, ChatSession> checkpoints,
+                            int maxRecords,
+                            Set<SessionKey> onlySessions) {
+                        throw fatal;
+                    }
+                };
+
+        try (CollectorService service =
+                new CollectorService(
+                        config(), Collections.singletonList(source), repository)) {
+            assertThatThrownBy(service::safeScan).isSameAs(fatal);
+        }
+    }
+
+    @Test
+    void safeCommitDoesNotSwallowThreadDeath() throws Exception {
+        SessionKey key = new SessionKey("codex", "fatal-commit");
+        FakeRepository repository = new FakeRepository();
+        AtomicInteger scans = new AtomicInteger();
+        ConversationSource source =
+                new ConversationSource() {
+                    @Override
+                    public String sourceType() {
+                        return "codex";
+                    }
+
+                    @Override
+                    public List<SessionBatch> scan(
+                            Map<SessionKey, ChatSession> checkpoints,
+                            int maxRecords,
+                            Set<SessionKey> onlySessions) {
+                        if (scans.getAndIncrement() > 0) {
+                            return Collections.emptyList();
+                        }
+                        return Collections.singletonList(
+                                new SessionBatch(
+                                        new ChatSession(
+                                                key,
+                                                "title",
+                                                "/tmp",
+                                                false,
+                                                "/tmp/fatal.jsonl",
+                                                "byte:1",
+                                                -1L,
+                                                Instant.EPOCH,
+                                                Instant.EPOCH,
+                                                Instant.EPOCH,
+                                                Instant.EPOCH),
+                                        Collections.singletonList(message(key, "fatal-message")),
+                                        1,
+                                        null,
+                                        -1L));
+                    }
+                };
+
+        try (CollectorService service =
+                new CollectorService(
+                        config(), Collections.singletonList(source), repository)) {
+            service.safeScan();
+            ThreadDeath fatal = new ThreadDeath();
+            repository.failNextFatalCommit = fatal;
+            assertThatThrownBy(service::safeCommit).isSameAs(fatal);
+        }
+    }
+
+    @Test
+    void drainsIgnoredRawRecordsUntilTheCursorCatchesUp() throws Exception {
+        SessionKey key = new SessionKey("codex", "ignored-records");
+        List<Integer> budgets = new ArrayList<>();
+        FakeRepository repository = new FakeRepository();
+        ConversationSource source = cursorDrainingSource(key, 9, false, budgets);
+
+        try (CollectorService service =
+                new CollectorService(
+                        config(3, 4), Collections.singletonList(source), repository)) {
+            service.runOnce();
+            assertThat(service.pendingData().batches()).isEmpty();
+        }
+
+        assertThat(budgets).containsExactly(3, 3, 3, 3);
+        assertThat(repository.commitCalls).isOne();
+        assertThat(repository.committedBatches).hasSize(1);
+        assertThat(repository.committedBatches.get(0).messages()).isEmpty();
+        assertThat(repository.committedBatches.get(0).sourceRecordsRead()).isEqualTo(9);
+        assertThat(repository.committedBatches.get(0).session().sourceCursor())
+                .isEqualTo("byte:9");
+    }
+
+    @Test
+    void acceptsAPhysicalAdvanceAcrossAFileReplacementWithARepeatedAnchor()
+            throws Exception {
+        SessionKey key = new SessionKey("codex", "replaced-file");
+        String repeatedAnchor = "same-line-digest";
+        ChatSession checkpoint =
+                new ChatSession(
+                        key,
+                        "title",
+                        "/tmp",
+                        false,
+                        "/tmp/replaced-file.jsonl",
+                        SourceCursors.file(100L, "old-file", repeatedAnchor),
+                        5L,
+                        Instant.EPOCH,
+                        Instant.EPOCH,
+                        Instant.EPOCH,
+                        Instant.EPOCH);
+        FakeRepository repository = new FakeRepository(checkpoint);
+        ConversationSource source =
+                new ConversationSource() {
+                    @Override
+                    public String sourceType() {
+                        return "codex";
+                    }
+
+                    @Override
+                    public List<SessionBatch> scan(
+                            Map<SessionKey, ChatSession> checkpoints,
+                            int maxRecords,
+                            Set<SessionKey> onlySessions) {
+                        ChatSession previous = checkpoints.get(key);
+                        if (SourceCursors.parseByteOffset(previous.sourceCursor()) >= 200L) {
+                            return Collections.emptyList();
+                        }
+                        ChatSession advanced =
+                                new ChatSession(
+                                        key,
+                                        previous.title(),
+                                        previous.cwd(),
+                                        previous.archived(),
+                                        previous.sourcePath(),
+                                        SourceCursors.file(
+                                                200L, "new-file", repeatedAnchor),
+                                        previous.lastCommitId(),
+                                        previous.createdAt(),
+                                        previous.updatedAt(),
+                                        previous.lastMessageAt(),
+                                        previous.ingestedAt());
+                        return Collections.singletonList(
+                                new SessionBatch(
+                                        advanced,
+                                        Collections.singletonList(message(key, "repeated-line")),
+                                        1,
+                                        previous.sourceCursor(),
+                                        previous.lastCommitId()));
+                    }
+                };
+
+        try (CollectorService service =
+                new CollectorService(
+                        config(), Collections.singletonList(source), repository)) {
+            service.runOnce();
+        }
+
+        assertThat(repository.committedIdentifier).isEqualTo(6L);
+        assertThat(repository.committedBatches).hasSize(1);
+        assertThat(repository.committedBatches.get(0).session().sourceCursor())
+                .isEqualTo(SourceCursors.file(200L, "new-file", repeatedAnchor));
     }
 
     @Test
@@ -103,6 +432,9 @@ class CollectorServiceTest {
                             Map<SessionKey, ChatSession> checkpoints,
                             int maxRecords,
                             Set<SessionKey> onlySessions) {
+                        if (onlySessions.isEmpty()) {
+                            return Collections.emptyList();
+                        }
                         assertThat(onlySessions).containsExactly(key);
                         assertThat(checkpoints.get(key).sourceCursor()).isEqualTo("byte:0");
                         assertThat(checkpoints.get(key).pendingCursor()).isEqualTo("byte:10");
@@ -153,13 +485,26 @@ class CollectorServiceTest {
     }
 
     @Test
-    void doesNotCommitAnIncompleteMultiSessionRecovery() throws Exception {
-        SessionKey firstKey = new SessionKey("codex", "s1");
-        SessionKey secondKey = new SessionKey("codex", "s2");
-        FakeRepository repository =
-                new FakeRepository(
-                        pendingSession(firstKey, "byte:10"),
-                        pendingSession(secondKey, "byte:20"));
+    void completesRecoveryWhenThePendingAnchorMovesInAReplacementFile()
+            throws Exception {
+        SessionKey key = new SessionKey("codex", "remapped-recovery");
+        String targetAnchor = "pending-boundary-anchor";
+        ChatSession durable =
+                new ChatSession(
+                        key,
+                        "title",
+                        "/tmp",
+                        false,
+                        "/tmp/remapped-recovery.jsonl",
+                        SourceCursors.file(100L, "old-file", "committed-anchor"),
+                        6L,
+                        7L,
+                        SourceCursors.file(200L, "old-file", targetAnchor),
+                        Instant.EPOCH,
+                        Instant.EPOCH,
+                        null,
+                        Instant.EPOCH);
+        FakeRepository repository = new FakeRepository(durable);
         ConversationSource source =
                 new ConversationSource() {
                     @Override
@@ -172,6 +517,78 @@ class CollectorServiceTest {
                             Map<SessionKey, ChatSession> checkpoints,
                             int maxRecords,
                             Set<SessionKey> onlySessions) {
+                        if (onlySessions.isEmpty()) {
+                            return Collections.emptyList();
+                        }
+                        ChatSession checkpoint = checkpoints.get(key);
+                        if ("new-file"
+                                .equals(
+                                        SourceCursors.parseFileCursor(
+                                                        checkpoint.sourceCursor())
+                                                .fileKey())) {
+                            return Collections.emptyList();
+                        }
+                        ChatSession recovered =
+                                new ChatSession(
+                                        key,
+                                        checkpoint.title(),
+                                        checkpoint.cwd(),
+                                        checkpoint.archived(),
+                                        checkpoint.sourcePath(),
+                                        SourceCursors.file(240L, "new-file", targetAnchor),
+                                        checkpoint.lastCommitId(),
+                                        checkpoint.createdAt(),
+                                        checkpoint.updatedAt(),
+                                        checkpoint.lastMessageAt(),
+                                        checkpoint.ingestedAt());
+                        return Collections.singletonList(
+                                new SessionBatch(
+                                        recovered,
+                                        Collections.singletonList(
+                                                message(key, "recovered-message")),
+                                        1,
+                                        checkpoint.sourceCursor(),
+                                        checkpoint.lastCommitId()));
+                    }
+                };
+
+        try (CollectorService service =
+                new CollectorService(
+                        config(), Collections.singletonList(source), repository)) {
+            service.runOnce();
+            assertThat(service.pendingData().batches()).isEmpty();
+        }
+
+        assertThat(repository.committedIdentifiers).containsExactly(7L);
+        assertThat(repository.committedBatches).hasSize(1);
+        assertThat(repository.committedBatches.get(0).session().sourceCursor())
+                .isEqualTo(SourceCursors.file(240L, "new-file", targetAnchor));
+    }
+
+    @Test
+    void doesNotCommitAnIncompleteMultiSessionRecovery() throws Exception {
+        SessionKey firstKey = new SessionKey("codex", "s1");
+        SessionKey secondKey = new SessionKey("codex", "s2");
+        FakeRepository repository =
+                new FakeRepository(
+                        pendingSession(firstKey, "byte:10"),
+                        pendingSession(secondKey, "byte:20"));
+        int[] scans = {0};
+        ConversationSource source =
+                new ConversationSource() {
+                    @Override
+                    public String sourceType() {
+                        return "codex";
+                    }
+
+                    @Override
+                    public List<SessionBatch> scan(
+                            Map<SessionKey, ChatSession> checkpoints,
+                            int maxRecords,
+                            Set<SessionKey> onlySessions) {
+                        if (scans[0]++ > 0) {
+                            return Collections.emptyList();
+                        }
                         ChatSession recovered =
                                 checkpoints
                                         .get(firstKey)
@@ -196,7 +613,7 @@ class CollectorServiceTest {
     }
 
     @Test
-    void freezesTheBatchAfterAnUncertainCommitFailure() throws Exception {
+    void retriesAFrozenBatchAndDrainsTheRemainingTailInTheSameWakeUp() throws Exception {
         SessionKey key = new SessionKey("codex", "s1");
         FakeRepository repository = new FakeRepository();
         repository.failNextCommit = true;
@@ -213,7 +630,18 @@ class CollectorServiceTest {
                             Map<SessionKey, ChatSession> checkpoints,
                             int maxRecords,
                             Set<SessionKey> onlySessions) {
+                        ChatSession previous = checkpoints.get(key);
+                        int start =
+                                Math.toIntExact(
+                                        SourceCursors.parseByteOffset(
+                                                previous == null
+                                                        ? null
+                                                        : previous.sourceCursor()));
+                        if (start >= 20) {
+                            return Collections.emptyList();
+                        }
                         scans[0]++;
+                        int end = start + 10;
                         ChatSession session =
                                 new ChatSession(
                                         key,
@@ -221,8 +649,8 @@ class CollectorServiceTest {
                                         "/tmp",
                                         false,
                                         "/tmp/s1.jsonl",
-                                        "byte:10",
-                                        -1L,
+                                        SourceCursors.byteOffset(end),
+                                        previous == null ? -1L : previous.lastCommitId(),
                                         Instant.EPOCH,
                                         Instant.EPOCH,
                                         Instant.EPOCH,
@@ -230,16 +658,17 @@ class CollectorServiceTest {
                         return Collections.singletonList(
                                 new SessionBatch(
                                         session,
-                                        Collections.singletonList(message(key, "m1")),
+                                        Collections.singletonList(
+                                                message(key, start == 0 ? "m1" : "m2")),
                                         1,
-                                        null,
-                                        -1L));
+                                        previous == null ? null : previous.sourceCursor(),
+                                        previous == null ? -1L : previous.lastCommitId()));
                     }
                 };
 
         try (CollectorService service =
                 new CollectorService(
-                        config(), Collections.singletonList(source), repository)) {
+                        config(100, 1), Collections.singletonList(source), repository)) {
             assertThatThrownBy(service::runOnce).isInstanceOf(Exception.class);
             assertThat(service.pendingData().commitIdentifier()).isZero();
             assertThat(service.pendingData().batches()).hasSize(1);
@@ -249,10 +678,95 @@ class CollectorServiceTest {
             service.runOnce();
         }
 
-        assertThat(scans[0]).isEqualTo(1);
-        assertThat(repository.commitCalls).isEqualTo(2);
+        assertThat(scans[0]).isEqualTo(2);
+        assertThat(repository.commitCalls).isEqualTo(3);
+        assertThat(repository.committedIdentifiers).containsExactly(0L, 1L);
+        assertThat(repository.commits)
+                .flatExtracting(batch -> batch)
+                .flatExtracting(SessionBatch::messages)
+                .extracting(ChatMessage::messageId)
+                .containsExactly("m1", "m2");
         assertThat(repository.committedBatches.get(0).session().sourceCursor())
-                .isEqualTo("byte:10");
+                .isEqualTo("byte:20");
+    }
+
+    @Test
+    void runOnceRetriesAFrozenWalBeforeOpeningAnUnavailableSource() throws Exception {
+        SessionKey key = new SessionKey("codex", "wal-before-open");
+        PendingBatchStore store =
+                new PendingBatchStore(
+                        tempDir.resolve("wal-before-open"),
+                        "collector-test",
+                        "table-pair-a");
+        store.save(0L, Collections.singletonList(frozenBatch(key)));
+        FakeRepository repository = new FakeRepository();
+        AtomicInteger openCalls = new AtomicInteger();
+        ConversationSource unavailable = unavailableSource("codex", openCalls, null);
+
+        try (CollectorService service =
+                new CollectorService(
+                        config(), Collections.singletonList(unavailable), repository, store)) {
+            assertThatThrownBy(service::runOnce)
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("source unavailable");
+
+            assertThat(repository.committedIdentifiers).containsExactly(0L);
+            assertThat(store.pendingFile()).doesNotExist();
+            assertThat(openCalls).hasValue(1);
+        }
+    }
+
+    @Test
+    void scheduledCommitRetriesAFrozenBatchBeforeASecondSourceOpenFails()
+            throws Exception {
+        SessionKey key = new SessionKey("codex", "scheduled-before-open");
+        FakeRepository repository = new FakeRepository();
+        repository.failNextCommit = true;
+        AtomicInteger openCalls = new AtomicInteger();
+        CountDownLatch failedSecondOpen = new CountDownLatch(1);
+        ConversationSource source =
+                new ConversationSource() {
+                    @Override
+                    public String sourceType() {
+                        return "codex";
+                    }
+
+                    @Override
+                    public List<SessionBatch> scan(
+                            Map<SessionKey, ChatSession> checkpoints,
+                            int maxRecords,
+                            Set<SessionKey> onlySessions) {
+                        throw new AssertionError("collector must use the opened scan cycle");
+                    }
+
+                    @Override
+                    public ScanCycle openScanCycle() throws Exception {
+                        if (openCalls.getAndIncrement() > 0) {
+                            failedSecondOpen.countDown();
+                            throw new IOException("source unavailable after commit failure");
+                        }
+                        return new ScanCycle() {
+                            @Override
+                            public List<SessionBatch> scan(
+                                    Map<SessionKey, ChatSession> checkpoints,
+                                    int maxRecords,
+                                    Set<SessionKey> onlySessions) {
+                                return Collections.singletonList(frozenBatch(key));
+                            }
+                        };
+                    }
+                };
+
+        try (CollectorService service =
+                new CollectorService(
+                        config(100, 1), Collections.singletonList(source), repository)) {
+            service.start();
+
+            assertThat(repository.successfulCommit.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(failedSecondOpen.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(repository.committedIdentifiers).containsExactly(0L);
+            assertThat(openCalls.get()).isGreaterThanOrEqualTo(2);
+        }
     }
 
     @Test
@@ -270,7 +784,8 @@ class CollectorServiceTest {
                         Instant.EPOCH,
                         Instant.EPOCH,
                         Instant.EPOCH,
-                        Instant.EPOCH);
+                        Instant.EPOCH,
+                        "{\"thread_spawn\":{\"parent_thread_id\":\"root\",\"depth\":1}}");
         ChatMessage message =
                 new ChatMessage(
                         "wal-message",
@@ -295,6 +810,9 @@ class CollectorServiceTest {
                             Map<SessionKey, ChatSession> checkpoints,
                             int maxRecords,
                             Set<SessionKey> onlySessions) {
+                        if (checkpoints.containsKey(key)) {
+                            return Collections.emptyList();
+                        }
                         return Collections.singletonList(
                                 new SessionBatch(
                                         session,
@@ -342,6 +860,7 @@ class CollectorServiceTest {
                 .isInstanceOf(java.io.IOException.class)
                 .hasMessageContaining("checksum mismatch");
 
+        FakeRepository restartedRepository = new FakeRepository();
         ConversationSource deletedSource =
                 new ConversationSource() {
                     @Override
@@ -354,10 +873,11 @@ class CollectorServiceTest {
                             Map<SessionKey, ChatSession> checkpoints,
                             int maxRecords,
                             Set<SessionKey> onlySessions) {
-                        throw new AssertionError("the deleted source must not be scanned");
+                        assertThat(restartedRepository.committedIdentifier).isZero();
+                        assertThat(checkpoints.get(key).sourceCursor()).isEqualTo("byte:10");
+                        return Collections.emptyList();
                     }
                 };
-        FakeRepository restartedRepository = new FakeRepository();
         try (CollectorService restarted =
                 new CollectorService(
                         config(),
@@ -369,6 +889,13 @@ class CollectorServiceTest {
 
         assertThat(restartedRepository.committedIdentifier).isZero();
         assertThat(restartedRepository.committedBatches).hasSize(1);
+        assertThat(
+                        restartedRepository
+                                .committedBatches
+                                .get(0)
+                                .session()
+                                .subagentSourceJson())
+                .isEqualTo(session.subagentSourceJson());
         assertThat(
                         restartedRepository
                                 .committedBatches
@@ -412,6 +939,55 @@ class CollectorServiceTest {
                 Instant.EPOCH);
     }
 
+    private static SessionBatch frozenBatch(SessionKey key) {
+        ChatSession session =
+                new ChatSession(
+                        key,
+                        "title",
+                        "/tmp",
+                        false,
+                        "/tmp/" + key.sessionId() + ".jsonl",
+                        "byte:10",
+                        -1L,
+                        Instant.EPOCH,
+                        Instant.EPOCH,
+                        Instant.EPOCH,
+                        Instant.EPOCH);
+        return new SessionBatch(
+                session,
+                Collections.singletonList(message(key, "frozen-message")),
+                1,
+                null,
+                -1L);
+    }
+
+    private static ConversationSource unavailableSource(
+            String sourceType, AtomicInteger openCalls, CountDownLatch attemptedOpen) {
+        return new ConversationSource() {
+            @Override
+            public String sourceType() {
+                return sourceType;
+            }
+
+            @Override
+            public List<SessionBatch> scan(
+                    Map<SessionKey, ChatSession> checkpoints,
+                    int maxRecords,
+                    Set<SessionKey> onlySessions) {
+                throw new AssertionError("unavailable source must not be scanned");
+            }
+
+            @Override
+            public ScanCycle openScanCycle() throws Exception {
+                openCalls.incrementAndGet();
+                if (attemptedOpen != null) {
+                    attemptedOpen.countDown();
+                }
+                throw new IOException("source unavailable");
+            }
+        };
+    }
+
     private static ConversationSource sourceWithOneMessage(
             String name, SessionKey key, List<String> calls, List<Integer> budgets) {
         return new ConversationSource() {
@@ -427,6 +1003,9 @@ class CollectorServiceTest {
                     Set<SessionKey> onlySessions) {
                 calls.add(name);
                 budgets.add(maxRecords);
+                if (checkpoints.containsKey(key)) {
+                    return Collections.emptyList();
+                }
                 ChatSession session =
                         new ChatSession(
                                 key,
@@ -447,6 +1026,59 @@ class CollectorServiceTest {
                                 1,
                                 null,
                                 -1L));
+            }
+        };
+    }
+
+    private static ConversationSource cursorDrainingSource(
+            SessionKey key, int totalRecords, boolean emitMessages, List<Integer> budgets) {
+        return new ConversationSource() {
+            @Override
+            public String sourceType() {
+                return key.sourceType();
+            }
+
+            @Override
+            public List<SessionBatch> scan(
+                    Map<SessionKey, ChatSession> checkpoints,
+                    int maxRecords,
+                    Set<SessionKey> onlySessions) {
+                budgets.add(maxRecords);
+                ChatSession previous = checkpoints.get(key);
+                int start =
+                        Math.toIntExact(
+                                SourceCursors.parseByteOffset(
+                                        previous == null ? null : previous.sourceCursor()));
+                if (start >= totalRecords) {
+                    return Collections.emptyList();
+                }
+                int end = Math.min(totalRecords, start + maxRecords);
+                List<ChatMessage> messages = new ArrayList<>();
+                if (emitMessages) {
+                    for (int index = start; index < end; index++) {
+                        messages.add(message(key, "m" + index));
+                    }
+                }
+                ChatSession session =
+                        new ChatSession(
+                                key,
+                                "title",
+                                "/tmp",
+                                false,
+                                "/tmp/" + key.sessionId() + ".jsonl",
+                                SourceCursors.byteOffset(end),
+                                previous == null ? -1L : previous.lastCommitId(),
+                                Instant.EPOCH,
+                                Instant.EPOCH,
+                                Instant.EPOCH,
+                                Instant.EPOCH);
+                return Collections.singletonList(
+                        new SessionBatch(
+                                session,
+                                messages,
+                                end - start,
+                                previous == null ? null : previous.sourceCursor(),
+                                previous == null ? -1L : previous.lastCommitId()));
             }
         };
     }
@@ -474,6 +1106,10 @@ class CollectorServiceTest {
     }
 
     private ProjectConfig config(int maxBufferRecords) {
+        return config(100, maxBufferRecords);
+    }
+
+    private ProjectConfig config(int maxScanRecordsPerSource, int maxBufferRecords) {
         return new ProjectConfig(
                 "db",
                 "sessions",
@@ -487,7 +1123,7 @@ class CollectorServiceTest {
                 true,
                 false,
                 1024,
-                100,
+                maxScanRecordsPerSource,
                 maxBufferRecords,
                 0,
                 Duration.ofSeconds(1));
@@ -500,6 +1136,11 @@ class CollectorServiceTest {
 
         private int commitCalls;
         private boolean failNextCommit;
+        private Error failNextFatalCommit;
+        private volatile boolean closed;
+        private final List<Long> committedIdentifiers = new ArrayList<>();
+        private final List<List<SessionBatch>> commits = new ArrayList<>();
+        private final CountDownLatch successfulCommit = new CountDownLatch(1);
 
         private FakeRepository(ChatSession... initialSessions) {
             for (ChatSession session : initialSessions) {
@@ -518,15 +1159,29 @@ class CollectorServiceTest {
         @Override
         public void commit(long commitIdentifier, List<SessionBatch> batches) {
             commitCalls++;
+            if (failNextFatalCommit != null) {
+                Error fatal = failNextFatalCommit;
+                failNextFatalCommit = null;
+                throw fatal;
+            }
             if (failNextCommit) {
                 failNextCommit = false;
                 throw new IllegalStateException("uncertain test failure");
             }
             this.committedIdentifier = commitIdentifier;
             this.committedBatches = batches;
+            this.committedIdentifiers.add(commitIdentifier);
+            this.commits.add(new ArrayList<>(batches));
+            this.successfulCommit.countDown();
         }
 
         @Override
-        public void close() {}
+        public void close() {
+            closed = true;
+        }
+    }
+
+    private static final class TestVirtualMachineError extends VirtualMachineError {
+        private static final long serialVersionUID = 1L;
     }
 }

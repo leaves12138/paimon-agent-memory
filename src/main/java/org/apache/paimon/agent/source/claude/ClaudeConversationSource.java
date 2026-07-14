@@ -12,6 +12,7 @@ import org.apache.paimon.agent.source.IncrementalFiles;
 import org.apache.paimon.agent.source.JsonlRecord;
 import org.apache.paimon.agent.source.JsonlTailReader;
 import org.apache.paimon.agent.source.ResolvedAttachments;
+import org.apache.paimon.agent.source.ScanFileSnapshot;
 import org.apache.paimon.agent.source.SourceCursors;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -68,17 +69,64 @@ public final class ClaudeConversationSource implements ConversationSource {
             int maxRecords,
             Set<SessionKey> onlySessions)
             throws Exception {
+        try (ScanCycle cycle = openScanCycle()) {
+            return cycle.scan(checkpoints, maxRecords, onlySessions);
+        }
+    }
+
+    @Override
+    public ScanCycle openScanCycle() throws Exception {
+        ScanWindow window = captureScanWindow();
+        return new ScanCycle() {
+            @Override
+            public List<SessionBatch> scan(
+                    Map<SessionKey, ChatSession> checkpoints,
+                    int maxRecords,
+                    Set<SessionKey> onlySessions)
+                    throws Exception {
+                return scanWindow(window, checkpoints, maxRecords, onlySessions);
+            }
+        };
+    }
+
+    private ScanWindow captureScanWindow() throws Exception {
         Path projects = claudeHome.resolve("projects");
         if (!Files.isDirectory(projects)) {
             LOG.debug("Claude projects directory does not exist: {}", projects);
-            return java.util.Collections.emptyList();
+            return new ScanWindow(
+                    java.util.Collections.emptyMap(),
+                    java.util.Collections.emptyList(),
+                    java.util.Collections.emptyMap());
         }
 
         Map<String, ClaudeMetadata> metadata = loadIndexes(projects);
         List<Path> transcripts = discoverTranscripts(projects);
+        Map<Path, ScanFileSnapshot> files = new HashMap<>();
+        for (Path transcript : transcripts) {
+            try {
+                ScanFileSnapshot snapshot = ScanFileSnapshot.capture(transcript);
+                if (snapshot != null) {
+                    files.put(transcript, snapshot);
+                }
+            } catch (IOException e) {
+                LOG.debug(
+                        "Claude transcript disappeared while opening the scan cycle: {}",
+                        transcript,
+                        e);
+            }
+        }
+        return new ScanWindow(metadata, transcripts, files);
+    }
+
+    private List<SessionBatch> scanWindow(
+            ScanWindow window,
+            Map<SessionKey, ChatSession> checkpoints,
+            int maxRecords,
+            Set<SessionKey> onlySessions)
+            throws Exception {
         List<SessionBatch> batches = new ArrayList<>();
         int remaining = maxRecords;
-        int transcriptCount = transcripts.size();
+        int transcriptCount = window.transcripts.size();
         int transcriptStart =
                 transcriptCount == 0 ? 0 : Math.floorMod(nextTranscriptIndex, transcriptCount);
         if (transcriptCount > 0) {
@@ -91,7 +139,8 @@ public final class ClaudeConversationSource implements ConversationSource {
                 break;
             }
             Path transcript =
-                    transcripts.get((transcriptStart + transcriptOffset) % transcriptCount);
+                    window.transcripts.get(
+                            (transcriptStart + transcriptOffset) % transcriptCount);
             String sessionId = stripJsonl(transcript.getFileName().toString());
             SessionKey key = new SessionKey(SOURCE_TYPE, sessionId);
             if (!onlySessions.isEmpty() && !onlySessions.contains(key)) {
@@ -103,7 +152,8 @@ public final class ClaudeConversationSource implements ConversationSource {
                         scanTranscript(
                                 transcript,
                                 sessionId,
-                                metadata.get(sessionId),
+                                window.metadata.get(sessionId),
+                                window.files.get(transcript),
                                 checkpoints.get(key),
                                 remaining);
             } catch (AttachmentResolver.RetryableAttachmentException | IOException failure) {
@@ -129,23 +179,35 @@ public final class ClaudeConversationSource implements ConversationSource {
             Path transcript,
             String sessionId,
             ClaudeMetadata metadata,
+            ScanFileSnapshot fileSnapshot,
             ChatSession previous,
             int maxRecords)
             throws IOException {
+        if (fileSnapshot == null || !fileSnapshot.canRead(transcript)) {
+            LOG.debug(
+                    "Claude transcript {} changed identity or was truncated during this scan "
+                            + "cycle; deferring it to the next wake-up",
+                    transcript);
+            return null;
+        }
         SourceCursors.FileCursor priorCursor =
                 SourceCursors.parseFileCursor(previous == null ? null : previous.sourceCursor());
         SourceCursors.FileCursor targetCursor =
                 SourceCursors.parseFileCursor(
                         previous == null ? null : previous.pendingCursor());
-        String currentFileKey = IncrementalFiles.fileKey(transcript);
+        String currentFileKey = fileSnapshot.fileKey();
         long startOffset = priorCursor.offset();
-        if (Files.size(transcript) < startOffset
+        if (fileSnapshot.size() < startOffset
                 || (priorCursor.fileKey() != null
                         && !Objects.equals(priorCursor.fileKey(), currentFileKey))
                 || !IncrementalFiles.anchorMatchesAtOffset(transcript, priorCursor)) {
             long recovered =
                     IncrementalFiles.findOffsetAfterAnchor(
-                            tailReader, transcript, priorCursor.anchor(), priorCursor.offset());
+                            tailReader,
+                            transcript,
+                            priorCursor.anchor(),
+                            priorCursor.offset(),
+                            fileSnapshot.size());
             if (recovered < 0) {
                 LOG.warn(
                         "Claude transcript {} was rewritten and its checkpoint anchor disappeared; "
@@ -166,7 +228,8 @@ public final class ClaudeConversationSource implements ConversationSource {
                                 tailReader,
                                 transcript,
                                 targetCursor.anchor(),
-                                targetCursor.offset());
+                                targetCursor.offset(),
+                                fileSnapshot.size());
                 if (targetOffset < 0) {
                     LOG.warn(
                             "Pending Claude boundary disappeared for session {}; recovery is paused",
@@ -176,7 +239,8 @@ public final class ClaudeConversationSource implements ConversationSource {
             }
         }
 
-        List<JsonlRecord> records = tailReader.read(transcript, startOffset, maxRecords);
+        List<JsonlRecord> records =
+                tailReader.read(transcript, startOffset, maxRecords, fileSnapshot.size());
         List<ChatMessage> messages = new ArrayList<>();
         SessionKey key = new SessionKey(SOURCE_TYPE, sessionId);
         long processedOffset = startOffset;
@@ -289,10 +353,10 @@ public final class ClaudeConversationSource implements ConversationSource {
         }
 
         if (createdAt == null) {
-            createdAt = Files.getLastModifiedTime(transcript).toInstant();
+            createdAt = fileSnapshot.creationTime();
         }
         if (updatedAt == null) {
-            updatedAt = Files.getLastModifiedTime(transcript).toInstant();
+            updatedAt = fileSnapshot.lastModifiedTime();
         }
         ChatSession session =
                 new ChatSession(
@@ -306,7 +370,8 @@ public final class ClaudeConversationSource implements ConversationSource {
                         createdAt,
                         updatedAt,
                         lastMessageAt,
-                        now);
+                        now,
+                        null);
         boolean pendingBoundaryReached =
                 previous != null
                         && previous.hasPendingCommit()
@@ -603,6 +668,21 @@ public final class ClaudeConversationSource implements ConversationSource {
         private ExtractedEvent(JsonNode sanitizedEvent, List<AttachmentReference> references) {
             this.sanitizedEvent = sanitizedEvent;
             this.references = references;
+        }
+    }
+
+    private static final class ScanWindow {
+        private final Map<String, ClaudeMetadata> metadata;
+        private final List<Path> transcripts;
+        private final Map<Path, ScanFileSnapshot> files;
+
+        private ScanWindow(
+                Map<String, ClaudeMetadata> metadata,
+                List<Path> transcripts,
+                Map<Path, ScanFileSnapshot> files) {
+            this.metadata = metadata;
+            this.transcripts = transcripts;
+            this.files = files;
         }
     }
 

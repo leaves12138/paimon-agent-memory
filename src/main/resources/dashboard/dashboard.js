@@ -2,6 +2,9 @@
   "use strict";
 
   const API_ROOT = "/api";
+  // Keep the convenience scan for a conversational row bounded. A long run of tool-only
+  // events must not turn one click into an unbounded sequence of full-session page requests.
+  const MAX_AUTO_HIDDEN_TOOL_PAGES = 3;
   const ALLOWED_IMAGE_TYPES = new Set([
     "image/png",
     "image/jpeg",
@@ -56,7 +59,9 @@
       loaded: false,
       error: null,
       controller: null,
-      request: 0
+      request: 0,
+      expandedGroups: new Set(),
+      groupLimit: 5
     },
     selection: {
       key: null,
@@ -74,7 +79,8 @@
       error: null,
       controller: null,
       request: 0,
-      expandedKey: null
+      expandedKey: null,
+      showTools: false
     },
     detailCache: new Map(),
     detailController: null,
@@ -129,11 +135,14 @@
     chatSessionId: byId("chat-session-id"),
     refreshChat: byId("refresh-chat"),
     messageSummary: byId("message-summary"),
+    showToolsToggle: byId("show-tools-toggle"),
     chatScroll: byId("chat-scroll"),
     loadOlderMessages: byId("load-older-messages"),
     messageList: byId("message-list"),
     messageLoading: byId("message-loading"),
     messageEmpty: byId("message-empty"),
+    messageEmptyTitle: byId("message-empty-title"),
+    messageEmptyDescription: byId("message-empty-description"),
     messageError: byId("message-error"),
     messageErrorMessage: byId("message-error-message"),
     retryMessages: byId("retry-messages"),
@@ -154,10 +163,9 @@
   initializeDashboard();
 
   async function initializeDashboard() {
-    const loaded = await loadSessions({ reset: true });
-    if (loaded && !state.selection.session && state.sessions.items.length > 0) {
-      await selectSession(state.sessions.items[0], { announce: false, openMobile: false });
-    }
+    // Keep initial rendering cheap: selecting a session is the user's explicit action and may
+    // require a substantially larger Paimon message scan.
+    await loadSessions({ reset: true });
     await loadOverview();
   }
 
@@ -335,7 +343,8 @@
     return displayValue(error.message, "数据读取失败，请稍后重试。");
   }
 
-  async function loadOverview() {
+  async function loadOverview(options) {
+    const opts = options || {};
     if (state.overviewController) {
       state.overviewController.abort();
     }
@@ -343,7 +352,8 @@
     const request = ++state.overviewRequest;
     state.overviewController = controller;
     try {
-      const payload = await fetchJson(API_ROOT + "/overview", controller.signal);
+      const path = API_ROOT + "/overview" + (opts.refresh ? "?refresh=true" : "");
+      const payload = await fetchJson(path, controller.signal);
       if (request !== state.overviewRequest) {
         return false;
       }
@@ -451,6 +461,9 @@
     if (sessions.query.trim()) {
       params.set("query", sessions.query.trim());
     }
+    if (opts.refresh) {
+      params.set("refresh", "true");
+    }
 
     try {
       const payload = await fetchJson(API_ROOT + "/sessions?" + params.toString(), controller.signal);
@@ -515,8 +528,8 @@
   function renderSessions() {
     const sessions = state.sessions;
     const fragment = document.createDocumentFragment();
-    sessions.items.forEach(function (item) {
-      fragment.appendChild(buildSessionItem(item));
+    groupSessionsByProject(sessions.items).forEach(function (group) {
+      fragment.appendChild(buildSessionGroup(group));
     });
     dom.sessionList.replaceChildren(fragment);
 
@@ -543,6 +556,66 @@
     }
   }
 
+  function groupSessionsByProject(items) {
+    const groups = new Map();
+    items.forEach(function (item) {
+      const cwd = displayValue(item.cwd, "").trim().replace(/[\\/]+$/, "");
+      const key = cwd || "\u0000other";
+      let group = groups.get(key);
+      if (!group) {
+        const parts = cwd.split(/[\\/]/).filter(Boolean);
+        group = {
+          key: key,
+          cwd: cwd,
+          label: parts.length > 0 ? parts[parts.length - 1] : "其他会话",
+          items: []
+        };
+        groups.set(key, group);
+      }
+      group.items.push(item);
+    });
+    return Array.from(groups.values());
+  }
+
+  function buildSessionGroup(group) {
+    const wrapper = element("li", "project-group");
+    const section = element("section", "project-section");
+    section.setAttribute("aria-label", group.label);
+
+    const heading = element("div", "project-heading");
+    const folder = element("span", "project-folder");
+    folder.setAttribute("aria-hidden", "true");
+    const title = element("h2", "project-title", group.label);
+    title.title = group.cwd || group.label;
+    heading.append(folder, title);
+
+    const list = element("ul", "project-session-list");
+    const selectedIndex = group.items.findIndex(function (item) {
+      return sessionKey(item) === state.selection.key;
+    });
+    const expanded = state.sessions.expandedGroups.has(group.key);
+    const visibleCount = expanded
+      ? group.items.length
+      : Math.max(state.sessions.groupLimit, selectedIndex + 1);
+    group.items.slice(0, visibleCount).forEach(function (item) {
+      list.appendChild(buildSessionItem(item));
+    });
+
+    section.append(heading, list);
+    if (visibleCount < group.items.length) {
+      const more = element("button", "project-show-more", "Show more");
+      more.type = "button";
+      more.setAttribute("aria-label", "展开 " + group.label + " 的更多会话");
+      more.addEventListener("click", function () {
+        state.sessions.expandedGroups.add(group.key);
+        renderSessions();
+      });
+      section.appendChild(more);
+    }
+    wrapper.appendChild(section);
+    return wrapper;
+  }
+
   function buildSessionItem(item) {
     const key = sessionKey(item);
     const active = key === state.selection.key;
@@ -553,28 +626,18 @@
     if (active) {
       button.setAttribute("aria-current", "page");
     }
-    button.setAttribute("aria-label", displayValue(item.title, "未命名会话") + "，" + sourceLabel(item.sourceType));
+    const status = sessionStatus(item);
+    const titleText = displayValue(item.title, "未命名会话");
+    button.setAttribute("aria-label", titleText + "，" + sourceLabel(item.sourceType) + "，" + status.label);
+    button.title = [titleText, displayValue(item.cwd, ""), formatDate(item.lastMessageAt || item.updatedAt, false)]
+      .filter(Boolean)
+      .join("\n");
     button.addEventListener("click", function () { selectSession(item); });
 
-    const head = element("span", "session-item-head");
-    head.append(
-      element("strong", "session-item-title", displayValue(item.title, "未命名会话")),
-      sourceBadge(item.sourceType)
-    );
-    const path = element("span", "session-item-preview", shortPath(item.cwd));
-    path.title = displayValue(item.cwd, "未知工作目录");
-    const meta = element("span", "session-item-meta");
-    const time = element("time");
-    setTime(time, item.lastMessageAt || item.updatedAt, true);
-    const id = element("code", "", shortId(item.sessionId));
-    id.title = displayValue(item.sessionId);
-    meta.append(time, id);
-    const footer = element("span", "session-item-footer");
-    footer.append(statusBadge(sessionStatus(item)));
-    if (item.archived === true) {
-      footer.appendChild(element("span", "archived-label", "已归档"));
-    }
-    button.append(head, path, meta, footer);
+    const title = element("span", "session-item-title", titleText);
+    const indicator = element("span", "session-state-dot is-" + status.kind);
+    indicator.setAttribute("aria-hidden", "true");
+    button.append(title, indicator);
     listItem.appendChild(button);
     return listItem;
   }
@@ -632,6 +695,7 @@
     const request = ++conversation.request;
     const selectedKey = state.selection.key;
     const requestedPage = reset ? 1 : conversation.page + 1;
+    const visibleCountBefore = reset ? 0 : visibleConversationItems().length;
     const anchor = !reset ? captureScrollAnchor() : null;
     conversation.controller = controller;
     conversation.sessionKey = selectedKey;
@@ -647,29 +711,60 @@
     }
     renderConversation();
 
-    const params = new URLSearchParams();
-    params.set("page", String(requestedPage));
-    if (state.pagination.configured) {
-      params.set("pageSize", String(conversation.pageSize));
-    }
-    params.set("sourceType", displayValue(session.sourceType, ""));
-    params.set("sessionId", displayValue(session.sessionId, ""));
-
     try {
-      const payload = await fetchJson(API_ROOT + "/messages?" + params.toString(), controller.signal);
-      if (request !== conversation.request || selectedKey !== state.selection.key) {
-        return false;
-      }
-      const pageItems = Array.isArray(payload.items) ? payload.items.slice().reverse() : [];
-      const merged = reset ? pageItems : pageItems.concat(conversation.items);
-      conversation.items = uniqueMessages(merged).sort(compareMessages);
-      conversation.page = Math.max(1, positiveWholeNumber(payload.page, requestedPage));
-      conversation.pageSize = positiveWholeNumber(payload.pageSize, conversation.pageSize);
-      conversation.total = Math.max(safeNumber(payload.total, conversation.items.length), conversation.items.length);
-      conversation.hasMore = typeof payload.hasMore === "boolean"
-        ? payload.hasMore
-        : conversation.page * conversation.pageSize < conversation.total;
-      conversation.truncated = payload.truncated === true;
+      let pageToFetch = requestedPage;
+      let firstPage = true;
+      let pagesFetched = 0;
+      do {
+        const params = new URLSearchParams();
+        params.set("page", String(pageToFetch));
+        if (state.pagination.configured) {
+          params.set("pageSize", String(conversation.pageSize));
+        }
+        params.set("sourceType", displayValue(session.sourceType, ""));
+        params.set("sessionId", displayValue(session.sessionId, ""));
+        if (opts.refresh && firstPage) {
+          params.set("refresh", "true");
+        }
+
+        const payload = await fetchJson(API_ROOT + "/messages?" + params.toString(), controller.signal);
+        pagesFetched += 1;
+        if (request !== conversation.request || selectedKey !== state.selection.key) {
+          return false;
+        }
+        const pageItems = Array.isArray(payload.items) ? payload.items.slice().reverse() : [];
+        const merged = reset && firstPage
+          ? pageItems
+          : pageItems.concat(conversation.items);
+        conversation.items = uniqueMessages(merged).sort(compareMessages);
+        conversation.page = Math.max(1, positiveWholeNumber(payload.page, pageToFetch));
+        conversation.pageSize = positiveWholeNumber(payload.pageSize, conversation.pageSize);
+        conversation.total = Math.max(
+          conversation.total,
+          safeNumber(payload.total, conversation.items.length),
+          conversation.items.length
+        );
+        conversation.hasMore = typeof payload.hasMore === "boolean"
+          ? payload.hasMore
+          : conversation.page * conversation.pageSize < conversation.total;
+        conversation.truncated = conversation.truncated || payload.truncated === true;
+        firstPage = false;
+
+        const foundVisibleMessage = visibleConversationItems().length > visibleCountBefore;
+        if (conversation.showTools
+            || foundVisibleMessage
+            || !conversation.hasMore
+            || pagesFetched >= MAX_AUTO_HIDDEN_TOOL_PAGES) {
+          break;
+        }
+        const nextPage = conversation.page + 1;
+        if (nextPage <= pageToFetch) {
+          conversation.hasMore = false;
+          break;
+        }
+        pageToFetch = nextPage;
+      } while (true);
+
       conversation.error = null;
       conversation.mode = conversation.items.length > 0 ? "ready" : "empty";
       renderConversation();
@@ -767,7 +862,7 @@
   function renderMessages() {
     const fragment = document.createDocumentFragment();
     let lastDay = null;
-    state.conversation.items.forEach(function (item) {
+    visibleConversationItems().forEach(function (item) {
       const currentDay = dayKey(item.createdAt || item.ingestedAt);
       if (currentDay !== lastDay) {
         const divider = element("li", "chat-day-divider");
@@ -779,6 +874,24 @@
       fragment.appendChild(buildMessageItem(item));
     });
     dom.messageList.replaceChildren(fragment);
+  }
+
+  function visibleConversationItems() {
+    return state.conversation.items.filter(function (item) {
+      return state.conversation.showTools || !isToolEvent(item);
+    });
+  }
+
+  function isToolEvent(item) {
+    if (normalizeRole(item.role) === "tool") {
+      return true;
+    }
+    const event = displayValue(item.eventType, "").trim().toLowerCase().replace(/[-.]/g, "_");
+    return event.includes("tool")
+      || event.includes("function_call")
+      || /(^|_)call(_|$)/.test(event)
+      || event.endsWith("_call")
+      || event.endsWith("_call_output");
   }
 
   function buildMessageItem(item) {
@@ -805,7 +918,7 @@
     head.append(identity, time);
 
     const content = element("div", "message-content");
-    content.appendChild(element("p", "", messagePreview(item)));
+    renderRichText(content, messagePreview(item));
 
     const meta = element("div", "message-meta");
     meta.append(
@@ -814,7 +927,7 @@
     );
 
     const actions = element("div", "message-actions");
-    const detailButton = element("button", "message-detail-button", expanded ? "收起详情" : "查看原始记录与附件");
+    const detailButton = element("button", "message-detail-button", expanded ? "收起详情" : "附件与原始记录");
     detailButton.type = "button";
     detailButton.dataset.messageKey = key;
     detailButton.setAttribute("aria-expanded", String(expanded));
@@ -836,6 +949,87 @@
       return emptyMessageLabel(item);
     }
     return preview;
+  }
+
+  function renderRichText(container, value) {
+    const text = displayValue(value, "").replace(/\r\n?/g, "\n");
+    const fence = /```([^\n`]*)\n?([\s\S]*?)```/g;
+    let cursor = 0;
+    let match;
+    while ((match = fence.exec(text)) !== null) {
+      appendTextBlocks(container, text.slice(cursor, match.index));
+      const pre = element("pre", "message-code-block");
+      const code = element("code", "", match[2].replace(/\n$/, ""));
+      const language = match[1].trim();
+      if (language) {
+        code.dataset.language = language;
+      }
+      pre.appendChild(code);
+      container.appendChild(pre);
+      cursor = match.index + match[0].length;
+    }
+    appendTextBlocks(container, text.slice(cursor));
+  }
+
+  function appendTextBlocks(container, value) {
+    value.split(/\n{2,}/).forEach(function (rawBlock) {
+      const block = rawBlock.trim();
+      if (!block) {
+        return;
+      }
+      const lines = block.split("\n");
+      if (lines.every(function (line) { return /^\s*[-*]\s+/.test(line); })) {
+        const list = element("ul", "message-markdown-list");
+        lines.forEach(function (line) {
+          const item = element("li");
+          appendInlineMarkdown(item, line.replace(/^\s*[-*]\s+/, ""));
+          list.appendChild(item);
+        });
+        container.appendChild(list);
+        return;
+      }
+      const heading = lines.length === 1 ? /^(#{1,3})\s+(.+)$/.exec(lines[0]) : null;
+      if (heading) {
+        const node = element("h" + Math.min(heading[1].length + 2, 5), "message-markdown-heading");
+        appendInlineMarkdown(node, heading[2]);
+        container.appendChild(node);
+        return;
+      }
+      const paragraph = element("p");
+      lines.forEach(function (line, index) {
+        if (index > 0) {
+          paragraph.appendChild(document.createElement("br"));
+        }
+        appendInlineMarkdown(paragraph, line);
+      });
+      container.appendChild(paragraph);
+    });
+  }
+
+  function appendInlineMarkdown(container, value) {
+    const token = /`([^`\n]+)`|\*\*([^*\n]+)\*\*|\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g;
+    let cursor = 0;
+    let match;
+    while ((match = token.exec(value)) !== null) {
+      if (match.index > cursor) {
+        container.appendChild(document.createTextNode(value.slice(cursor, match.index)));
+      }
+      if (match[1] !== undefined) {
+        container.appendChild(element("code", "", match[1]));
+      } else if (match[2] !== undefined) {
+        container.appendChild(element("strong", "", match[2]));
+      } else {
+        const link = element("a", "", match[3]);
+        link.href = match[4];
+        link.target = "_blank";
+        link.rel = "noreferrer noopener";
+        container.appendChild(link);
+      }
+      cursor = match.index + match[0].length;
+    }
+    if (cursor < value.length) {
+      container.appendChild(document.createTextNode(value.slice(cursor)));
+    }
   }
 
   function emptyMessageLabel(item) {
@@ -929,8 +1123,17 @@
     const conversation = state.conversation;
     const loadingInitial = conversation.mode === "loading";
     const loadingOlder = conversation.mode === "loading-older";
+    const visibleItems = visibleConversationItems();
+    const hiddenToolCount = conversation.items.length - visibleItems.length;
+    const onlyHiddenTools = conversation.mode === "ready" && visibleItems.length === 0 && hiddenToolCount > 0;
     dom.messageLoading.hidden = !loadingInitial;
-    dom.messageEmpty.hidden = conversation.mode !== "empty";
+    dom.messageEmpty.hidden = conversation.mode !== "empty" && !onlyHiddenTools;
+    dom.messageEmptyTitle.textContent = onlyHiddenTools ? "工具调用已隐藏" : "这个会话还没有消息";
+    dom.messageEmptyDescription.textContent = onlyHiddenTools
+      ? (conversation.hasMore
+        ? "点击“加载更早消息”继续查找对话，或打开“显示工具调用”查看这些记录。"
+        : "打开“显示工具调用”即可查看这些记录。")
+      : "下一次采集完成后，新消息会显示在这里。";
     dom.messageError.hidden = conversation.mode !== "error";
     dom.messageErrorMessage.textContent = conversation.error || "";
     dom.loadOlderMessages.hidden = !conversation.hasMore || loadingInitial || conversation.mode === "error";
@@ -939,8 +1142,9 @@
     dom.refreshChat.disabled = loadingInitial || loadingOlder;
 
     const suffix = conversation.truncated ? "+" : "";
-    dom.messageSummary.textContent = formatCount(conversation.total) + suffix + " 条消息";
-    dom.chatFooterCount.textContent = "已显示 " + formatCount(conversation.items.length) + " 条";
+    dom.messageSummary.textContent = formatCount(conversation.total) + suffix + " 条消息"
+      + (hiddenToolCount > 0 && !conversation.showTools ? " · 已隐藏 " + formatCount(hiddenToolCount) + " 条工具记录" : "");
+    dom.chatFooterCount.textContent = "已显示 " + formatCount(visibleItems.length) + " 条";
   }
 
   function toggleMessageDetail(item, key) {
@@ -1077,10 +1281,9 @@
     const fullText = extractHumanText(item.contentJson, item.eventType);
     if (fullText && fullText !== messagePreview(item)) {
       const fullContent = element("section", "message-full-content");
-      fullContent.append(
-        element("h3", "", "完整文本"),
-        element("p", "message-full-text", fullText)
-      );
+      const rendered = element("div", "message-full-text message-content");
+      renderRichText(rendered, fullText);
+      fullContent.append(element("h3", "", "完整文本"), rendered);
       panel.appendChild(fullContent);
     }
     if (attachments.length > 0) {
@@ -1395,12 +1598,12 @@
     dom.refreshAll.classList.add("is-refreshing");
     cancelMessageDetail();
     state.detailCache.clear();
-    const sessionsLoaded = await loadSessions({ reset: true });
+    // One invalidation clears every server-side dashboard cache. The following message and
+    // overview reads therefore share the newly loaded snapshot instead of invalidating it again.
+    const sessionsLoaded = await loadSessions({ reset: true, refresh: true });
     let messagesLoaded = null;
     if (state.selection.session) {
       messagesLoaded = await loadMessages({ reset: true });
-    } else if (sessionsLoaded && state.sessions.items.length > 0) {
-      messagesLoaded = await selectSession(state.sessions.items[0], { announce: false });
     }
     const overviewLoaded = await loadOverview();
     dom.refreshAll.disabled = false;
@@ -1418,7 +1621,7 @@
     dom.refreshChat.classList.add("is-refreshing");
     cancelMessageDetail();
     state.detailCache.clear();
-    const success = await loadMessages({ reset: true });
+    const success = await loadMessages({ reset: true, refresh: true });
     if (selectedKey === state.selection.key) {
       dom.refreshChat.classList.remove("is-refreshing");
       renderMessageStates();
@@ -1451,6 +1654,18 @@
     });
     dom.loadOlderMessages.addEventListener("click", function () { loadMessages({ reset: false }); });
     dom.chatBack.addEventListener("click", leaveConversation);
+    dom.showToolsToggle.addEventListener("change", function () {
+      state.conversation.showTools = dom.showToolsToggle.checked;
+      renderMessages();
+      renderMessageStates();
+      dom.chatLiveStatus.textContent = state.conversation.showTools ? "已显示工具调用" : "已隐藏工具调用";
+      if (!state.conversation.showTools
+          && visibleConversationItems().length === 0
+          && state.conversation.hasMore
+          && state.conversation.mode === "ready") {
+        loadMessages({ reset: false });
+      }
+    });
 
     dom.sessionSearch.addEventListener("input", function () {
       clearTimeout(state.searchTimer);

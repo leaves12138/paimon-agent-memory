@@ -13,7 +13,8 @@ import java.util.Set;
 /** Builds a bounded preview while preserving transcript structure and avoiding JSON trees. */
 final class DashboardContentPreview {
 
-    private static final int MAX_LENGTH = 240;
+    static final int DEFAULT_MAX_LENGTH = 240;
+    static final int CONVERSATION_MAX_LENGTH = 4096;
     private static final int TYPE_LIMIT = 80;
     private static final int DETAIL_LIMIT = 180;
     private static final int MAX_PARTS = 32;
@@ -22,22 +23,52 @@ final class DashboardContentPreview {
     private DashboardContentPreview() {}
 
     static String preview(String contentJson) {
+        return preview(contentJson, DEFAULT_MAX_LENGTH);
+    }
+
+    static String preview(String contentJson, int maxChars) {
+        if (maxChars <= 0) {
+            throw new IllegalArgumentException("maxChars must be greater than zero");
+        }
         if (contentJson == null || contentJson.isEmpty()) {
             return "";
         }
 
         try (JsonParser parser = JSON_FACTORY.createParser(contentJson)) {
-            ParsedPreview parsed = parse(contentJson, parser);
+            ParsedPreview parsed = parse(contentJson, parser, maxChars);
             String value = parsed.render();
-            return isBlank(value) ? compactRaw(contentJson) : normalizeAndTruncate(value);
+            return isBlank(value)
+                    ? compactRaw(contentJson, maxChars)
+                    : normalizeAndTruncate(value, maxChars);
         } catch (IOException | RuntimeException ignored) {
             // Partial and future transcript shapes remain browsable as bounded raw text.
-            return compactRaw(contentJson);
+            return compactRaw(contentJson, maxChars);
         }
     }
 
-    private static ParsedPreview parse(String source, JsonParser parser) throws IOException {
-        ParsedPreview result = new ParsedPreview();
+    static String previewMessage(String contentJson, String role, String eventType) {
+        return preview(contentJson, messageLimit(role, eventType));
+    }
+
+    static int messageLimit(String role, String eventType) {
+        String normalizedRole = role == null ? "" : role.toLowerCase(java.util.Locale.ROOT);
+        String normalizedEvent =
+                eventType == null ? "" : eventType.toLowerCase(java.util.Locale.ROOT);
+        if ("tool".equals(normalizedRole)
+                || normalizedEvent.contains("tool")
+                || normalizedEvent.contains("call")
+                || normalizedEvent.endsWith("_output")) {
+            return DEFAULT_MAX_LENGTH;
+        }
+        if ("user".equals(normalizedRole) || "assistant".equals(normalizedRole)) {
+            return CONVERSATION_MAX_LENGTH;
+        }
+        return DEFAULT_MAX_LENGTH;
+    }
+
+    private static ParsedPreview parse(String source, JsonParser parser, int maxChars)
+            throws IOException {
+        ParsedPreview result = new ParsedPreview(maxChars);
         Context context = null;
         ContentBlock block = null;
         Payload payload = null;
@@ -59,9 +90,9 @@ final class DashboardContentPreview {
                     result.hasAttachments = true;
                 }
                 if (isPayload(context)) {
-                    payload = new Payload(context);
+                    payload = new Payload(context, maxChars);
                 } else if (isContentItem(context)) {
-                    block = new ContentBlock(context);
+                    block = new ContentBlock(context, maxChars);
                 }
                 continue;
             }
@@ -103,7 +134,7 @@ final class DashboardContentPreview {
                         || "text".equals(field)
                         || "content".equals(field)
                         || "output".equals(field)) {
-                    Snippet text = stringValue(source, parser, MAX_LENGTH);
+                    Snippet text = stringValue(source, parser, maxChars);
                     result.add(text.display(), false);
                     if (text.truncated) {
                         break;
@@ -144,13 +175,13 @@ final class DashboardContentPreview {
             }
 
             if (isMessage(context) && "content".equals(field)) {
-                Snippet text = stringValue(source, parser, MAX_LENGTH);
+                Snippet text = stringValue(source, parser, maxChars);
                 result.add(text.display(), false);
                 if (text.truncated) {
                     break;
                 }
             } else if (isDirectContentArray(context)) {
-                Snippet text = stringValue(source, parser, MAX_LENGTH);
+                Snippet text = stringValue(source, parser, maxChars);
                 result.add(text.display(), false);
                 if (text.truncated) {
                     break;
@@ -306,7 +337,7 @@ final class DashboardContentPreview {
                     case 'u':
                         int first = unicodeEscape(source, index);
                         if (first < 0) {
-                            return new Snippet(value.text(), true);
+                            return new Snippet(value.text(), true, limit);
                         }
                         index += 4;
                         if (Character.isHighSurrogate((char) first)
@@ -329,10 +360,10 @@ final class DashboardContentPreview {
                 }
             }
             if (!value.append(codePoint)) {
-                return new Snippet(value.text(), true);
+                return new Snippet(value.text(), true, limit);
             }
         }
-        return new Snippet(value.text(), !closed);
+        return new Snippet(value.text(), !closed, limit);
     }
 
     private static int unicodeEscape(String source, int index) {
@@ -352,7 +383,7 @@ final class DashboardContentPreview {
 
     private static Snippet bounded(String value, int limit) {
         if (value == null) {
-            return new Snippet("", false);
+            return new Snippet("", false, limit);
         }
         NormalizedBuilder result = new NormalizedBuilder(limit);
         int index = 0;
@@ -360,18 +391,18 @@ final class DashboardContentPreview {
             int codePoint = value.codePointAt(index);
             index += Character.charCount(codePoint);
             if (!result.append(codePoint)) {
-                return new Snippet(result.text(), true);
+                return new Snippet(result.text(), true, limit);
             }
         }
-        return new Snippet(result.text(), false);
+        return new Snippet(result.text(), false, limit);
     }
 
-    private static String compactRaw(String value) {
-        return bounded(value, MAX_LENGTH).display();
+    private static String compactRaw(String value, int maxChars) {
+        return bounded(value, maxChars).display();
     }
 
-    private static String normalizeAndTruncate(String value) {
-        return bounded(value, MAX_LENGTH).display();
+    private static String normalizeAndTruncate(String value, int maxChars) {
+        return bounded(value, maxChars).display();
     }
 
     private static String firstNonBlank(String first, String second) {
@@ -397,14 +428,18 @@ final class DashboardContentPreview {
 
     private static final class Payload {
         private final Context context;
-        private final BoundedParts text = new BoundedParts(MAX_LENGTH);
-        private final BoundedParts details = new BoundedParts(DETAIL_LIMIT);
+        private final int maxChars;
+        private final BoundedParts text;
+        private final BoundedParts details;
         private String type;
         private String name;
         private String output;
 
-        private Payload(Context context) {
+        private Payload(Context context, int maxChars) {
             this.context = context;
+            this.maxChars = maxChars;
+            this.text = new BoundedParts(maxChars);
+            this.details = new BoundedParts(Math.min(DETAIL_LIMIT, maxChars));
         }
 
         private Snippet accept(String field, String source, JsonParser parser)
@@ -428,14 +463,14 @@ final class DashboardContentPreview {
                 return value;
             }
             if ("output".equals(field) || "result".equals(field)) {
-                Snippet value = stringValue(source, parser, MAX_LENGTH);
+                Snippet value = stringValue(source, parser, maxChars);
                 output = firstNonBlank(output, value.display());
                 return value;
             }
             if ("message".equals(field)
                     || "text".equals(field)
                     || "content".equals(field)) {
-                Snippet value = stringValue(source, parser, MAX_LENGTH);
+                Snippet value = stringValue(source, parser, maxChars);
                 text.add(value.display());
                 return value;
             }
@@ -484,14 +519,19 @@ final class DashboardContentPreview {
 
     private static final class ContentBlock {
         private final Context context;
-        private final BoundedParts text = new BoundedParts(MAX_LENGTH);
-        private final BoundedParts nestedOutput = new BoundedParts(MAX_LENGTH);
-        private final BoundedParts detail = new BoundedParts(DETAIL_LIMIT);
+        private final int maxChars;
+        private final BoundedParts text;
+        private final BoundedParts nestedOutput;
+        private final BoundedParts detail;
         private String type;
         private String name;
 
-        private ContentBlock(Context context) {
+        private ContentBlock(Context context, int maxChars) {
             this.context = context;
+            this.maxChars = maxChars;
+            this.text = new BoundedParts(maxChars);
+            this.nestedOutput = new BoundedParts(maxChars);
+            this.detail = new BoundedParts(Math.min(DETAIL_LIMIT, maxChars));
         }
 
         private Snippet accept(
@@ -513,7 +553,7 @@ final class DashboardContentPreview {
                         || "refusal".equals(field)
                         || "content".equals(field)
                         || "output".equals(field)) {
-                    Snippet value = stringValue(source, parser, MAX_LENGTH);
+                    Snippet value = stringValue(source, parser, maxChars);
                     text.add(value.display());
                     return value;
                 }
@@ -522,7 +562,7 @@ final class DashboardContentPreview {
                             || "content".equals(nestedField)
                             || "output".equals(nestedField)
                             || "result".equals(nestedField))) {
-                Snippet value = stringValue(source, parser, MAX_LENGTH);
+                Snippet value = stringValue(source, parser, maxChars);
                 nestedOutput.add(value.display());
                 return value;
             } else if ((isBlank(type) || isToolCall()) && isDetailField(nestedField)) {
@@ -584,10 +624,14 @@ final class DashboardContentPreview {
     }
 
     private static final class ParsedPreview {
-        private final BoundedParts parts = new BoundedParts(MAX_LENGTH);
+        private final BoundedParts parts;
         private String rootType;
         private boolean hasAttachments;
         private boolean attachmentDescribed;
+
+        private ParsedPreview(int maxChars) {
+            this.parts = new BoundedParts(maxChars);
+        }
 
         private void add(String value, boolean describesAttachment) {
             parts.add(value);
@@ -612,10 +656,12 @@ final class DashboardContentPreview {
     private static final class Snippet {
         private final String text;
         private final boolean truncated;
+        private final int limit;
 
-        private Snippet(String text, boolean truncated) {
+        private Snippet(String text, boolean truncated, int limit) {
             this.text = text;
             this.truncated = truncated;
+            this.limit = limit;
         }
 
         private String display() {
@@ -623,7 +669,7 @@ final class DashboardContentPreview {
                 return text;
             }
             int count = text.codePointCount(0, text.length());
-            int keep = Math.min(count, MAX_LENGTH - 1);
+            int keep = Math.min(count, Math.max(0, limit - 1));
             return text.substring(0, text.offsetByCodePoints(0, keep)) + '…';
         }
     }
@@ -633,6 +679,8 @@ final class DashboardContentPreview {
         private final StringBuilder value;
         private int codePoints;
         private boolean pendingSpace;
+        private int pendingNewlines;
+        private boolean previousCarriageReturn;
 
         private NormalizedBuilder(int limit) {
             this.limit = limit;
@@ -640,9 +688,28 @@ final class DashboardContentPreview {
         }
 
         private boolean append(int codePoint) {
-            if (Character.isWhitespace(codePoint)) {
-                pendingSpace = value.length() > 0;
+            if (codePoint == '\r' || codePoint == '\n') {
+                if (codePoint == '\n' && previousCarriageReturn) {
+                    previousCarriageReturn = false;
+                    return true;
+                }
+                previousCarriageReturn = codePoint == '\r';
+                if (value.length() > 0) {
+                    pendingNewlines = Math.min(2, pendingNewlines + 1);
+                }
+                pendingSpace = false;
                 return true;
+            }
+            previousCarriageReturn = false;
+            if (Character.isWhitespace(codePoint)) {
+                pendingSpace = value.length() > 0 && pendingNewlines == 0;
+                return true;
+            }
+            while (pendingNewlines > 0) {
+                if (!appendValue('\n')) {
+                    return false;
+                }
+                pendingNewlines--;
             }
             if (pendingSpace) {
                 if (!appendValue(' ')) {

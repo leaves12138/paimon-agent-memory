@@ -141,21 +141,41 @@ public final class IncrementalFiles {
     public static long findOffsetAfterAnchor(
             JsonlTailReader reader, Path path, String anchor, long preferredOffset)
             throws IOException {
+        return findOffsetAfterAnchor(reader, path, anchor, preferredOffset, Long.MAX_VALUE);
+    }
+
+    /** Searches only through the EOF captured for the current collector wake-up. */
+    public static long findOffsetAfterAnchor(
+            JsonlTailReader reader,
+            Path path,
+            String anchor,
+            long preferredOffset,
+            long endOffset)
+            throws IOException {
         if (anchor == null) {
             return -1L;
+        }
+        boolean bounded = endOffset != Long.MAX_VALUE;
+        long searchEnd = bounded ? endOffset : Files.size(path);
+        if (bounded && Files.size(path) < searchEnd) {
+            throw new IOException(
+                    "File was truncated below the captured anchor search boundary: " + path);
         }
         long offset = 0L;
         long bestOffset = -1L;
         long bestDistance = Long.MAX_VALUE;
-        while (offset < Files.size(path)) {
-            List<JsonlRecord> records = reader.read(path, offset, 1_000);
+        while (offset < searchEnd) {
+            List<JsonlRecord> records =
+                    bounded
+                            ? reader.read(path, offset, 1_000, searchEnd)
+                            : reader.read(path, offset, 1_000);
             if (records.isEmpty()) {
                 return -1L;
             }
             long next = offset;
             for (JsonlRecord record : records) {
                 if (!record.lineTerminated()) {
-                    return -1L;
+                    return bestOffset;
                 }
                 next = record.endOffset();
                 if (anchor.equals(lineAnchor(record.json()))) {

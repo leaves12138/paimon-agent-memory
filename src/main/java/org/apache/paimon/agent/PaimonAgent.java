@@ -88,15 +88,25 @@ public final class PaimonAgent {
 
             PaimonChatRepository repository = new PaimonChatRepository(configuration);
             repository.initialize();
-            CollectorService service =
-                    new CollectorService(
-                            project,
-                            sources,
-                            repository,
-                            new PendingBatchStore(
-                                    arguments.dataDirectory.resolve("pending"),
-                                    project.collectorId(),
-                                    AgentProcessLock.tablePairIdentity(configuration)));
+            CollectorService service;
+            try {
+                service =
+                        new CollectorService(
+                                project,
+                                sources,
+                                repository,
+                                new PendingBatchStore(
+                                        arguments.dataDirectory.resolve("pending"),
+                                        project.collectorId(),
+                                        AgentProcessLock.tablePairIdentity(configuration)));
+            } catch (Exception failure) {
+                try {
+                    repository.close();
+                } catch (Exception closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+                throw failure;
+            }
             if (arguments.runOnce || project.runOnce()) {
                 try {
                     service.runOnce();

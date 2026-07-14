@@ -12,6 +12,9 @@ interface ConversationFormatRestorer extends AutoCloseable {
 
     Path attachmentDirectory(ChatSession session);
 
+    /** Supplies the stable restore graph before any client files are installed. */
+    default void prepare(List<ChatSession> sessions) throws Exception {}
+
     void restore(ChatSession session, List<Path> orderedMessages, boolean overwrite)
             throws Exception;
 

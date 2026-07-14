@@ -37,7 +37,7 @@ Restore options are passed to Java unchanged:
 
 Environment:
   JAVA_HOME                         JDK location; Java 11 is required
-  PAIMON_AGENT_JAVA_OPTS            Additional JVM options
+  PAIMON_AGENT_JAVA_OPTS            Additional JVM options (defaults include -Xms256m -Xmx1024m)
   PAIMON_AGENT_PAIMON_CONFIG        Catalog configuration path
   PAIMON_AGENT_PROJECT_CONFIG       Collector configuration path
   PAIMON_AGENT_DATA_DIR             PID, log, and local cache directory
@@ -78,7 +78,10 @@ prepare_runtime() {
 }
 
 build_java_command() {
-    JAVA_COMMAND=("$JAVA_CMD")
+    # Keep the daemon predictable on developer workstations where the JVM would otherwise size
+    # its heap from total machine memory. User-supplied duplicate -Xms/-Xmx options are appended
+    # below and therefore take precedence over these conservative defaults.
+    JAVA_COMMAND=("$JAVA_CMD" "-Xms256m" "-Xmx1024m")
     if [[ -n "${PAIMON_AGENT_JAVA_OPTS:-}" ]]; then
         local extra_opts
         read -r -a extra_opts <<< "$PAIMON_AGENT_JAVA_OPTS"

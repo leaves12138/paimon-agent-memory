@@ -36,7 +36,8 @@ import java.util.Set;
 public final class PendingBatchStore {
 
     private static final int MAGIC = 0x5041494d;
-    private static final int VERSION = 2;
+    private static final int VERSION = 3;
+    private static final int MIN_SUPPORTED_VERSION = 2;
     private static final int MAX_COLLECTION_ENTRIES = 10_000_000;
     private static final int CHECKSUM_BYTES = 32;
 
@@ -69,7 +70,7 @@ public final class PendingBatchStore {
                 throw new IOException("Invalid pending batch WAL magic: " + pendingFile);
             }
             int version = input.readInt();
-            if (version != VERSION) {
+            if (version < MIN_SUPPORTED_VERSION || version > VERSION) {
                 throw new IOException(
                         "Unsupported pending batch WAL version " + version + ": " + pendingFile);
             }
@@ -90,7 +91,7 @@ public final class PendingBatchStore {
             int batchCount = readCount(input, "batch", payloadSize);
             List<SessionBatch> batches = new ArrayList<>(batchCount);
             for (int index = 0; index < batchCount; index++) {
-                batches.add(readBatch(input, payloadSize));
+                batches.add(readBatch(input, payloadSize, version));
             }
             byte[] checksum = new byte[CHECKSUM_BYTES];
             input.readFully(checksum);
@@ -196,9 +197,9 @@ public final class PendingBatchStore {
         output.writeLong(batch.startingCommitId());
     }
 
-    private static SessionBatch readBatch(DataInputStream input, long fileSize)
+    private static SessionBatch readBatch(DataInputStream input, long fileSize, int version)
             throws IOException {
-        ChatSession session = readSession(input, fileSize);
+        ChatSession session = readSession(input, fileSize, version);
         int messageCount = readCount(input, "message", fileSize);
         List<ChatMessage> messages = new ArrayList<>(messageCount);
         for (int index = 0; index < messageCount; index++) {
@@ -234,9 +235,10 @@ public final class PendingBatchStore {
         writeInstant(output, session.updatedAt());
         writeInstant(output, session.lastMessageAt());
         writeInstant(output, session.ingestedAt());
+        writeString(output, session.subagentSourceJson());
     }
 
-    private static ChatSession readSession(DataInputStream input, long fileSize)
+    private static ChatSession readSession(DataInputStream input, long fileSize, int version)
             throws IOException {
         SessionKey key =
                 new SessionKey(readString(input, fileSize), readString(input, fileSize));
@@ -248,6 +250,12 @@ public final class PendingBatchStore {
         long lastCommitId = input.readLong();
         Long pendingCommitId = input.readBoolean() ? input.readLong() : null;
         String pendingCursor = readString(input, fileSize);
+        Instant createdAt = readInstant(input);
+        Instant updatedAt = readInstant(input);
+        Instant lastMessageAt = readInstant(input);
+        Instant ingestedAt = readInstant(input);
+        String subagentSourceJson =
+                version >= 3 ? readString(input, fileSize) : null;
         return new ChatSession(
                 key,
                 title,
@@ -258,10 +266,11 @@ public final class PendingBatchStore {
                 lastCommitId,
                 pendingCommitId,
                 pendingCursor,
-                readInstant(input),
-                readInstant(input),
-                readInstant(input),
-                readInstant(input));
+                createdAt,
+                updatedAt,
+                lastMessageAt,
+                ingestedAt,
+                subagentSourceJson);
     }
 
     private static void writeMessage(DataOutputStream output, ChatMessage message)

@@ -19,6 +19,7 @@ public final class ChatSession {
     private final Instant updatedAt;
     private final Instant lastMessageAt;
     private final Instant ingestedAt;
+    private final String subagentSourceJson;
 
     public ChatSession(
             SessionKey key,
@@ -45,7 +46,38 @@ public final class ChatSession {
                 createdAt,
                 updatedAt,
                 lastMessageAt,
-                ingestedAt);
+                ingestedAt,
+                null);
+    }
+
+    public ChatSession(
+            SessionKey key,
+            String title,
+            String cwd,
+            boolean archived,
+            String sourcePath,
+            String sourceCursor,
+            long lastCommitId,
+            Instant createdAt,
+            Instant updatedAt,
+            Instant lastMessageAt,
+            Instant ingestedAt,
+            String subagentSourceJson) {
+        this(
+                key,
+                title,
+                cwd,
+                archived,
+                sourcePath,
+                sourceCursor,
+                lastCommitId,
+                null,
+                null,
+                createdAt,
+                updatedAt,
+                lastMessageAt,
+                ingestedAt,
+                subagentSourceJson);
     }
 
     public ChatSession(
@@ -62,6 +94,38 @@ public final class ChatSession {
             Instant updatedAt,
             Instant lastMessageAt,
             Instant ingestedAt) {
+        this(
+                key,
+                title,
+                cwd,
+                archived,
+                sourcePath,
+                sourceCursor,
+                lastCommitId,
+                pendingCommitId,
+                pendingCursor,
+                createdAt,
+                updatedAt,
+                lastMessageAt,
+                ingestedAt,
+                null);
+    }
+
+    public ChatSession(
+            SessionKey key,
+            String title,
+            String cwd,
+            boolean archived,
+            String sourcePath,
+            String sourceCursor,
+            long lastCommitId,
+            Long pendingCommitId,
+            String pendingCursor,
+            Instant createdAt,
+            Instant updatedAt,
+            Instant lastMessageAt,
+            Instant ingestedAt,
+            String subagentSourceJson) {
         this.key = Objects.requireNonNull(key, "key");
         this.title = title;
         this.cwd = cwd;
@@ -75,6 +139,7 @@ public final class ChatSession {
         this.updatedAt = updatedAt;
         this.lastMessageAt = lastMessageAt;
         this.ingestedAt = ingestedAt;
+        this.subagentSourceJson = subagentSourceJson;
     }
 
     public SessionKey key() {
@@ -133,6 +198,28 @@ public final class ChatSession {
         return ingestedAt;
     }
 
+    public String subagentSourceJson() {
+        return subagentSourceJson;
+    }
+
+    public ChatSession withSubagentSourceJson(String value) {
+        return new ChatSession(
+                key,
+                title,
+                cwd,
+                archived,
+                sourcePath,
+                sourceCursor,
+                lastCommitId,
+                pendingCommitId,
+                pendingCursor,
+                createdAt,
+                updatedAt,
+                lastMessageAt,
+                ingestedAt,
+                value);
+    }
+
     public ChatSession withCheckpoint(String cursor, long commitId, Instant ingestionTime) {
         return new ChatSession(
                 key,
@@ -147,7 +234,8 @@ public final class ChatSession {
                 createdAt,
                 updatedAt,
                 lastMessageAt,
-                ingestionTime);
+                ingestionTime,
+                subagentSourceJson);
     }
 
     public ChatSession withPendingCommit(
@@ -169,7 +257,8 @@ public final class ChatSession {
                 createdAt,
                 updatedAt,
                 lastMessageAt,
-                ingestionTime);
+                ingestionTime,
+                subagentSourceJson);
     }
 
     public ChatSession withPendingBoundary(long pendingId, String targetCursor) {
@@ -186,6 +275,7 @@ public final class ChatSession {
                 createdAt,
                 updatedAt,
                 lastMessageAt,
-                ingestedAt);
+                ingestedAt,
+                subagentSourceJson);
     }
 }
