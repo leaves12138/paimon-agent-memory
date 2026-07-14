@@ -570,13 +570,14 @@ public final class DashboardServer implements AutoCloseable {
             return false;
         }
         List<String> hosts = exchange.getRequestHeaders().get("Host");
-        if (hosts == null || hosts.size() != 1 || !hosts.get(0).equals(expectedHostHeader())) {
+        if (hosts == null || hosts.size() != 1 || !isAllowedHostHeader(hosts.get(0))) {
             return false;
         }
+        String requestHost = hosts.get(0);
         List<String> origins = exchange.getRequestHeaders().get("Origin");
         if (origins != null
                 && (origins.size() != 1
-                        || !origins.get(0).equals(address().toString().replaceAll("/$", "")))) {
+                        || !origins.get(0).equalsIgnoreCase("http://" + requestHost))) {
             return false;
         }
         List<String> fetchSites = exchange.getRequestHeaders().get("Sec-Fetch-Site");
@@ -584,6 +585,11 @@ public final class DashboardServer implements AutoCloseable {
                 || (fetchSites.size() == 1
                         && ("same-origin".equals(fetchSites.get(0))
                                 || "none".equals(fetchSites.get(0))));
+    }
+
+    private boolean isAllowedHostHeader(String host) {
+        return host.equalsIgnoreCase(expectedHostHeader())
+                || host.equalsIgnoreCase("localhost:" + server.getAddress().getPort());
     }
 
     private String expectedHostHeader() {

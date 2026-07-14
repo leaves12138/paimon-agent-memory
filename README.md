@@ -149,10 +149,11 @@ Paimon. Every expandable session and message is marked `待上传` or `已上传
 bytes can be previewed through the same size-limited, loopback-only endpoint. A standalone
 Dashboard has no access to another process's in-memory batch and therefore shows Paimon rows only.
 
-After starting the service, open the Dashboard directly:
+After starting the service, open the Dashboard directly with either loopback URL:
 
 ```text
 http://127.0.0.1:8787/
+http://localhost:8787/
 ```
 
 No token is required. `bin/paimon-agent dashboard-url` remains available as a convenience command
@@ -177,17 +178,17 @@ This command does not acquire the collector writer lock or collect, upload, rest
 conversation. Open the configured loopback address after it starts. Do not run the standalone
 command on the same host and port while the Dashboard managed by `start` is already active.
 
-The server accepts only the literal loopback addresses `127.0.0.1` and `::1`; it cannot be bound to
-`0.0.0.0` or another network interface. Do not expose conversation history directly over a LAN or
-the public Internet. For a remote demonstration, keep the server on loopback and forward the same
-port through SSH:
+The server binds only to the literal loopback addresses `127.0.0.1` or `::1` and also accepts
+`localhost` as a request Host alias; it cannot be bound to `0.0.0.0` or another network interface.
+Do not expose conversation history directly over a LAN or the public Internet. For a remote
+demonstration, keep the server on loopback and forward the same port through SSH:
 
 ```bash
 ssh -L 8787:127.0.0.1:8787 user@collector-host
 ```
 
-Then open `http://127.0.0.1:8787/` in the local browser. Use the same local and remote port so the
-Dashboard's strict Host validation is preserved.
+Then open `http://127.0.0.1:8787/` or `http://localhost:8787/` in the local browser. Use the same
+local and remote port so the Dashboard's strict Host validation is preserved.
 
 ## Build
 

@@ -233,6 +233,33 @@ class DashboardServerTest {
     }
 
     @Test
+    void acceptsLocalhostAliasAndRequiresItsMatchingOrigin() throws Exception {
+        startServer();
+        URI localhostAddress =
+                URI.create("http://localhost:" + address.getPort() + '/');
+
+        assertThat(request(localhostAddress, "GET", "").statusCode()).isEqualTo(200);
+        assertThat(
+                        request(
+                                        localhostAddress,
+                                        "GET",
+                                        "api/overview",
+                                        "Origin",
+                                        "http://localhost:" + address.getPort())
+                                .statusCode())
+                .isEqualTo(200);
+        assertError(
+                request(
+                        localhostAddress,
+                        "GET",
+                        "api/overview",
+                        "Origin",
+                        address.toString().replaceAll("/$", "")),
+                403,
+                "Request rejected");
+    }
+
+    @Test
     void servesDashboardOnConfiguredIpv6Loopback() throws Exception {
         Assumptions.assumeTrue(ipv6LoopbackAvailable(), "IPv6 loopback is unavailable");
         startServer("::1");
@@ -316,14 +343,29 @@ class DashboardServerTest {
     }
 
     private HttpResponse<byte[]> request(String method, String relativePath) throws Exception {
-        return request(method, relativePath, null, null);
+        return request(address, method, relativePath, null, null);
     }
 
     private HttpResponse<byte[]> request(
             String method, String relativePath, String headerName, String headerValue)
             throws Exception {
+        return request(address, method, relativePath, headerName, headerValue);
+    }
+
+    private HttpResponse<byte[]> request(URI baseAddress, String method, String relativePath)
+            throws Exception {
+        return request(baseAddress, method, relativePath, null, null);
+    }
+
+    private HttpResponse<byte[]> request(
+            URI baseAddress,
+            String method,
+            String relativePath,
+            String headerName,
+            String headerValue)
+            throws Exception {
         HttpRequest.Builder request =
-                HttpRequest.newBuilder(address.resolve(relativePath))
+                HttpRequest.newBuilder(baseAddress.resolve(relativePath))
                         .timeout(Duration.ofSeconds(5));
         if (headerName != null) {
             request.header(headerName, headerValue);
