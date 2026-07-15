@@ -81,6 +81,28 @@ class PaimonChatRepositoryTest {
     }
 
     @Test
+    void derivesWalIdentityFromTheInitializedPhysicalTables() throws Exception {
+        String firstIdentity;
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
+            repository.initialize();
+            firstIdentity = repository.walTablePairIdentity();
+            assertThat(firstIdentity).hasSize(64);
+        }
+
+        try (PaimonChatRepository reopened = new PaimonChatRepository(configuration())) {
+            reopened.initialize();
+            assertThat(reopened.walTablePairIdentity()).isEqualTo(firstIdentity);
+        }
+
+        try (PaimonChatRepository other =
+                new PaimonChatRepository(
+                        configuration("other-agent", tempDir.resolve("other-warehouse")))) {
+            other.initialize();
+            assertThat(other.walTablePairIdentity()).isNotEqualTo(firstIdentity);
+        }
+    }
+
+    @Test
     void onlyTheOwningWriterAddsMetadataColumnsToLegacySessionsTable() throws Exception {
         SessionKey key = new SessionKey("codex", "legacy-root");
         Instant instant = Instant.parse("2026-01-01T00:00:00Z");
@@ -483,11 +505,14 @@ class PaimonChatRepositoryTest {
     }
 
     private AgentConfiguration configuration(String collectorId) {
+        return configuration(collectorId, tempDir);
+    }
+
+    private AgentConfiguration configuration(String collectorId, Path warehouse) {
         Map<String, String> catalog = new LinkedHashMap<>();
-        // Unit tests construct the repository directly with a local Catalog. The public
-        // ConfigLoader intentionally accepts only metastore=rest.
+        // Unit tests construct the repository directly with a local filesystem Catalog.
         catalog.put("metastore", "filesystem");
-        catalog.put("warehouse", tempDir.toString());
+        catalog.put("warehouse", warehouse.toString());
         ProjectConfig project =
                 new ProjectConfig(
                         "ai_memory",

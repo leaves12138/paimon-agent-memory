@@ -880,6 +880,40 @@ class CollectorServiceTest {
     }
 
     @Test
+    void acceptsOneLegacyWalIdentityAndWritesThePhysicalIdentityAfterItClears()
+            throws Exception {
+        Path directory = tempDir.resolve("wal-identity-upgrade");
+        List<SessionBatch> batches =
+                Collections.singletonList(
+                        frozenBatch(new SessionKey("codex", "wal-identity-upgrade")));
+        PendingBatchStore legacy =
+                new PendingBatchStore(directory, "collector-test", "legacy-rest-identity");
+        legacy.save(4L, batches);
+
+        PendingBatchStore upgraded =
+                new PendingBatchStore(
+                        directory,
+                        "collector-test",
+                        "physical-table-identity",
+                        "legacy-rest-identity");
+        assertThat(upgraded.load().identifier()).isEqualTo(4L);
+        upgraded.delete(4L);
+        upgraded.save(5L, batches);
+
+        assertThat(
+                        new PendingBatchStore(
+                                        directory,
+                                        "collector-test",
+                                        "physical-table-identity")
+                                .load()
+                                .identifier())
+                .isEqualTo(5L);
+        assertThatThrownBy(legacy::load)
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("different Catalog table pair");
+    }
+
+    @Test
     void scheduledCommitRetriesAFrozenBatchBeforeASecondSourceOpenFails()
             throws Exception {
         SessionKey key = new SessionKey("codex", "scheduled-before-open");

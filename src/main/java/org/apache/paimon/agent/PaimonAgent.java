@@ -90,6 +90,10 @@ public final class PaimonAgent {
             repository.initialize();
             CollectorService service;
             try {
+                String legacyRestWalIdentity =
+                        "rest".equals(configuration.catalogOptions().get("metastore"))
+                                ? AgentProcessLock.tablePairIdentity(configuration)
+                                : null;
                 service =
                         new CollectorService(
                                 project,
@@ -98,7 +102,8 @@ public final class PaimonAgent {
                                 new PendingBatchStore(
                                         arguments.dataDirectory.resolve("pending"),
                                         project.collectorId(),
-                                        AgentProcessLock.tablePairIdentity(configuration)));
+                                        repository.walTablePairIdentity(),
+                                        legacyRestWalIdentity));
             } catch (Exception failure) {
                 try {
                     repository.close();

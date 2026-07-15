@@ -66,8 +66,11 @@ uri=http://127.0.0.1:8080
 warehouse=default
 ```
 
-Version 1 supports only the REST Catalog and therefore requires `metastore=rest`; the legacy
-`type=rest` spelling is rejected. Authentication and filesystem options also belong in this file.
+Paimon selects the Catalog implementation with the `metastore` option. For example, use
+`metastore=rest` for a REST Catalog or `metastore=filesystem` for a filesystem Catalog; when the
+option is omitted, Paimon's `filesystem` default is used. The unrecognized `type` key is rejected
+to prevent it from being silently ignored. All Catalog-specific authentication and filesystem
+options also belong in this file and are passed through to Paimon unchanged.
 
 `project.properties` contains all collector settings:
 
@@ -391,9 +394,11 @@ bytes—in `data/pending/pending-commit.bin`. Each commit then uses three steps:
 promote the pending cursor to `source_cursor`. Both tables use stable Paimon stream commit users and
 monotonically increasing commit identifiers. An uncertain or partial failure is retried through
 `filterAndCommit` with the same immutable batch and identifier. The owner-private WAL is removed
-only after the Paimon commit succeeds. Its header binds it to the collector and the REST
-Catalog/database/table-pair identity, and a SHA-256 checksum rejects truncated or corrupted WAL
-content instead of replaying it elsewhere.
+only after the Paimon commit succeeds. Its header binds it to the collector and a credential-free
+fingerprint of both initialized physical tables (UUID, full name, and storage location), and a
+SHA-256 checksum rejects truncated or corrupted WAL content instead of replaying it elsewhere.
+For an in-flight WAL created by the earlier REST-only build, the previous REST Catalog identity is
+accepted once; after that commit clears, all newly written WALs use the physical-table fingerprint.
 
 After a crash, the collector loads and replays the exact local WAL without depending on mutable
 source files. If a legacy or manually removed WAL is absent while Paimon contains pending session

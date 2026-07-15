@@ -71,11 +71,15 @@ public final class AgentProcessLock implements AutoCloseable {
         return Paths.get(System.getProperty("user.home"), ".paimon-agent", "locks");
     }
 
-    /** Stable, credential-free identity for one REST Catalog table pair. */
+    /** Stable, credential-free identity for one Paimon Catalog table pair. */
     public static String tablePairIdentity(AgentConfiguration configuration) {
         Map<String, String> catalog = configuration.catalogOptions();
+        String metastore = value(catalog, "metastore");
+        if (metastore.isEmpty()) {
+            metastore = "filesystem";
+        }
         String identity =
-                value(catalog, "metastore")
+                metastore
                         + '\n'
                         + value(catalog, "uri")
                         + '\n'

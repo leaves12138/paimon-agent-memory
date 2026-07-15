@@ -31,7 +31,7 @@ class ConfigLoaderTest {
         AgentConfiguration loaded = ConfigLoader.load(paimon, project);
 
         assertThat(loaded.catalogOptions())
-                .containsEntry("metastore", "rest")
+                .containsEntry("metastore", "REST")
                 .containsEntry("token", "secret")
                 .doesNotContainKey("database");
         assertThat(loaded.project().database()).isEqualTo("memory");
@@ -51,7 +51,7 @@ class ConfigLoaderTest {
     }
 
     @Test
-    void acceptsOnlyTheRestMetastoreProperty() throws Exception {
+    void rejectsTypeAndAcceptsPaimonMetastoreValues() throws Exception {
         Path project = tempDir.resolve("project.properties");
         Files.writeString(project, "database=memory\ncollector.id=test-installation\n");
 
@@ -59,13 +59,29 @@ class ConfigLoaderTest {
         Files.writeString(legacy, "type=rest\nwarehouse=test\n");
         assertThatThrownBy(() -> ConfigLoader.load(legacy, project))
                 .isInstanceOf(ConfigurationException.class)
-                .hasMessageContaining("use metastore=rest");
+                .hasMessageContaining("metastore=<catalog-name>");
 
-        Path unsupported = tempDir.resolve("unsupported.properties");
-        Files.writeString(unsupported, "metastore=filesystem\nwarehouse=test\n");
-        assertThatThrownBy(() -> ConfigLoader.load(unsupported, project))
-                .isInstanceOf(ConfigurationException.class)
-                .hasMessageContaining("only metastore=rest is supported");
+        Path filesystem = tempDir.resolve("filesystem.properties");
+        Files.writeString(filesystem, "metastore=filesystem\nwarehouse=test\n");
+        assertThat(ConfigLoader.load(filesystem, project).catalogOptions())
+                .containsEntry("metastore", "filesystem")
+                .containsEntry("warehouse", "test")
+                .doesNotContainKey("uri");
+
+        Path defaultMetastore = tempDir.resolve("default-metastore.properties");
+        Files.writeString(defaultMetastore, "warehouse=test\n");
+        assertThat(ConfigLoader.load(defaultMetastore, project).catalogOptions())
+                .doesNotContainKey("metastore");
+
+        Path custom = tempDir.resolve("custom.properties");
+        Files.writeString(
+                custom,
+                "metastore=MixedCaseCustomCatalog\nwarehouse=test\n"
+                        + "custom.namespace=one\ncustom.whitespace=value  \n");
+        assertThat(ConfigLoader.load(custom, project).catalogOptions())
+                .containsEntry("metastore", "MixedCaseCustomCatalog")
+                .containsEntry("custom.namespace", "one")
+                .containsEntry("custom.whitespace", "value  ");
     }
 
     @Test

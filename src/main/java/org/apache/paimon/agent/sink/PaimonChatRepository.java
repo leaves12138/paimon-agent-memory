@@ -25,6 +25,7 @@ import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.table.DataTable;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.StreamTableCommit;
@@ -39,6 +40,9 @@ import org.apache.paimon.types.RowType;
 
 import org.apache.hadoop.conf.Configuration;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -94,6 +98,40 @@ public final class PaimonChatRepository implements ChatRepository {
     public Table messagesTableForRead() {
         ensureInitialized();
         return messagesTable;
+    }
+
+    /** Credential-free identity of the initialized physical tables for WAL replay validation. */
+    public String walTablePairIdentity() {
+        ensureInitialized();
+        StringBuilder identity = new StringBuilder("physical-table-pair-v1");
+        appendPhysicalTableIdentity(identity, sessionsTable);
+        appendPhysicalTableIdentity(identity, messagesTable);
+        try {
+            byte[] digest =
+                    MessageDigest.getInstance("SHA-256")
+                            .digest(identity.toString().getBytes(StandardCharsets.UTF_8));
+            StringBuilder result = new StringBuilder(digest.length * 2);
+            for (byte item : digest) {
+                result.append(String.format("%02x", item & 0xff));
+            }
+            return result.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
+    }
+
+    private static void appendPhysicalTableIdentity(StringBuilder identity, Table table) {
+        appendIdentityValue(identity, table.uuid());
+        appendIdentityValue(identity, table.fullName());
+        String location =
+                table instanceof DataTable
+                        ? ((DataTable) table).location().toString()
+                        : table.options().getOrDefault("path", "");
+        appendIdentityValue(identity, location);
+    }
+
+    private static void appendIdentityValue(StringBuilder identity, String value) {
+        identity.append('|').append(value.length()).append(':').append(value);
     }
 
     private void initializeSafely(boolean writer) throws Exception {

@@ -45,13 +45,23 @@ public final class PendingBatchStore {
     private final Path pendingFile;
     private final String collectorId;
     private final String tablePairIdentity;
+    private final String legacyTablePairIdentity;
 
     public PendingBatchStore(
             Path directory, String collectorId, String tablePairIdentity) {
+        this(directory, collectorId, tablePairIdentity, null);
+    }
+
+    public PendingBatchStore(
+            Path directory,
+            String collectorId,
+            String tablePairIdentity,
+            String legacyTablePairIdentity) {
         this.directory = directory.toAbsolutePath().normalize();
         this.pendingFile = this.directory.resolve("pending-commit.bin");
         this.collectorId = collectorId;
         this.tablePairIdentity = tablePairIdentity;
+        this.legacyTablePairIdentity = legacyTablePairIdentity;
     }
 
     StoredCommit load() throws IOException {
@@ -83,7 +93,9 @@ public final class PendingBatchStore {
                                 + collectorId);
             }
             String storedTablePair = readString(input, payloadSize);
-            if (!tablePairIdentity.equals(storedTablePair)) {
+            if (!tablePairIdentity.equals(storedTablePair)
+                    && (legacyTablePairIdentity == null
+                            || !legacyTablePairIdentity.equals(storedTablePair))) {
                 throw new IOException(
                         "Pending batch WAL belongs to a different Catalog table pair");
             }

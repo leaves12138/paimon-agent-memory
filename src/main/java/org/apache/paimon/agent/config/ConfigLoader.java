@@ -26,21 +26,12 @@ public final class ConfigLoader {
         Map<String, String> catalogOptions = new LinkedHashMap<>();
         paimon.stringPropertyNames().stream()
                 .sorted()
-                .forEach(name -> catalogOptions.put(name, paimon.getProperty(name).trim()));
+                .forEach(name -> catalogOptions.put(name, paimon.getProperty(name)));
         if (catalogOptions.containsKey("type")) {
             throw new ConfigurationException(
-                    "Unsupported Paimon catalog property: type; use metastore=rest");
+                    "Unsupported Paimon catalog property: type; "
+                            + "Paimon selects catalogs with metastore=<catalog-name>");
         }
-        requireCatalogOption(catalogOptions, "metastore");
-        if (!"rest".equalsIgnoreCase(catalogOptions.get("metastore"))) {
-            throw new ConfigurationException(
-                    "Unsupported Paimon catalog metastore: "
-                            + catalogOptions.get("metastore")
-                            + "; only metastore=rest is supported");
-        }
-        catalogOptions.put("metastore", "rest");
-        requireCatalogOption(catalogOptions, "uri");
-        requireCatalogOption(catalogOptions, "warehouse");
 
         ProjectConfig projectConfig =
                 new ProjectConfig(
@@ -198,10 +189,4 @@ public final class ConfigLoader {
         return value == null ? defaultValue : value.trim();
     }
 
-    private static void requireCatalogOption(Map<String, String> options, String key) {
-        String value = options.get(key);
-        if (value == null || value.isEmpty()) {
-            throw new ConfigurationException("Missing required Paimon catalog property: " + key);
-        }
-    }
 }

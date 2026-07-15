@@ -29,7 +29,7 @@
             <version>${paimon.version}</version>
         </dependency>
 
-        <!-- REST catalogs can return oss:// data paths; ship Paimon's shaded OSS FileIO plugin. -->
+        <!-- Catalogs can return oss:// data paths; ship Paimon's shaded OSS FileIO plugin. -->
         <dependency>
             <groupId>org.apache.paimon</groupId>
             <artifactId>paimon-oss</artifactId>
