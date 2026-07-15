@@ -436,6 +436,13 @@ public final class DashboardServer implements AutoCloseable {
         value.put("contentPreview", message.getContentPreview());
         value.put("contentLength", message.getContentLength());
         value.put("attachmentCount", message.getAttachmentCount());
+        List<Map<String, Object>> attachments = new ArrayList<>();
+        for (DashboardAttachment attachment : message.getAttachments()) {
+            Map<String, Object> item = attachment(attachment);
+            item.put("previewUrl", previewUrl(message, attachment));
+            attachments.add(item);
+        }
+        value.put("attachments", attachments);
         value.put("createdAt", instant(message.getCreatedAt()));
         value.put("ingestedAt", instant(message.getIngestedAt()));
         value.put("storageStatus", message.getStorageStatus().apiValue());
@@ -459,14 +466,7 @@ public final class DashboardServer implements AutoCloseable {
         value.put("storageStatus", detail.getStorageStatus().apiValue());
         List<Map<String, Object>> attachments = new ArrayList<>();
         for (DashboardAttachment attachment : detail.getAttachments()) {
-            Map<String, Object> item = new LinkedHashMap<>();
-            item.put("index", attachment.getIndex());
-            item.put("present", attachment.isPresent());
-            item.put("size", attachment.getSize());
-            item.put("mimeType", attachment.getMimeType());
-            item.put("fileName", attachment.getFileName());
-            item.put("status", attachment.getStatus());
-            item.put("sha256", attachment.getSha256());
+            Map<String, Object> item = attachment(attachment);
             if (attachment.isPresent()
                     && attachment.getSize() >= 0
                     && attachment.getSize() <= config.maxAttachmentPreviewBytes()) {
@@ -478,15 +478,56 @@ public final class DashboardServer implements AutoCloseable {
         return value;
     }
 
+    private static Map<String, Object> attachment(DashboardAttachment attachment) {
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("index", attachment.getIndex());
+        item.put("present", attachment.isPresent());
+        item.put("size", attachment.getSize());
+        item.put("mimeType", attachment.getMimeType());
+        item.put("fileName", attachment.getFileName());
+        item.put("status", attachment.getStatus());
+        item.put("sha256", attachment.getSha256());
+        return item;
+    }
+
+    private String previewUrl(
+            DashboardMessage message, DashboardAttachment attachment) {
+        if (!attachment.isPresent()
+                || attachment.getSize() < 0
+                || attachment.getSize() > config.maxAttachmentPreviewBytes()) {
+            return null;
+        }
+        return attachmentUrl(
+                message.getSourceType(),
+                message.getSessionId(),
+                message.getMessageId(),
+                message.getSequenceNo(),
+                attachment.getIndex());
+    }
+
     private String attachmentUrl(DashboardMessageDetail detail, int index) {
+        return attachmentUrl(
+                detail.getSourceType(),
+                detail.getSessionId(),
+                detail.getMessageId(),
+                detail.getSequenceNo(),
+                index);
+    }
+
+    private static String attachmentUrl(
+            String sourceType,
+            String sessionId,
+            String messageId,
+            long sequenceNo,
+            int index) {
         return "/api/attachments?sourceType="
-                + encode(detail.getSourceType())
+                + encode(sourceType)
                 + "&sessionId="
-                + encode(detail.getSessionId())
+                + encode(sessionId)
                 + "&messageId="
-                + encode(detail.getMessageId())
+                + encode(messageId)
                 + "&sequenceNo="
-                + detail.getSequenceNo()
+                + sequenceNo
                 + "&index="
                 + index;
     }

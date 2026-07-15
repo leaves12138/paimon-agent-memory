@@ -169,8 +169,8 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                                         message.contentJson(),
                                         message.role(),
                                         message.eventType());
-                if (matches(message, query, preview)) {
-                    DashboardMessage row = pendingMessage(message, preview);
+                DashboardMessage row = pendingMessage(message, preview);
+                if (matches(message, query, preview, !row.getAttachments().isEmpty())) {
                     rows.put(messageKey(row), row);
                 }
             }
@@ -377,7 +377,7 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 DashboardStorageStatus.PENDING);
     }
 
-    private static DashboardMessage pendingMessage(ChatMessage message, String contentPreview) {
+    private DashboardMessage pendingMessage(ChatMessage message, String contentPreview) {
         return new DashboardMessage(
                 message.messageId(),
                 message.sessionKey().sourceType(),
@@ -387,20 +387,32 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 message.eventType(),
                 contentPreview,
                 message.contentJson().length(),
-                storedAttachmentCount(message),
+                pendingAttachments(message),
                 message.createdAt(),
                 message.ingestedAt(),
                 DashboardStorageStatus.PENDING);
     }
 
-    private static int storedAttachmentCount(ChatMessage message) {
-        int count = 0;
-        for (AttachmentPayload attachment : message.attachments()) {
-            if (!attachment.isMissing()) {
-                count++;
+    private List<DashboardAttachment> pendingAttachments(ChatMessage message) {
+        Map<Integer, AttachmentMetadata> metadata = attachmentMetadata(message.contentJson());
+        List<DashboardAttachment> attachments = new ArrayList<>();
+        for (int index = 0; index < message.attachments().size(); index++) {
+            AttachmentPayload payload = message.attachments().get(index);
+            if (payload.isMissing()) {
+                continue;
             }
+            AttachmentMetadata item = metadata.get(index);
+            attachments.add(
+                    new DashboardAttachment(
+                            index,
+                            true,
+                            payload.size(),
+                            item == null ? null : item.mimeType,
+                            item == null ? null : item.fileName,
+                            item == null || item.status == null ? "stored" : item.status,
+                            item == null ? null : item.sha256));
         }
-        return count;
+        return attachments;
     }
 
     private static boolean matches(ChatSession session, SessionQuery query) {
@@ -419,7 +431,10 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
     }
 
     private static boolean matches(
-            ChatMessage message, MessageQuery query, String contentPreview) {
+            ChatMessage message,
+            MessageQuery query,
+            String contentPreview,
+            boolean hasStoredAttachments) {
         if (!matches(normalize(query.getSourceType()), message.sessionKey().sourceType())
                 || !matches(normalize(query.getSessionId()), message.sessionKey().sessionId())
                 || !matches(normalize(query.getRole()), message.role())
@@ -429,7 +444,9 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                                 message.role(), message.eventType()))) {
             return false;
         }
-        if (query.isConversationOnly() && contentPreview.isEmpty()) {
+        if (query.isConversationOnly()
+                && contentPreview.isEmpty()
+                && !hasStoredAttachments) {
             return false;
         }
         String search = normalizedSearch(query.getSearch());

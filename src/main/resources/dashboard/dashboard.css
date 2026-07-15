@@ -1115,11 +1115,14 @@ kbd {
 }
 
 .message-card {
+  display: flex;
   width: 100%;
   max-width: 820px;
   min-width: 0;
   padding: 0;
   overflow: visible;
+  flex-direction: column;
+  align-items: flex-start;
   color: #292928;
   background: transparent;
 }
@@ -1127,6 +1130,21 @@ kbd {
 .message-item.is-user .message-card {
   width: fit-content;
   max-width: min(76%, 680px);
+  align-items: flex-end;
+}
+
+.message-bubble {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.message-item.is-assistant .message-bubble,
+.message-item.is-event .message-bubble {
+  width: 100%;
+}
+
+.message-item.is-user .message-bubble {
+  width: fit-content;
   padding: 11px 15px;
   border-radius: 14px;
   background: var(--user-bubble);
@@ -1145,6 +1163,128 @@ kbd {
   padding-left: 16px;
   border-left: 1px solid #e2e2df;
   color: var(--ink-soft);
+}
+
+.message-inline-attachments {
+  display: flex;
+  max-width: 100%;
+  margin: 0 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.message-inline-attachments.has-following-bubble {
+  margin-bottom: 14px;
+}
+
+.message-inline-attachment {
+  position: relative;
+  display: block;
+  width: 144px;
+  height: 144px;
+  padding: 0;
+  overflow: hidden;
+  flex: 0 0 144px;
+  border: 1px solid rgba(41, 41, 39, 0.09);
+  border-radius: 16px;
+  background: #f0f0ee;
+  box-shadow: 0 1px 3px rgba(31, 31, 29, 0.06);
+  cursor: zoom-in;
+  transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}
+
+.message-inline-attachment:hover {
+  border-color: rgba(41, 41, 39, 0.16);
+  box-shadow: 0 3px 10px rgba(31, 31, 29, 0.09);
+  transform: translateY(-1px);
+}
+
+.message-inline-attachment:disabled {
+  opacity: 1;
+}
+
+.message-inline-attachment:focus-visible {
+  outline: 2px solid rgba(51, 105, 167, 0.55);
+  outline-offset: 3px;
+}
+
+.message-inline-attachment img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.message-inline-attachment-placeholder {
+  position: absolute;
+  inset: 0;
+  display: block;
+  background:
+    linear-gradient(105deg, transparent 36%, rgba(255, 255, 255, 0.55) 48%, transparent 60%),
+    #efefed;
+  background-position: 130% 0;
+  background-size: 220% 100%;
+}
+
+.message-inline-attachment.is-loading .message-inline-attachment-placeholder {
+  animation: attachment-skeleton 1.35s ease-in-out infinite;
+}
+
+.message-inline-attachment:not(.is-loading):not(.is-error):not(.is-unavailable) .message-inline-attachment-placeholder {
+  display: none;
+}
+
+.message-inline-attachment.is-error {
+  cursor: pointer;
+}
+
+.message-inline-attachment.is-error .message-inline-attachment-placeholder {
+  display: grid;
+  place-items: center;
+  background: #f3f3f1;
+}
+
+.message-inline-attachment.is-error .message-inline-attachment-placeholder::before {
+  width: 28px;
+  height: 22px;
+  border: 1px solid #c8c8c4;
+  border-radius: 6px;
+  color: #aaa9a5;
+  content: "!";
+  font-size: 11px;
+  line-height: 20px;
+  text-align: center;
+}
+
+.message-inline-attachment.is-unavailable {
+  cursor: default;
+}
+
+.message-inline-attachment.is-unavailable:hover {
+  border-color: rgba(41, 41, 39, 0.09);
+  box-shadow: 0 1px 3px rgba(31, 31, 29, 0.06);
+  transform: none;
+}
+
+.message-inline-attachment.is-unavailable .message-inline-attachment-placeholder {
+  display: grid;
+  place-items: center;
+  background: #f3f3f1;
+}
+
+.message-inline-attachment-filetype {
+  display: grid;
+  min-width: 42px;
+  height: 48px;
+  padding: 0 7px;
+  place-items: center;
+  border: 1px solid #c9c9c5;
+  border-radius: 7px;
+  color: #8f8f8b;
+  background: #fafaf8;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 
 .message-head {
@@ -1391,6 +1531,8 @@ kbd {
 
 /* Message detail and attachments */
 .message-detail {
+  width: 100%;
+  align-self: stretch;
   margin-top: 8px;
   padding: 12px;
   border: 1px solid var(--line);
@@ -1956,6 +2098,13 @@ body.has-modal {
     max-width: 91%;
   }
 
+  .message-inline-attachment {
+    width: 112px;
+    height: 112px;
+    flex-basis: 112px;
+    border-radius: 14px;
+  }
+
   .preview-modal {
     padding: 12px;
   }
@@ -2029,6 +2178,16 @@ body.has-modal {
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes attachment-skeleton {
+  from {
+    background-position: 130% 0;
+  }
+
+  to {
+    background-position: -130% 0;
   }
 }
 

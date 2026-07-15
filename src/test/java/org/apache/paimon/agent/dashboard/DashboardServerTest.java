@@ -84,7 +84,11 @@ class DashboardServerTest {
         assertThat(new String(css.body(), StandardCharsets.UTF_8))
                 .contains(":root")
                 .contains(".message-markdown-table")
-                .contains(".message-markdown-table-wrap");
+                .contains(".message-markdown-table-wrap")
+                .contains(".message-inline-attachments")
+                .contains("width: 144px")
+                .contains("height: 144px")
+                .contains("object-fit: cover");
 
         HttpResponse<byte[]> javascript = request("GET", "dashboard.js");
         assertThat(javascript.statusCode()).isEqualTo(200);
@@ -122,6 +126,11 @@ class DashboardServerTest {
                 .contains("ATTACHMENT_PREVIEW_TIMEOUT_MS = 30000")
                 .contains("await waitForPreviewImage(dom.previewImage, controller.signal)")
                 .contains("image.naturalWidth <= 0 || image.naturalHeight <= 0")
+                .contains("INLINE_ATTACHMENT_TIMEOUT_MS = 30000")
+                .contains("cleanCodexAttachmentEnvelope")
+                .contains("message-inline-attachments")
+                .contains("window.IntersectionObserver")
+                .contains("fetchAttachmentBlob")
                 .doesNotContain(
                         "foundVisibleMessage",
                         "MAX_AUTO_HIDDEN_TOOL_PAGES",
@@ -202,6 +211,18 @@ class DashboardServerTest {
         assertThat(message.path("sequenceNo").asLong()).isEqualTo(7L);
         assertThat(message.path("contentPreview").asText()).isEqualTo("hello preview");
         assertThat(message.path("attachmentCount").asInt()).isEqualTo(1);
+        JsonNode messageAttachment = message.path("attachments").get(0);
+        assertThat(messageAttachment.path("index").asInt()).isZero();
+        assertThat(messageAttachment.path("present").asBoolean()).isTrue();
+        assertThat(messageAttachment.path("size").asLong()).isEqualTo(PNG.length);
+        assertThat(messageAttachment.path("mimeType").asText()).isEqualTo("image/png");
+        assertThat(messageAttachment.path("fileName").asText()).isEqualTo("pixel demo.png");
+        assertThat(messageAttachment.path("status").asText()).isEqualTo("stored");
+        assertThat(messageAttachment.path("sha256").asText()).isEqualTo("sha256");
+        assertThat(messageAttachment.path("previewUrl").asText())
+                .isEqualTo(
+                        "/api/attachments?sourceType=codex&sessionId=session-1"
+                                + "&messageId=message-1&sequenceNo=7&index=0");
         assertThat(message.path("storageStatus").asText()).isEqualTo("uploaded");
         assertThat(dataStore.lastMessageQuery.getSourceType()).isEqualTo("codex");
         assertThat(dataStore.lastMessageQuery.getSessionId()).isEqualTo("session-1");
@@ -572,7 +593,15 @@ class DashboardServerTest {
                             "message",
                             "hello preview",
                             16L,
-                            1,
+                            Collections.singletonList(
+                                    new DashboardAttachment(
+                                            0,
+                                            true,
+                                            PNG.length,
+                                            "image/png",
+                                            "pixel demo.png",
+                                            "stored",
+                                            "sha256")),
                             CREATED_AT,
                             INGESTED_AT);
             return new DashboardPage<>(

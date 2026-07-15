@@ -9,6 +9,9 @@
   const TRANSIENT_FETCH_MAX_DELAY_MS = 5000;
   const MESSAGE_DETAIL_TIMEOUT_MS = 15000;
   const ATTACHMENT_PREVIEW_TIMEOUT_MS = 30000;
+  const INLINE_ATTACHMENT_TIMEOUT_MS = 30000;
+  const INLINE_ATTACHMENT_CACHE_MAX_ENTRIES = 12;
+  const INLINE_ATTACHMENT_CACHE_MAX_BYTES = 32 * 1024 * 1024;
   const ALLOWED_IMAGE_TYPES = new Set([
     "image/png",
     "image/jpeg",
@@ -93,8 +96,15 @@
     detailCache: new Map(),
     detailController: null,
     detailRequest: 0,
+    inlineAttachmentCache: new Map(),
+    inlineAttachmentCacheBytes: 0,
+    inlineAttachmentQueue: [],
+    inlineAttachmentController: null,
+    inlineAttachmentObserver: null,
+    inlineAttachmentGeneration: 0,
+    inlineAttachmentPumpGeneration: null,
     previewController: null,
-    previewObjectUrl: null,
+    previewCacheUrl: null,
     previewReturnFocus: null
   };
 
@@ -767,6 +777,8 @@
     state.selection.session = item;
     dom.refreshChat.classList.remove("is-refreshing");
     if (changed) {
+      closePreview();
+      clearInlineAttachmentResources();
       cancelMessageDetail();
       state.detailCache.clear();
       prepareConversationSelection(key);
@@ -1108,6 +1120,7 @@
       fragment.appendChild(buildMessageItem(item));
     });
     dom.messageList.replaceChildren(fragment);
+    activateInlineAttachmentThumbnails();
   }
 
   function visibleConversationItems() {
@@ -1153,8 +1166,8 @@
     setTime(time, item.createdAt || item.ingestedAt, true);
     head.append(identity, time);
 
-    const content = element("div", "message-content");
-    renderRichText(content, messagePreview(item));
+    const preview = messagePreview(item);
+    const inlineAttachments = displayAttachments(item);
 
     const meta = element("div", "message-meta");
     meta.append(
@@ -1162,10 +1175,21 @@
       statusBadge(messageStatus(item))
     );
 
-    article.append(head, content, meta);
+    article.appendChild(head);
+    if (inlineAttachments.length > 0) {
+      article.appendChild(buildInlineAttachments(inlineAttachments, Boolean(preview)));
+    }
+    if (preview) {
+      const bubble = element("div", "message-bubble");
+      const content = element("div", "message-content");
+      renderRichText(content, preview);
+      bubble.appendChild(content);
+      article.appendChild(bubble);
+    }
+    article.appendChild(meta);
     if (hasAttachments) {
       const actions = element("div", "message-actions");
-      const detailButton = element("button", "message-detail-button", expanded ? "收起详情" : "附件与原始记录");
+      const detailButton = element("button", "message-detail-button", expanded ? "收起原始记录" : "原始记录");
       detailButton.type = "button";
       detailButton.dataset.messageKey = key;
       detailButton.setAttribute("aria-expanded", String(expanded));
@@ -1182,11 +1206,374 @@
   }
 
   function messagePreview(item) {
-    const preview = displayValue(item.contentPreview, "").trim();
+    const preview = cleanCodexAttachmentEnvelope(displayValue(item.contentPreview, ""), item);
     if (!preview) {
+      if (displayAttachments(item).length > 0) {
+        return "";
+      }
       return emptyMessageLabel(item);
     }
     return preview;
+  }
+
+  function displayAttachments(item) {
+    if (normalizeRole(item.role) !== "user") {
+      return [];
+    }
+    const attachments = Array.isArray(item.attachments) ? item.attachments : [];
+    return attachments.filter(function (attachment) {
+      return attachment.present !== false;
+    });
+  }
+
+  function canPreviewInlineAttachment(attachment) {
+    const mimeType = displayValue(attachment.mimeType, "").trim().toLowerCase();
+    const fileName = displayValue(attachment.fileName, "").trim().toLowerCase();
+    return hasValue(attachment.previewUrl)
+      && (ALLOWED_IMAGE_TYPES.has(mimeType)
+        || /\.(?:png|jpe?g|gif|webp|avif)$/.test(fileName));
+  }
+
+  function cleanCodexAttachmentEnvelope(value, item) {
+    let text = displayValue(value, "").replace(/\r\n?/g, "\n").trim();
+    if (displayValue(item && item.sourceType, "").toLowerCase() !== "codex"
+        || normalizeRole(item && item.role) !== "user") {
+      return text;
+    }
+    const filesMarker = "# Files mentioned by the user:";
+    const requestMarker = "## My request for Codex:";
+    const filesIndex = text.indexOf(filesMarker);
+    const requestIndex = text.indexOf(requestMarker, filesIndex + filesMarker.length);
+    if (filesIndex < 0 || requestIndex < 0) {
+      return text;
+    }
+    const fileList = text.slice(filesIndex + filesMarker.length, requestIndex);
+    if (!/^##\s+.+:\s+(?:\/(?!\/)|~\/|[A-Za-z]:[\\/])/m.test(fileList)) {
+      return text;
+    }
+    text = text.slice(requestIndex + requestMarker.length);
+    text = text.replace(/(?:\s*·\s*)?<image\b[^>]*>[\s\S]*?<\/image>(?:\s*·\s*)?/gi, "\n");
+    text = text.replace(/(?:\s*·\s*)?<image\b[^>]*>[\s\S]*$/gi, "\n");
+    text = text.replace(/(?:^|\n)\s*<\/?image\b[^>]*>\s*(?=\n|$)/gi, "\n");
+    return text.replace(/^(?:\s*·\s*)+|(?:\s*·\s*)+$/g, "").trim();
+  }
+
+  function buildInlineAttachments(attachments, hasFollowingBubble) {
+    const strip = element(
+      "div",
+      "message-inline-attachments" + (hasFollowingBubble ? " has-following-bubble" : "")
+    );
+    strip.setAttribute("aria-label", attachments.length + " 个附件");
+    attachments.forEach(function (attachment, position) {
+      const rawFileName = displayValue(
+        attachment.fileName,
+        "图片 " + (safeNumber(attachment.index, position) + 1)
+      );
+      const fileName = rawFileName.split(/[\\/]/).filter(Boolean).pop() || rawFileName;
+      const mimeType = displayValue(attachment.mimeType, "image/png").trim().toLowerCase();
+      if (!canPreviewInlineAttachment(attachment)) {
+        const unavailable = element("div", "message-inline-attachment is-unavailable");
+        unavailable.setAttribute("role", "img");
+        unavailable.setAttribute("aria-label", "附件 " + fileName + " 暂不可预览");
+        const placeholder = element("span", "message-inline-attachment-placeholder");
+        const extension = fileName.includes(".")
+          ? fileName.split(".").pop().slice(0, 5).toUpperCase()
+          : "FILE";
+        placeholder.appendChild(element("span", "message-inline-attachment-filetype", extension));
+        unavailable.appendChild(placeholder);
+        strip.appendChild(unavailable);
+        return;
+      }
+      const button = element("button", "message-inline-attachment is-loading");
+      button.type = "button";
+      button.disabled = true;
+      button.dataset.previewUrl = displayValue(attachment.previewUrl, "");
+      button.dataset.mimeType = mimeType;
+      button.dataset.fileName = fileName;
+      button.setAttribute("aria-label", "预览附件 " + fileName);
+      button.title = fileName;
+
+      const image = document.createElement("img");
+      image.alt = "";
+      image.hidden = true;
+      image.decoding = "async";
+      image.addEventListener("load", function () {
+        if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+          image.hidden = false;
+          button.classList.remove("is-loading", "is-error");
+          button.disabled = false;
+          enforceInlineAttachmentCacheLimit(null);
+        } else {
+          showInlineAttachmentError(button);
+        }
+      });
+      image.addEventListener("error", function () { showInlineAttachmentError(button); });
+      const placeholder = element("span", "message-inline-attachment-placeholder");
+      placeholder.setAttribute("aria-hidden", "true");
+      button.append(image, placeholder);
+      button.addEventListener("click", function () {
+        openAttachmentPreview(attachment, fileName, mimeType, button);
+      });
+      strip.appendChild(button);
+    });
+    return strip;
+  }
+
+  function activateInlineAttachmentThumbnails() {
+    if (state.inlineAttachmentObserver) {
+      state.inlineAttachmentObserver.disconnect();
+      state.inlineAttachmentObserver = null;
+    }
+    const buttons = dom.messageList.querySelectorAll(".message-inline-attachment[data-preview-url]");
+    if (!buttons.length) {
+      return;
+    }
+    if (typeof window.IntersectionObserver !== "function") {
+      buttons.forEach(queueInlineAttachmentThumbnail);
+      return;
+    }
+    const observer = new window.IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) {
+          return;
+        }
+        observer.unobserve(entry.target);
+        queueInlineAttachmentThumbnail(entry.target);
+      });
+    }, { root: dom.chatScroll, rootMargin: "180px 0px" });
+    state.inlineAttachmentObserver = observer;
+    buttons.forEach(function (button) {
+      const cached = touchInlineAttachmentCache(button.dataset.previewUrl);
+      if (cached && cached.status === "ready") {
+        showInlineAttachmentThumbnail(button, cached.objectUrl);
+      } else if (cached && cached.status === "error") {
+        showInlineAttachmentError(button);
+      } else {
+        observer.observe(button);
+      }
+    });
+  }
+
+  function queueInlineAttachmentThumbnail(button) {
+    const previewUrl = button.dataset.previewUrl;
+    if (!previewUrl) {
+      showInlineAttachmentError(button);
+      return;
+    }
+    const cached = touchInlineAttachmentCache(previewUrl);
+    if (cached && cached.status === "ready") {
+      showInlineAttachmentThumbnail(button, cached.objectUrl);
+      return;
+    }
+    if (cached && (cached.status === "queued" || cached.status === "loading")) {
+      return;
+    }
+    button.classList.add("is-loading");
+    button.classList.remove("is-error");
+    button.disabled = true;
+    state.inlineAttachmentCache.set(previewUrl, { status: "queued" });
+    state.inlineAttachmentQueue.push({
+      previewUrl: previewUrl,
+      mimeType: button.dataset.mimeType,
+      generation: state.inlineAttachmentGeneration
+    });
+    pumpInlineAttachmentQueue(state.inlineAttachmentGeneration);
+  }
+
+  async function pumpInlineAttachmentQueue(generation) {
+    if (state.inlineAttachmentPumpGeneration === generation) {
+      return;
+    }
+    state.inlineAttachmentPumpGeneration = generation;
+    try {
+      while (generation === state.inlineAttachmentGeneration && state.inlineAttachmentQueue.length > 0) {
+        const queued = state.inlineAttachmentQueue.shift();
+        if (!queued || queued.generation !== generation) {
+          continue;
+        }
+        const controller = new AbortController();
+        state.inlineAttachmentController = controller;
+        state.inlineAttachmentCache.set(queued.previewUrl, { status: "loading" });
+        let timedOut = false;
+        const timeout = window.setTimeout(function () {
+          timedOut = true;
+          controller.abort();
+        }, INLINE_ATTACHMENT_TIMEOUT_MS);
+        try {
+          const result = await fetchAttachmentBlob(
+            { previewUrl: queued.previewUrl, mimeType: queued.mimeType },
+            controller.signal
+          );
+          if (generation !== state.inlineAttachmentGeneration) {
+            continue;
+          }
+          const objectUrl = storeInlineAttachmentBlob(
+            queued.previewUrl,
+            result.blob,
+            result.mimeType
+          );
+          updateInlineAttachmentThumbnails(queued.previewUrl, objectUrl, false);
+        } catch (error) {
+          if (generation !== state.inlineAttachmentGeneration || (error.name === "AbortError" && !timedOut)) {
+            continue;
+          }
+          state.inlineAttachmentCache.set(queued.previewUrl, {
+            status: "error",
+            error: timedOut ? "缩略图读取超时" : friendlyError(error)
+          });
+          updateInlineAttachmentThumbnails(queued.previewUrl, null, true);
+        } finally {
+          window.clearTimeout(timeout);
+          if (state.inlineAttachmentController === controller) {
+            state.inlineAttachmentController = null;
+          }
+        }
+      }
+    } finally {
+      if (state.inlineAttachmentPumpGeneration === generation) {
+        state.inlineAttachmentPumpGeneration = null;
+      }
+    }
+  }
+
+  function updateInlineAttachmentThumbnails(previewUrl, objectUrl, failed) {
+    dom.messageList.querySelectorAll(".message-inline-attachment[data-preview-url]").forEach(function (button) {
+      if (button.dataset.previewUrl !== previewUrl) {
+        return;
+      }
+      if (failed) {
+        showInlineAttachmentError(button);
+      } else {
+        showInlineAttachmentThumbnail(button, objectUrl);
+      }
+    });
+  }
+
+  function showInlineAttachmentThumbnail(button, objectUrl) {
+    const image = button.querySelector("img");
+    if (!image || !objectUrl) {
+      showInlineAttachmentError(button);
+      return;
+    }
+    image.src = objectUrl;
+    image.hidden = true;
+    button.classList.add("is-loading");
+    button.classList.remove("is-error");
+    if (image.complete) {
+      if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+        image.hidden = false;
+        button.classList.remove("is-loading");
+        button.disabled = false;
+        enforceInlineAttachmentCacheLimit(null);
+      } else {
+        showInlineAttachmentError(button);
+      }
+    }
+  }
+
+  function storeInlineAttachmentBlob(previewUrl, blob, mimeType) {
+    const previous = state.inlineAttachmentCache.get(previewUrl);
+    if (previous && previous.status === "ready" && previous.objectUrl) {
+      URL.revokeObjectURL(previous.objectUrl);
+      state.inlineAttachmentCacheBytes = Math.max(
+        0,
+        state.inlineAttachmentCacheBytes - safeNumber(previous.size, 0)
+      );
+    }
+    const objectUrl = URL.createObjectURL(blob);
+    const entry = {
+      status: "ready",
+      objectUrl: objectUrl,
+      mimeType: mimeType,
+      size: blob.size,
+      lastUsed: Date.now()
+    };
+    state.inlineAttachmentCache.set(previewUrl, entry);
+    state.inlineAttachmentCacheBytes += blob.size;
+    enforceInlineAttachmentCacheLimit(previewUrl);
+    return objectUrl;
+  }
+
+  function touchInlineAttachmentCache(previewUrl) {
+    const cached = state.inlineAttachmentCache.get(previewUrl);
+    if (cached && cached.status === "ready") {
+      cached.lastUsed = Date.now();
+    }
+    return cached;
+  }
+
+  function enforceInlineAttachmentCacheLimit(keepUrl) {
+    while (readyInlineAttachmentCount() > INLINE_ATTACHMENT_CACHE_MAX_ENTRIES
+        || state.inlineAttachmentCacheBytes > INLINE_ATTACHMENT_CACHE_MAX_BYTES) {
+      let oldestUrl = null;
+      let oldestEntry = null;
+      state.inlineAttachmentCache.forEach(function (entry, previewUrl) {
+        if (previewUrl === keepUrl
+            || previewUrl === state.previewCacheUrl
+            || !entry
+            || entry.status !== "ready") {
+          return;
+        }
+        if (!oldestEntry || safeNumber(entry.lastUsed, 0) < safeNumber(oldestEntry.lastUsed, 0)) {
+          oldestUrl = previewUrl;
+          oldestEntry = entry;
+        }
+      });
+      if (!oldestEntry) {
+        break;
+      }
+      evictInlineAttachment(oldestUrl, oldestEntry);
+    }
+  }
+
+  function readyInlineAttachmentCount() {
+    let count = 0;
+    state.inlineAttachmentCache.forEach(function (entry) {
+      if (entry && entry.status === "ready") {
+        count += 1;
+      }
+    });
+    return count;
+  }
+
+  function evictInlineAttachment(previewUrl, entry) {
+    URL.revokeObjectURL(entry.objectUrl);
+    state.inlineAttachmentCacheBytes = Math.max(
+      0,
+      state.inlineAttachmentCacheBytes - safeNumber(entry.size, 0)
+    );
+    state.inlineAttachmentCache.delete(previewUrl);
+  }
+
+  function showInlineAttachmentError(button) {
+    button.classList.remove("is-loading");
+    button.classList.add("is-error");
+    button.disabled = false;
+    const image = button.querySelector("img");
+    if (image) {
+      image.hidden = true;
+      image.removeAttribute("src");
+    }
+  }
+
+  function clearInlineAttachmentResources() {
+    state.inlineAttachmentGeneration += 1;
+    if (state.inlineAttachmentObserver) {
+      state.inlineAttachmentObserver.disconnect();
+      state.inlineAttachmentObserver = null;
+    }
+    if (state.inlineAttachmentController) {
+      state.inlineAttachmentController.abort();
+      state.inlineAttachmentController = null;
+    }
+    state.inlineAttachmentQueue = [];
+    state.inlineAttachmentCache.forEach(function (cached) {
+      if (cached && cached.status === "ready" && cached.objectUrl) {
+        URL.revokeObjectURL(cached.objectUrl);
+      }
+    });
+    state.inlineAttachmentCache.clear();
+    state.inlineAttachmentCacheBytes = 0;
   }
 
   function renderRichText(container, value) {
@@ -1721,7 +2108,10 @@
     const panel = element("div", "detail-panel");
     const attachments = Array.isArray(item.attachments) ? item.attachments : [];
     const contentTruncated = item.contentTruncated === true;
-    const fullText = extractHumanText(item.contentJson, item.eventType);
+    const fullText = cleanCodexAttachmentEnvelope(
+      extractHumanText(item.contentJson, item.eventType),
+      item
+    );
     if (fullText && fullText !== messagePreview(item)) {
       const fullContent = element("section", "message-full-content");
       const rendered = element("div", "message-full-text message-content");
@@ -1884,28 +2274,27 @@
     }, ATTACHMENT_PREVIEW_TIMEOUT_MS);
     state.previewController = controller;
     try {
-      const response = await sameOriginFetch(attachment.previewUrl, {
-        method: "GET",
-        headers: { Accept: mimeType },
-        signal: controller.signal
-      });
-      if (!response.ok) {
-        const error = new Error(response.status === 403
-          ? "附件请求被拒绝，请确认正在通过本机地址访问"
-          : "附件读取失败（HTTP " + response.status + "）");
-        error.status = response.status;
-        throw error;
-      }
-      const responseType = (response.headers.get("Content-Type") || mimeType).split(";", 1)[0].trim().toLowerCase();
-      if (!ALLOWED_IMAGE_TYPES.has(responseType)) {
-        throw new Error("该附件不是支持预览的图片格式");
-      }
-      const blob = await response.blob();
+      const previewUrl = displayValue(attachment.previewUrl, "");
+      const cached = touchInlineAttachmentCache(previewUrl);
       if (controller.signal.aborted || dom.previewModal.hidden) {
         return;
       }
-      state.previewObjectUrl = URL.createObjectURL(blob);
-      dom.previewImage.src = state.previewObjectUrl;
+      if (cached && cached.status === "ready" && cached.objectUrl) {
+        state.previewCacheUrl = previewUrl;
+        dom.previewImage.src = cached.objectUrl;
+      } else {
+        const result = await fetchAttachmentBlob(attachment, controller.signal);
+        if (controller.signal.aborted || dom.previewModal.hidden) {
+          return;
+        }
+        state.previewCacheUrl = previewUrl;
+        dom.previewImage.src = storeInlineAttachmentBlob(
+          previewUrl,
+          result.blob,
+          result.mimeType
+        );
+        updateInlineAttachmentThumbnails(previewUrl, dom.previewImage.src, false);
+      }
       await waitForPreviewImage(dom.previewImage, controller.signal);
       if (controller.signal.aborted || dom.previewModal.hidden) {
         return;
@@ -1929,6 +2318,42 @@
       if (state.previewController === controller) {
         state.previewController = null;
       }
+    }
+  }
+
+  async function fetchAttachmentBlob(attachment, signal) {
+    const mimeType = displayValue(attachment.mimeType, "image/png").trim().toLowerCase();
+    let transientRetries = 0;
+    while (true) {
+      const response = await sameOriginFetch(attachment.previewUrl, {
+        method: "GET",
+        headers: { Accept: mimeType },
+        signal: signal
+      });
+      if (!response.ok) {
+        const retryAfter = response.headers.get("Retry-After");
+        const transientBusy =
+          (response.status === 429 || response.status === 503) && hasValue(retryAfter);
+        if (transientBusy && transientRetries < TRANSIENT_FETCH_MAX_RETRIES) {
+          const retryDelay = transientRetryDelay(retryAfter, transientRetries);
+          transientRetries += 1;
+          await waitForRetry(retryDelay, signal);
+          continue;
+        }
+        const error = new Error(response.status === 403
+          ? "附件请求被拒绝，请确认正在通过本机地址访问"
+          : "附件读取失败（HTTP " + response.status + "）");
+        error.status = response.status;
+        throw error;
+      }
+      const responseType = (response.headers.get("Content-Type") || mimeType)
+        .split(";", 1)[0]
+        .trim()
+        .toLowerCase();
+      if (!ALLOWED_IMAGE_TYPES.has(responseType)) {
+        throw new Error("该附件不是支持预览的图片格式");
+      }
+      return { blob: await response.blob(), mimeType: responseType };
     }
   }
 
@@ -2009,10 +2434,8 @@
       state.previewController.abort();
       state.previewController = null;
     }
-    if (state.previewObjectUrl) {
-      URL.revokeObjectURL(state.previewObjectUrl);
-      state.previewObjectUrl = null;
-    }
+    state.previewCacheUrl = null;
+    enforceInlineAttachmentCacheLimit(null);
     dom.previewImage.removeAttribute("src");
   }
 
@@ -2125,6 +2548,8 @@
   async function refreshAll() {
     dom.refreshAll.disabled = true;
     dom.refreshAll.classList.add("is-refreshing");
+    closePreview();
+    clearInlineAttachmentResources();
     cancelMessageDetail();
     state.detailCache.clear();
     // One invalidation clears every server-side dashboard cache. The following message and
@@ -2148,6 +2573,8 @@
     const selectedKey = state.selection.key;
     dom.refreshChat.disabled = true;
     dom.refreshChat.classList.add("is-refreshing");
+    closePreview();
+    clearInlineAttachmentResources();
     cancelMessageDetail();
     state.detailCache.clear();
     const success = await loadMessages({ reset: true, refresh: true });
@@ -2186,6 +2613,8 @@
     dom.chatBack.addEventListener("click", leaveConversation);
     dom.showToolsToggle.addEventListener("change", function () {
       state.conversation.showTools = dom.showToolsToggle.checked;
+      closePreview();
+      clearInlineAttachmentResources();
       cancelMessageDetail();
       state.detailCache.clear();
       dom.chatLiveStatus.textContent = state.conversation.showTools ? "已显示工具调用" : "已隐藏工具调用";
@@ -2247,6 +2676,7 @@
     });
     window.addEventListener("beforeunload", function () {
       closePreviewResources();
+      clearInlineAttachmentResources();
       cancelMessageDetail();
       if (state.sessions.controller) {
         state.sessions.controller.abort();

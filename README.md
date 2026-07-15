@@ -184,9 +184,13 @@ larger batches (up to 100 rows and never above `dashboard.max-page-size`) as the
 the top, without losing the current scroll position. No load-more click is required; a retry control
 appears only when an automatic older-message request fails.
 Common GFM pipe tables in chat text are rendered as semantic, horizontally scrollable HTML tables.
-The attachment/detail action appears only when the message manifest contains a stored attachment.
-Its JSON and attachment metadata are loaded without projecting `ARRAY<BLOB>`; supported images are
-then fetched from Paimon only when the user opens their preview. The preview is bounded by
+Stored user images are shown as Codex-style thumbnails above the message bubble and are fetched
+sequentially only when they approach the viewport. Codex's injected file list, local paths, and
+`<image>` wrappers are hidden from the chat rendering but remain intact in `content_json` for raw
+inspection and restoration. Image-only turns therefore render as a thumbnail without an empty text
+bubble. The lightweight attachment manifest is returned by the message list without projecting
+`ARRAY<BLOB>`; opening a thumbnail reuses the bounded in-browser preview cache when possible. The
+raw-record action still appears only for messages with a stored attachment. Previews are bounded by
 `dashboard.max-attachment-preview-size`, while `dashboard.page-size`,
 `dashboard.max-page-size`, and `dashboard.max-scan-rows` bound interactive queries. On narrow
 screens the two panes become a session-list-to-chat navigation flow.

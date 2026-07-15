@@ -62,6 +62,20 @@ class LiveDashboardDataStoreTest {
                         Collections.singletonList(AttachmentPayload.of(image)),
                         NOW,
                         NOW);
+        ChatMessage pendingImageOnlyMessage =
+                new ChatMessage(
+                        "pending-image-only-message",
+                        newKey,
+                        7L,
+                        "user",
+                        "message",
+                        "{\"_paimon_attachments\":[{\"index\":0,"
+                                + "\"file_name\":\"only-image.png\","
+                                + "\"mime_type\":\"image/png\",\"status\":\"stored\","
+                                + "\"size\":4,\"sha256\":\"image-only-digest\"}]}",
+                        Collections.singletonList(AttachmentPayload.of(image)),
+                        NOW.plusSeconds(5),
+                        NOW.plusSeconds(5));
         ChatMessage pendingToolMessage =
                 new ChatMessage(
                         "pending-tool-message",
@@ -128,7 +142,8 @@ class LiveDashboardDataStoreTest {
                                                 pendingToolMessage,
                                                 pendingClaudeToolUse,
                                                 pendingClaudeToolResult,
-                                                pendingClaudeMixed))));
+                                                pendingClaudeMixed,
+                                                pendingImageOnlyMessage))));
 
         LiveDashboardDataStore store =
                 new LiveDashboardDataStore(uploaded, () -> snapshot, 20);
@@ -155,11 +170,14 @@ class LiveDashboardDataStoreTest {
                 store.listMessages(
                         new MessageQuery(
                                 null, null, null, null, null, true, 1, 20));
-        assertThat(messages.getTotal()).isEqualTo(3L);
+        assertThat(messages.getTotal()).isEqualTo(4L);
         assertThat(messages.getItems())
                 .extracting(DashboardMessage::getMessageId)
                 .containsExactlyInAnyOrder(
-                        "uploaded-message", "pending-message", "pending-claude-mixed")
+                        "uploaded-message",
+                        "pending-message",
+                        "pending-claude-mixed",
+                        "pending-image-only-message")
                 .doesNotContain(
                         "pending-tool-message",
                         "pending-claude-tool-use",
@@ -174,6 +192,31 @@ class LiveDashboardDataStoreTest {
         assertThat(pendingRow.getContentPreview()).contains("pending needle");
         assertThat(pendingRow.getContentPreview().length()).isGreaterThan(240);
         assertThat(pendingRow.getAttachmentCount()).isEqualTo(1);
+        assertThat(messages.getItems())
+                .filteredOn(
+                        message ->
+                                "pending-image-only-message".equals(
+                                        message.getMessageId()))
+                .singleElement()
+                .satisfies(
+                        message -> {
+                            assertThat(message.getContentPreview()).isEmpty();
+                            assertThat(message.getAttachments())
+                                    .singleElement()
+                                    .satisfies(
+                                            attachment -> {
+                                                assertThat(attachment.isPresent()).isTrue();
+                                                assertThat(attachment.getSize()).isEqualTo(4L);
+                                                assertThat(attachment.getFileName())
+                                                        .isEqualTo("only-image.png");
+                                                assertThat(attachment.getMimeType())
+                                                        .isEqualTo("image/png");
+                                                assertThat(attachment.getStatus())
+                                                        .isEqualTo("stored");
+                                                assertThat(attachment.getSha256())
+                                                        .isEqualTo("image-only-digest");
+                                            });
+                        });
         assertThat(messages.getItems())
                 .filteredOn(
                         message ->

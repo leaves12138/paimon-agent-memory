@@ -18,6 +18,8 @@ final class DashboardContentPreview {
     private static final int TYPE_LIMIT = 80;
     private static final int DETAIL_LIMIT = 180;
     private static final int MAX_PARTS = 32;
+    private static final String CODEX_FILES_MARKER = "# Files mentioned by the user:";
+    private static final String CODEX_REQUEST_MARKER = "## My request for Codex:";
     private static final JsonFactory JSON_FACTORY = new JsonFactory();
 
     private DashboardContentPreview() {}
@@ -35,7 +37,7 @@ final class DashboardContentPreview {
         }
 
         try (JsonParser parser = JSON_FACTORY.createParser(contentJson)) {
-            ParsedPreview parsed = parse(contentJson, parser, maxChars, false);
+            ParsedPreview parsed = parse(contentJson, parser, maxChars, false, false);
             String value = parsed.render();
             return isBlank(value)
                     ? compactRaw(contentJson, maxChars)
@@ -47,7 +49,23 @@ final class DashboardContentPreview {
     }
 
     static String previewMessage(String contentJson, String role, String eventType) {
-        return preview(contentJson, messageLimit(role, eventType));
+        int maxChars = messageLimit(role, eventType);
+        if (!isUserRole(role)) {
+            return preview(contentJson, maxChars);
+        }
+        if (contentJson == null || contentJson.isEmpty()) {
+            return "";
+        }
+        try (JsonParser parser = JSON_FACTORY.createParser(contentJson)) {
+            ParsedPreview parsed = parse(contentJson, parser, maxChars, false, true);
+            String value = parsed.render();
+            if (isBlank(value)) {
+                return parsed.isCodexUserEnvelope() ? "" : compactRaw(contentJson, maxChars);
+            }
+            return normalizeAndTruncate(value, maxChars);
+        } catch (IOException | RuntimeException ignored) {
+            return compactRaw(contentJson, maxChars);
+        }
     }
 
     static String conversationPreviewMessage(
@@ -57,7 +75,9 @@ final class DashboardContentPreview {
             return "";
         }
         try (JsonParser parser = JSON_FACTORY.createParser(contentJson)) {
-            String value = parse(contentJson, parser, maxChars, true).renderConversation();
+            String value =
+                    parse(contentJson, parser, maxChars, true, isUserRole(role))
+                            .renderConversation();
             return isBlank(value) ? "" : normalizeAndTruncate(value, maxChars);
         } catch (IOException | RuntimeException ignored) {
             // Unknown or partially written message shapes are preserved instead of silently
@@ -82,10 +102,18 @@ final class DashboardContentPreview {
         return DEFAULT_MAX_LENGTH;
     }
 
+    private static boolean isUserRole(String role) {
+        return role != null && "user".equalsIgnoreCase(role);
+    }
+
     private static ParsedPreview parse(
-            String source, JsonParser parser, int maxChars, boolean conversationOnly)
+            String source,
+            JsonParser parser,
+            int maxChars,
+            boolean conversationOnly,
+            boolean cleanCodexUserEnvelope)
             throws IOException {
-        ParsedPreview result = new ParsedPreview(maxChars);
+        ParsedPreview result = new ParsedPreview(maxChars, cleanCodexUserEnvelope);
         Context context = null;
         ContentBlock block = null;
         Payload payload = null;
@@ -107,21 +135,19 @@ final class DashboardContentPreview {
                     result.hasAttachments = true;
                 }
                 if (isPayload(context)) {
-                    payload = new Payload(context, maxChars);
+                    payload = new Payload(context, maxChars, cleanCodexUserEnvelope);
                 } else if (isContentItem(context)) {
-                    block = new ContentBlock(context, maxChars);
+                    block = new ContentBlock(context, maxChars, cleanCodexUserEnvelope);
                 }
                 continue;
             }
             if (token == JsonToken.END_OBJECT || token == JsonToken.END_ARRAY) {
                 if (block != null && context == block.context) {
-                    result.add(
-                            block.render(), block.describesAttachment(), block.isTool());
+                    result.add(block);
                     block = null;
                 }
                 if (payload != null && context == payload.context) {
-                    result.add(
-                            payload.render(), payload.describesAttachment(), payload.isTool());
+                    result.add(payload);
                     payload = null;
                 }
                 context = context == null ? null : context.parent;
@@ -153,8 +179,10 @@ final class DashboardContentPreview {
                         || "text".equals(field)
                         || "content".equals(field)
                         || "output".equals(field)) {
-                    Snippet text = stringValue(source, parser, maxChars);
-                    result.add(text.display(), false, false);
+                    Snippet text =
+                            userTextValue(
+                                    source, parser, maxChars, cleanCodexUserEnvelope);
+                    result.addText(text);
                     if (text.truncated) {
                         break;
                     }
@@ -166,7 +194,7 @@ final class DashboardContentPreview {
                 Snippet snippet = payload.accept(field, source, parser);
                 if (snippet != null && payload.shouldStop(snippet) && payload.canRender()) {
                     boolean tool = payload.isTool();
-                    result.add(payload.render(), payload.describesAttachment(), tool);
+                    result.add(payload);
                     payload = null;
                     if (!conversationOnly || !tool) {
                         break;
@@ -179,7 +207,7 @@ final class DashboardContentPreview {
                 Snippet snippet = block.accept(context, field, source, parser);
                 if (snippet != null && block.shouldStop(snippet) && block.canRender()) {
                     boolean tool = block.isTool();
-                    result.add(block.render(), block.describesAttachment(), tool);
+                    result.add(block);
                     block = null;
                     if (!conversationOnly || !tool) {
                         break;
@@ -193,7 +221,7 @@ final class DashboardContentPreview {
                 Snippet snippet = payload.acceptStructured(detailField, source, parser);
                 if (snippet != null && payload.shouldStop(snippet) && payload.canRender()) {
                     boolean tool = payload.isTool();
-                    result.add(payload.render(), payload.describesAttachment(), tool);
+                    result.add(payload);
                     payload = null;
                     if (!conversationOnly || !tool) {
                         break;
@@ -203,14 +231,16 @@ final class DashboardContentPreview {
             }
 
             if (isMessage(context) && "content".equals(field)) {
-                Snippet text = stringValue(source, parser, maxChars);
-                result.add(text.display(), false, false);
+                Snippet text =
+                        userTextValue(source, parser, maxChars, cleanCodexUserEnvelope);
+                result.addText(text);
                 if (text.truncated) {
                     break;
                 }
             } else if (isDirectContentArray(context)) {
-                Snippet text = stringValue(source, parser, maxChars);
-                result.add(text.display(), false, false);
+                Snippet text =
+                        userTextValue(source, parser, maxChars, cleanCodexUserEnvelope);
+                result.addText(text);
                 if (text.truncated) {
                     break;
                 }
@@ -321,6 +351,226 @@ final class DashboardContentPreview {
             }
         }
         return bounded(parser.getValueAsString(), limit);
+    }
+
+    private static Snippet userTextValue(
+            String source, JsonParser parser, int limit, boolean cleanCodexUserEnvelope)
+            throws IOException {
+        if (!cleanCodexUserEnvelope) {
+            return stringValue(source, parser, limit);
+        }
+        long offset = parser.currentTokenLocation().getCharOffset();
+        if (offset < 0 || offset >= source.length()) {
+            return stringValue(source, parser, limit);
+        }
+        int quote = (int) offset;
+        while (quote < source.length() && source.charAt(quote) != '"') {
+            quote++;
+        }
+        if (quote >= source.length()) {
+            return stringValue(source, parser, limit);
+        }
+        int stringStart = quote + 1;
+        int stringEnd = jsonStringEnd(source, stringStart);
+        if (stringEnd < 0) {
+            return stringValue(source, parser, limit);
+        }
+        int files =
+                headingIndex(
+                        source,
+                        CODEX_FILES_MARKER,
+                        stringStart,
+                        stringEnd,
+                        stringStart);
+        if (files < 0) {
+            return stringValue(source, parser, limit);
+        }
+        int request =
+                headingIndex(
+                        source,
+                        CODEX_REQUEST_MARKER,
+                        files + CODEX_FILES_MARKER.length(),
+                        stringEnd,
+                        stringStart);
+        if (request < 0) {
+            return stringValue(source, parser, limit);
+        }
+        if (!hasFileEntry(
+                source,
+                files + CODEX_FILES_MARKER.length(),
+                request)) {
+            return stringValue(source, parser, limit);
+        }
+        Snippet value = decodeString(source, request + CODEX_REQUEST_MARKER.length(), limit);
+        return new Snippet(value.text, value.truncated, value.limit, true);
+    }
+
+    private static boolean hasFileEntry(String source, int start, int end) {
+        int lineStart = start;
+        while (lineStart < end) {
+            int lineBreak = encodedLineBreak(source, lineStart, end);
+            int lineEnd = lineBreak < 0 ? end : lineBreak;
+            if (isFileEntryLine(source, lineStart, lineEnd)) {
+                return true;
+            }
+            if (lineBreak < 0) {
+                break;
+            }
+            lineStart = lineBreak + 2;
+        }
+        return false;
+    }
+
+    private static int encodedLineBreak(String source, int start, int end) {
+        int index = start;
+        while (index < end) {
+            if (source.charAt(index) != '\\') {
+                index++;
+                continue;
+            }
+            int runStart = index;
+            while (index < end && source.charAt(index) == '\\') {
+                index++;
+            }
+            int count = index - runStart;
+            if ((count & 1) == 1
+                    && index < end
+                    && (source.charAt(index) == 'n' || source.charAt(index) == 'r')) {
+                return index - 1;
+            }
+            if (index < end) {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean isFileEntryLine(String source, int start, int end) {
+        if (start + 3 >= end || !source.startsWith("## ", start)) {
+            return false;
+        }
+        int separator = source.indexOf(": ", start + 3);
+        while (separator >= 0 && separator + 2 < end) {
+            if (separator < end
+                    && hasNonWhitespace(source, start + 3, separator)
+                    && isAbsolutePath(source, separator + 2, end)) {
+                return true;
+            }
+            separator = source.indexOf(": ", separator + 2);
+        }
+        return false;
+    }
+
+    private static boolean hasNonWhitespace(String source, int start, int end) {
+        for (int index = start; index < end; index++) {
+            if (!Character.isWhitespace(source.charAt(index))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isAbsolutePath(String source, int start, int end) {
+        if (start >= end) {
+            return false;
+        }
+        if (source.charAt(start) == '/') {
+            return hasNonWhitespace(source, start + 1, end);
+        }
+        if (start + 1 < end
+                && source.charAt(start) == '\\'
+                && source.charAt(start + 1) == '/') {
+            return hasNonWhitespace(source, start + 2, end);
+        }
+        if (start + 3 < end
+                && isAsciiLetter(source.charAt(start))
+                && source.charAt(start + 1) == ':'
+                && (source.charAt(start + 2) == '/'
+                        || (source.charAt(start + 2) == '\\'
+                                && source.charAt(start + 3) == '\\'))) {
+            int pathStart = source.charAt(start + 2) == '/' ? start + 3 : start + 4;
+            return hasNonWhitespace(source, pathStart, end);
+        }
+        return start + 4 < end
+                && source.charAt(start) == '\\'
+                && source.charAt(start + 1) == '\\'
+                && source.charAt(start + 2) == '\\'
+                && source.charAt(start + 3) == '\\'
+                && hasNonWhitespace(source, start + 4, end);
+    }
+
+    private static boolean isAsciiLetter(char value) {
+        return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
+    }
+
+    private static int jsonStringEnd(String source, int start) {
+        int index = start;
+        while (index < source.length()) {
+            char current = source.charAt(index++);
+            if (current == '\\') {
+                if (index < source.length()) {
+                    index++;
+                }
+            } else if (current == '"') {
+                return index - 1;
+            }
+        }
+        return -1;
+    }
+
+    private static int headingIndex(
+            String source, String heading, int from, int stringEnd, int stringStart) {
+        int index = source.indexOf(heading, from);
+        while (index >= 0 && index + heading.length() <= stringEnd) {
+            if (isEncodedLineStart(source, index, stringStart)
+                    && isEncodedLineEnd(source, index + heading.length(), stringEnd)) {
+                return index;
+            }
+            index = source.indexOf(heading, index + 1);
+        }
+        return -1;
+    }
+
+    private static boolean isEncodedLineStart(String source, int index, int stringStart) {
+        if (index == stringStart) {
+            return true;
+        }
+        if (index < stringStart + 2) {
+            return false;
+        }
+        char escaped = source.charAt(index - 1);
+        if (escaped != 'n' && escaped != 'r') {
+            return false;
+        }
+        int backslashes = 0;
+        int cursor = index - 2;
+        while (cursor >= stringStart && source.charAt(cursor) == '\\') {
+            backslashes++;
+            cursor--;
+        }
+        return (backslashes & 1) == 1;
+    }
+
+    private static boolean isEncodedLineEnd(String source, int index, int stringEnd) {
+        return index == stringEnd
+                || (index + 1 < stringEnd
+                        && source.charAt(index) == '\\'
+                        && (source.charAt(index + 1) == 'n'
+                                || source.charAt(index + 1) == 'r'));
+    }
+
+    private static boolean isSingleImageMarkup(String value) {
+        if (value == null) {
+            return false;
+        }
+        String trimmed = value.trim();
+        if ("</image>".equals(trimmed)) {
+            return true;
+        }
+        return trimmed.endsWith(">")
+                && trimmed.startsWith("<image")
+                && (trimmed.length() == "<image>".length()
+                        || Character.isWhitespace(trimmed.charAt("<image".length())));
     }
 
     private static Snippet decodeString(String source, int index, int limit) {
@@ -457,15 +707,18 @@ final class DashboardContentPreview {
     private static final class Payload {
         private final Context context;
         private final int maxChars;
+        private final boolean cleanCodexUserEnvelope;
         private final BoundedParts text;
         private final BoundedParts details;
         private String type;
         private String name;
         private String output;
+        private boolean codexUserEnvelope;
 
-        private Payload(Context context, int maxChars) {
+        private Payload(Context context, int maxChars, boolean cleanCodexUserEnvelope) {
             this.context = context;
             this.maxChars = maxChars;
+            this.cleanCodexUserEnvelope = cleanCodexUserEnvelope;
             this.text = new BoundedParts(maxChars);
             this.details = new BoundedParts(Math.min(DETAIL_LIMIT, maxChars));
         }
@@ -498,7 +751,10 @@ final class DashboardContentPreview {
             if ("message".equals(field)
                     || "text".equals(field)
                     || "content".equals(field)) {
-                Snippet value = stringValue(source, parser, maxChars);
+                Snippet value =
+                        userTextValue(
+                                source, parser, maxChars, cleanCodexUserEnvelope);
+                codexUserEnvelope |= value.codexUserEnvelope;
                 text.add(value.display());
                 return value;
             }
@@ -548,20 +804,27 @@ final class DashboardContentPreview {
         private boolean describesAttachment() {
             return "image_generation_end".equals(type);
         }
+
+        private boolean isCodexUserEnvelope() {
+            return codexUserEnvelope;
+        }
     }
 
     private static final class ContentBlock {
         private final Context context;
         private final int maxChars;
+        private final boolean cleanCodexUserEnvelope;
         private final BoundedParts text;
         private final BoundedParts nestedOutput;
         private final BoundedParts detail;
         private String type;
         private String name;
+        private boolean codexUserEnvelope;
 
-        private ContentBlock(Context context, int maxChars) {
+        private ContentBlock(Context context, int maxChars, boolean cleanCodexUserEnvelope) {
             this.context = context;
             this.maxChars = maxChars;
+            this.cleanCodexUserEnvelope = cleanCodexUserEnvelope;
             this.text = new BoundedParts(maxChars);
             this.nestedOutput = new BoundedParts(maxChars);
             this.detail = new BoundedParts(Math.min(DETAIL_LIMIT, maxChars));
@@ -586,7 +849,10 @@ final class DashboardContentPreview {
                         || "refusal".equals(field)
                         || "content".equals(field)
                         || "output".equals(field)) {
-                    Snippet value = stringValue(source, parser, maxChars);
+                    Snippet value =
+                            userTextValue(
+                                    source, parser, maxChars, cleanCodexUserEnvelope);
+                    codexUserEnvelope |= value.codexUserEnvelope;
                     text.add(value.display());
                     return value;
                 }
@@ -658,19 +924,48 @@ final class DashboardContentPreview {
                     || "file".equals(type)
                     || "attachment".equals(type);
         }
+
+        private boolean isCodexUserEnvelope() {
+            return codexUserEnvelope;
+        }
+
+        private boolean isCodexImagePart() {
+            return "input_image".equals(type) || isSingleImageMarkup(text.join());
+        }
     }
 
     private static final class ParsedPreview {
+        private final boolean cleanCodexUserEnvelope;
         private final BoundedParts parts;
         private final BoundedParts conversationParts;
         private String rootType;
         private boolean hasAttachments;
         private boolean attachmentDescribed;
         private boolean conversationAttachmentDescribed;
+        private boolean codexUserEnvelope;
 
-        private ParsedPreview(int maxChars) {
+        private ParsedPreview(int maxChars, boolean cleanCodexUserEnvelope) {
+            this.cleanCodexUserEnvelope = cleanCodexUserEnvelope;
             this.parts = new BoundedParts(maxChars);
             this.conversationParts = new BoundedParts(maxChars);
+        }
+
+        private void addText(Snippet value) {
+            codexUserEnvelope |= value.codexUserEnvelope;
+            add(value.display(), false, false);
+        }
+
+        private void add(Payload payload) {
+            codexUserEnvelope |= payload.isCodexUserEnvelope();
+            add(payload.render(), payload.describesAttachment(), payload.isTool());
+        }
+
+        private void add(ContentBlock block) {
+            codexUserEnvelope |= block.isCodexUserEnvelope();
+            if (cleanCodexUserEnvelope && codexUserEnvelope && block.isCodexImagePart()) {
+                return;
+            }
+            add(block.render(), block.describesAttachment(), block.isTool());
         }
 
         private void add(String value, boolean describesAttachment, boolean tool) {
@@ -690,7 +985,7 @@ final class DashboardContentPreview {
             if ("attachment".equals(rootType) && parts.isEmpty()) {
                 add("附件", true, false);
             }
-            if (hasAttachments && !attachmentDescribed) {
+            if (hasAttachments && !attachmentDescribed && !codexUserEnvelope) {
                 add("附件", true, false);
             }
             return parts.join();
@@ -703,10 +998,15 @@ final class DashboardContentPreview {
             }
             if (hasAttachments
                     && !conversationAttachmentDescribed
-                    && !conversationParts.isEmpty()) {
+                    && !conversationParts.isEmpty()
+                    && !codexUserEnvelope) {
                 conversationParts.add("附件");
             }
             return conversationParts.join();
+        }
+
+        private boolean isCodexUserEnvelope() {
+            return codexUserEnvelope;
         }
     }
 
@@ -714,11 +1014,18 @@ final class DashboardContentPreview {
         private final String text;
         private final boolean truncated;
         private final int limit;
+        private final boolean codexUserEnvelope;
 
         private Snippet(String text, boolean truncated, int limit) {
+            this(text, truncated, limit, false);
+        }
+
+        private Snippet(
+                String text, boolean truncated, int limit, boolean codexUserEnvelope) {
             this.text = text;
             this.truncated = truncated;
             this.limit = limit;
+            this.codexUserEnvelope = codexUserEnvelope;
         }
 
         private String display() {

@@ -336,7 +336,8 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                                     message(row, values.conversationOnly);
                             if (!values.matches(message)
                                     || (values.conversationOnly
-                                            && message.getContentPreview().isEmpty())) {
+                                            && message.getContentPreview().isEmpty()
+                                            && message.getAttachments().isEmpty())) {
                                 return;
                             }
                             if (values.search == null
@@ -997,18 +998,18 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                 eventType,
                 contentPreview,
                 contentJson.length(),
-                storedAttachmentCount(contentJson),
+                storedAttachments(contentJson),
                 nullableTimestamp(row, 7),
                 nullableTimestamp(row, 8));
     }
 
-    private int storedAttachmentCount(String contentJson) {
+    private List<DashboardAttachment> storedAttachments(String contentJson) {
         if (contentJson == null || contentJson.isEmpty()) {
-            return 0;
+            return Collections.emptyList();
         }
         try (JsonParser parser = objectMapper.getFactory().createParser(contentJson)) {
             if (parser.nextToken() != JsonToken.START_OBJECT) {
-                return 0;
+                return Collections.emptyList();
             }
             JsonToken token;
             while ((token = parser.nextToken()) != null && token != JsonToken.END_OBJECT) {
@@ -1023,26 +1024,37 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                     continue;
                 }
                 if (value != JsonToken.START_ARRAY) {
-                    return 0;
+                    return Collections.emptyList();
                 }
-                int count = 0;
+                Map<Integer, DashboardAttachment> attachments = new TreeMap<>();
+                int ordinal = 0;
                 while ((token = parser.nextToken()) != null && token != JsonToken.END_ARRAY) {
-                    if (token == JsonToken.START_OBJECT && isStoredAttachmentEntry(parser)) {
-                        count++;
+                    if (token == JsonToken.START_OBJECT) {
+                        DashboardAttachment attachment = storedAttachment(parser, ordinal);
+                        if (attachment != null) {
+                            attachments.put(attachment.getIndex(), attachment);
+                        }
                     } else {
                         parser.skipChildren();
                     }
+                    ordinal++;
                 }
-                return count;
+                return new ArrayList<>(attachments.values());
             }
         } catch (IOException | RuntimeException ignored) {
-            return 0;
+            return Collections.emptyList();
         }
-        return 0;
+        return Collections.emptyList();
     }
 
-    private static boolean isStoredAttachmentEntry(JsonParser parser) throws IOException {
-        boolean stored = false;
+    private static DashboardAttachment storedAttachment(JsonParser parser, int ordinal)
+            throws IOException {
+        int index = ordinal;
+        long size = -1L;
+        String mimeType = null;
+        String fileName = null;
+        String status = null;
+        String sha256 = null;
         JsonToken token;
         while ((token = parser.nextToken()) != null && token != JsonToken.END_OBJECT) {
             if (token != JsonToken.FIELD_NAME) {
@@ -1051,13 +1063,46 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
             }
             String field = parser.currentName();
             JsonToken value = parser.nextToken();
-            if ("status".equals(field) && value == JsonToken.VALUE_STRING) {
-                stored = "stored".equalsIgnoreCase(parser.getValueAsString());
-            } else {
-                parser.skipChildren();
+            switch (field) {
+                case "index":
+                    if (value == JsonToken.VALUE_NUMBER_INT) {
+                        index = parser.getIntValue();
+                    }
+                    break;
+                case "size":
+                    if (value == JsonToken.VALUE_NUMBER_INT) {
+                        size = parser.getLongValue();
+                    }
+                    break;
+                case "mime_type":
+                    if (value == JsonToken.VALUE_STRING) {
+                        mimeType = parser.getValueAsString();
+                    }
+                    break;
+                case "file_name":
+                    if (value == JsonToken.VALUE_STRING) {
+                        fileName = parser.getValueAsString();
+                    }
+                    break;
+                case "status":
+                    if (value == JsonToken.VALUE_STRING) {
+                        status = parser.getValueAsString();
+                    }
+                    break;
+                case "sha256":
+                    if (value == JsonToken.VALUE_STRING) {
+                        sha256 = parser.getValueAsString();
+                    }
+                    break;
+                default:
+                    parser.skipChildren();
             }
         }
-        return stored;
+        if (index < 0 || !"stored".equalsIgnoreCase(status)) {
+            return null;
+        }
+        return new DashboardAttachment(
+                index, true, size, mimeType, fileName, status, sha256);
     }
 
     private static boolean isStored(AttachmentMetadata metadata) {

@@ -106,7 +106,10 @@ class PaimonDashboardDataStoreTest {
                         11L,
                         "assistant",
                         "message",
-                        "{\"payload\":{\"text\":\"answer\"}}",
+                        "{\"payload\":{\"text\":\"answer\"},"
+                                + "\"_paimon_attachments\":[{\"index\":0,"
+                                + "\"file_name\":\"missing.png\","
+                                + "\"status\":\"missing\"}]}",
                         Collections.emptyList(),
                         second.plusSeconds(1),
                         second.plusSeconds(1));
@@ -172,20 +175,47 @@ class PaimonDashboardDataStoreTest {
                 assertThat(messages.getItems().get(0).getContentPreview().length())
                         .isGreaterThan(240);
                 assertThat(messages.getItems().get(0).getAttachmentCount()).isEqualTo(1);
-                assertThat(
-                                store.listMessages(
-                                                new MessageQuery(
-                                                        "codex",
-                                                        "codex-session",
-                                                        "assistant",
-                                                        "message",
-                                                        null,
-                                                        1,
-                                                        10))
-                                        .getItems()
-                                        .get(0)
-                                        .getAttachmentCount())
-                        .isZero();
+                assertThat(messages.getItems().get(0).getAttachments())
+                        .singleElement()
+                        .satisfies(
+                                item -> {
+                                    assertThat(item.getIndex()).isZero();
+                                    assertThat(item.isPresent()).isTrue();
+                                    assertThat(item.getSize()).isEqualTo(4L);
+                                    assertThat(item.getMimeType()).isEqualTo("image/png");
+                                    assertThat(item.getFileName()).isEqualTo("tiny.png");
+                                    assertThat(item.getStatus()).isEqualTo("stored");
+                                    assertThat(item.getSha256()).isEqualTo("digest");
+                                });
+                assertThatThrownBy(
+                                () ->
+                                        messages.getItems()
+                                                .get(0)
+                                                .getAttachments()
+                                                .add(
+                                                        new DashboardAttachment(
+                                                                1,
+                                                                true,
+                                                                1L,
+                                                                null,
+                                                                null,
+                                                                "stored",
+                                                                null)))
+                        .isInstanceOf(UnsupportedOperationException.class);
+                DashboardMessage missingAttachmentMessage =
+                        store.listMessages(
+                                        new MessageQuery(
+                                                "codex",
+                                                "codex-session",
+                                                "assistant",
+                                                "message",
+                                                null,
+                                                1,
+                                                10))
+                                .getItems()
+                                .get(0);
+                assertThat(missingAttachmentMessage.getAttachmentCount()).isZero();
+                assertThat(missingAttachmentMessage.getAttachments()).isEmpty();
 
                 DashboardMessageDetail detail =
                         store.messageDetail("codex", "codex-session", "message-image", 10L)
@@ -246,12 +276,16 @@ class PaimonDashboardDataStoreTest {
                 // Overview and list projections omit ARRAY<BLOB>, so missing blob files do not
                 // prevent browsing the two tables.
                 assertThat(store.overview().getMessageCount()).isEqualTo(2L);
-                assertThat(
-                                store.listMessages(
-                                                new MessageQuery(
-                                                        null, null, null, null, null, 1, 10))
-                                        .getTotal())
-                        .isEqualTo(2L);
+                DashboardPage<DashboardMessage> offlineMessages =
+                        store.listMessages(
+                                new MessageQuery(
+                                        null, null, null, null, null, 1, 10));
+                assertThat(offlineMessages.getTotal()).isEqualTo(2L);
+                assertThat(offlineMessages.getItems())
+                        .filteredOn(item -> "message-image".equals(item.getMessageId()))
+                        .flatExtracting(DashboardMessage::getAttachments)
+                        .extracting(DashboardAttachment::getFileName)
+                        .containsExactly("tiny.png");
                 DashboardMessageDetail offlineDetail =
                         store.messageDetail("codex", "codex-session", "message-image", 10L)
                                 .orElseThrow(AssertionError::new);
@@ -456,6 +490,21 @@ class PaimonDashboardDataStoreTest {
                                 + "\"type\":\"image_generation_end\","
                                 + "\"result\":\"paimon-blob:0\"}}",
                         time);
+        ChatMessage imageOnlyUserMessage =
+                new ChatMessage(
+                        "image-only-user-message",
+                        codexKey,
+                        2L,
+                        "user",
+                        "message",
+                        "{\"_paimon_attachments\":[{\"index\":0,"
+                                + "\"file_name\":\"screenshot.png\","
+                                + "\"mime_type\":\"image/png\",\"status\":\"stored\","
+                                + "\"size\":3,\"sha256\":\"image-digest\"}]}",
+                        Collections.singletonList(
+                                AttachmentPayload.of(new byte[] {1, 2, 3})),
+                        time.plusSeconds(2),
+                        time.plusSeconds(2));
         ChatMessage attachmentRole =
                 message(
                         "attachment-role",
@@ -496,7 +545,7 @@ class PaimonDashboardDataStoreTest {
                                             "Generated image",
                                             false,
                                             time),
-                                    Collections.singletonList(generatedImage)),
+                                    Arrays.asList(generatedImage, imageOnlyUserMessage)),
                             new SessionBatch(
                                     session(claudeKey, "Attachments", false, time),
                                     Arrays.asList(
@@ -517,14 +566,34 @@ class PaimonDashboardDataStoreTest {
                                         true,
                                         1,
                                         10));
-                assertThat(codex.getTotal()).isEqualTo(1L);
+                assertThat(codex.getTotal()).isEqualTo(2L);
                 assertThat(codex.getItems())
+                        .filteredOn(item -> "generated-image".equals(item.getMessageId()))
                         .extracting(
                                 DashboardMessage::getMessageId,
                                 DashboardMessage::getContentPreview)
                         .containsExactly(
                                 org.assertj.core.groups.Tuple.tuple(
                                         "generated-image", "生成图片"));
+                assertThat(codex.getItems())
+                        .filteredOn(
+                                item ->
+                                        "image-only-user-message".equals(
+                                                item.getMessageId()))
+                        .singleElement()
+                        .satisfies(
+                                item -> {
+                                    assertThat(item.getContentPreview()).isEmpty();
+                                    assertThat(item.getAttachments())
+                                            .singleElement()
+                                            .satisfies(
+                                                    attachment -> {
+                                                        assertThat(attachment.getFileName())
+                                                                .isEqualTo("screenshot.png");
+                                                        assertThat(attachment.getSha256())
+                                                                .isEqualTo("image-digest");
+                                                    });
+                                });
 
                 DashboardPage<DashboardMessage> claude =
                         store.listMessages(

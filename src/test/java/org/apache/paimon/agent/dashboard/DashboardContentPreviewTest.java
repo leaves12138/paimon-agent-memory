@@ -24,6 +24,165 @@ class DashboardContentPreviewTest {
     }
 
     @Test
+    void displaysOnlyTheRequestFromCodexAttachmentEnvelopes() {
+        String envelope =
+                "\\n# Files mentioned by the user:\\n\\n"
+                        + "## first.png: /tmp/first.png\\n\\n"
+                        + "## second.png: /tmp/second.png\\n\\n"
+                        + "## My request for Codex:\\n"
+                        + "请比较两张图片。\\n";
+        String user =
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\","
+                        + "\"role\":\"user\",\"content\":["
+                        + "{\"type\":\"input_text\",\"text\":\""
+                        + envelope
+                        + "\"},"
+                        + "{\"type\":\"input_text\",\"text\":\"<image name=[Image #1] path='/tmp/first.png'>\"},"
+                        + "{\"type\":\"input_image\",\"image_url\":\"paimon-blob:0\"},"
+                        + "{\"type\":\"input_text\",\"text\":\"</image>\"},"
+                        + "{\"type\":\"input_text\",\"text\":\"补充说明\"}]},"
+                        + "\"_paimon_attachments\":[{\"index\":0}]}";
+
+        assertThat(DashboardContentPreview.previewMessage(user, "user", "message"))
+                .isEqualTo("请比较两张图片。 · 补充说明");
+        assertThat(
+                        DashboardContentPreview.conversationPreviewMessage(
+                                user, "user", "message"))
+                .isEqualTo("请比较两张图片。 · 补充说明");
+        assertThat(DashboardContentPreview.preview(user))
+                .contains("# Files mentioned by the user:")
+                .contains("图片");
+    }
+
+    @Test
+    void keepsPureImageCodexMessagesWithoutSyntheticPreviewText() {
+        String user =
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\","
+                        + "\"role\":\"user\",\"content\":["
+                        + "{\"type\":\"input_text\",\"text\":\"\\n"
+                        + "# Files mentioned by the user:\\n\\n"
+                        + "## image.png: /tmp/image.png\\n\\n"
+                        + "## My request for Codex:\\n\\n\"},"
+                        + "{\"type\":\"input_text\",\"text\":\"<image name=[Image #1] path='/tmp/image.png'>\"},"
+                        + "{\"type\":\"input_image\",\"image_url\":\"paimon-blob:0\"},"
+                        + "{\"type\":\"input_text\",\"text\":\"</image>\"}]},"
+                        + "\"_paimon_attachments\":[{\"index\":0}]}";
+
+        assertThat(DashboardContentPreview.previewMessage(user, "user", "message"))
+                .isEmpty();
+        assertThat(
+                        DashboardContentPreview.conversationPreviewMessage(
+                                user, "user", "message"))
+                .isEmpty();
+    }
+
+    @Test
+    void doesNotCleanOrdinaryMarkdownOrIncompleteAttachmentMarkers() {
+        String onlyFiles =
+                codexUserText(
+                        "# Files mentioned by the user:\n\n"
+                                + "## file.txt: /tmp/file.txt\n\n"
+                                + "普通正文");
+        String onlyRequest =
+                codexUserText("## My request for Codex:\n这只是普通 Markdown");
+        String inlineMarkers =
+                codexUserText(
+                        "引用 # Files mentioned by the user:\n\n"
+                                + "引用 ## My request for Codex:\n正文");
+
+        assertThat(DashboardContentPreview.previewMessage(onlyFiles, "user", "message"))
+                .startsWith("# Files mentioned by the user:")
+                .endsWith("普通正文");
+        assertThat(DashboardContentPreview.previewMessage(onlyRequest, "user", "message"))
+                .isEqualTo("## My request for Codex:\n这只是普通 Markdown");
+        assertThat(DashboardContentPreview.previewMessage(inlineMarkers, "user", "message"))
+                .startsWith("引用 # Files mentioned by the user:");
+    }
+
+    @Test
+    void requiresARealAbsoluteFileEntryBetweenTheExactMarkers() {
+        String noFileEntry =
+                codexUserText(
+                        "# Files mentioned by the user:\n\n"
+                                + "这里没有文件项\n\n"
+                                + "## My request for Codex:\n正文");
+        String relativePath =
+                codexUserText(
+                        "# Files mentioned by the user:\n\n"
+                                + "## file.txt: relative/file.txt\n\n"
+                                + "## My request for Codex:\n正文");
+
+        assertThat(DashboardContentPreview.previewMessage(noFileEntry, "user", "message"))
+                .startsWith("# Files mentioned by the user:")
+                .contains("## My request for Codex:");
+        assertThat(DashboardContentPreview.previewMessage(relativePath, "user", "message"))
+                .startsWith("# Files mentioned by the user:")
+                .contains("relative/file.txt");
+    }
+
+    @Test
+    void acceptsCrLfAndColonsInFileNamesAndWindowsAbsolutePaths() {
+        String unix =
+                codexUserText(
+                        "# Files mentioned by the user:\r\n\r\n"
+                                + "## report: final.png: /tmp/report:final.png\r\n\r\n"
+                                + "## My request for Codex:\r\nUnix 正文");
+        String windows =
+                codexUserText(
+                        "# Files mentioned by the user:\r\n\r\n"
+                                + "## report: final.png: C:\\Users\\me\\report.png\r\n\r\n"
+                                + "## My request for Codex:\r\nWindows 正文");
+
+        assertThat(DashboardContentPreview.previewMessage(unix, "user", "message"))
+                .isEqualTo("Unix 正文");
+        assertThat(DashboardContentPreview.previewMessage(windows, "user", "message"))
+                .isEqualTo("Windows 正文");
+    }
+
+    @Test
+    void findsTheRequestAfterLargeFileListsAndStillHonorsTheConversationLimit() {
+        StringBuilder files = new StringBuilder("\n# Files mentioned by the user:\n\n");
+        for (int index = 0; index < 2_000; index++) {
+            files.append("## image-")
+                    .append(index)
+                    .append(".png: /a/very/long/path/image-")
+                    .append(index)
+                    .append(".png\n\n");
+        }
+        files.append("## My request for Codex:\n").append("🙂".repeat(5_000));
+
+        String preview =
+                DashboardContentPreview.previewMessage(
+                        codexUserText(files.toString()), "user", "message");
+
+        assertThat(preview).doesNotContain("Files mentioned").endsWith("…");
+        assertThat(preview.codePointCount(0, preview.length())).isEqualTo(4_096);
+    }
+
+    @Test
+    void imageEnvelopePartsDoNotConsumeBoundedPartsCapacity() {
+        String body = "x".repeat(4_091);
+        String user =
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\","
+                        + "\"role\":\"user\",\"content\":["
+                        + "{\"type\":\"input_text\",\"text\":\""
+                        + "# Files mentioned by the user:\\n\\n"
+                        + "## image.png: /tmp/image.png\\n\\n"
+                        + "## My request for Codex:\\n"
+                        + body
+                        + "\"},"
+                        + "{\"type\":\"input_text\",\"text\":\"<image path='/tmp/image.png'>\"},"
+                        + "{\"type\":\"input_image\",\"image_url\":\"paimon-blob:0\"},"
+                        + "{\"type\":\"input_text\",\"text\":\"</image>\"},"
+                        + "{\"type\":\"input_text\",\"text\":\"tail\"}]}}";
+
+        String preview = DashboardContentPreview.previewMessage(user, "user", "message");
+
+        assertThat(preview).isEqualTo(body + " · t…");
+        assertThat(preview.codePointCount(0, preview.length())).isEqualTo(4_096);
+    }
+
+    @Test
     void summarizesCodexFunctionCallAndOutput() {
         String call =
                 "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\","
@@ -288,5 +447,19 @@ class DashboardContentPreviewTest {
         assertThat(DashboardContentPreview.messageLimit("tool", "message")).isEqualTo(240);
         assertThatThrownBy(() -> DashboardContentPreview.preview(json, 0))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    private static String codexUserText(String text) {
+        return "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\","
+                + "\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\""
+                + jsonEscape(text)
+                + "\"}]}}";
+    }
+
+    private static String jsonEscape(String value) {
+        return value.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n");
     }
 }
