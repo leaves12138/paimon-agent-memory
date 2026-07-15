@@ -334,11 +334,11 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                         && pendingWasNonEmpty
                         && (!nonEmpty || commitIdentifier != pendingCommitIdentifier);
         if (generationAdvanced || observedPendingCommitCompleted) {
-            // pendingData() is synchronized with CollectorService.commitPending(). Once its
-            // generation advances, the Paimon commit has completed. Keep the pending transition
-            // fallback for standalone/legacy callers which do not provide a generation. Drop
-            // uploaded caches before removing the overlay, otherwise newly committed rows can
-            // disappear for the cache TTL.
+            // pendingData() and commitGeneration() are lock-free immutable collector views. Once
+            // the generation advances, the Paimon commit has completed. Keep the pending
+            // transition fallback for standalone/legacy callers which do not provide a
+            // generation. Drop uploaded caches before removing the overlay, otherwise newly
+            // committed rows can disappear for the cache TTL.
             uploaded.invalidate();
         }
         pendingStateObserved = true;

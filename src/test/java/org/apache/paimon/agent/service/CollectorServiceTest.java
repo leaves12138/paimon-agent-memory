@@ -2,6 +2,17 @@ package org.apache.paimon.agent.service;
 
 import org.apache.paimon.agent.config.ProjectConfig;
 import org.apache.paimon.agent.config.SourceConfig;
+import org.apache.paimon.agent.dashboard.AttachmentData;
+import org.apache.paimon.agent.dashboard.DashboardDataStore;
+import org.apache.paimon.agent.dashboard.DashboardMessage;
+import org.apache.paimon.agent.dashboard.DashboardMessageDetail;
+import org.apache.paimon.agent.dashboard.DashboardOverview;
+import org.apache.paimon.agent.dashboard.DashboardPage;
+import org.apache.paimon.agent.dashboard.DashboardSession;
+import org.apache.paimon.agent.dashboard.DashboardStorageStatus;
+import org.apache.paimon.agent.dashboard.LiveDashboardDataStore;
+import org.apache.paimon.agent.dashboard.MessageQuery;
+import org.apache.paimon.agent.dashboard.SessionQuery;
 import org.apache.paimon.agent.model.ChatMessage;
 import org.apache.paimon.agent.model.ChatSession;
 import org.apache.paimon.agent.model.AttachmentPayload;
@@ -25,8 +36,12 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -36,6 +51,127 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class CollectorServiceTest {
 
     @TempDir Path tempDir;
+
+    @Test
+    void exposesImmutableDashboardSnapshotWhileRepositoryCommitIsBlocked() throws Exception {
+        SessionKey key = new SessionKey("codex", "blocked-commit");
+        BlockingRepository repository = new BlockingRepository();
+        ConversationSource source =
+                sourceWithOneMessage(
+                        "blocked commit", key, new ArrayList<>(), new ArrayList<>());
+        CollectorService service =
+                new CollectorService(
+                        config(100, 1), Collections.singletonList(source), repository);
+        ExecutorService collector = Executors.newSingleThreadExecutor();
+        ExecutorService dashboardReaders = Executors.newFixedThreadPool(4);
+        LiveDashboardDataStore dashboard =
+                new LiveDashboardDataStore(
+                        new EmptyDashboardDataStore(),
+                        service::pendingData,
+                        service::commitGeneration,
+                        20);
+        Future<?> collection = collector.submit(() -> {
+            service.runOnce();
+            return null;
+        });
+
+        try {
+            assertThat(repository.commitStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            Future<PendingDataSnapshot> pendingRead =
+                    dashboardReaders.submit(service::pendingData);
+            Future<Long> generationRead =
+                    dashboardReaders.submit(service::commitGeneration);
+            Future<CollectorStatus> statusRead = dashboardReaders.submit(service::status);
+            Future<DashboardPage<DashboardSession>> sessionRead =
+                    dashboardReaders.submit(
+                            () ->
+                                    dashboard.listSessions(
+                                            new SessionQuery(null, null, null, 1, 20)));
+
+            PendingDataSnapshot snapshot = pendingRead.get(1, TimeUnit.SECONDS);
+            assertThat(generationRead.get(1, TimeUnit.SECONDS)).isZero();
+            CollectorStatus status = statusRead.get(1, TimeUnit.SECONDS);
+            DashboardPage<DashboardSession> page = sessionRead.get(1, TimeUnit.SECONDS);
+
+            assertThat(snapshot.commitIdentifier()).isZero();
+            assertThat(snapshot.batches()).hasSize(1);
+            assertThat(snapshot.batches().get(0).messages())
+                    .extracting(ChatMessage::messageId)
+                    .containsExactly("blocked commit");
+            assertThat(status.pendingSessions()).isOne();
+            assertThat(status.pendingMessages()).isOne();
+            assertThatThrownBy(() -> snapshot.batches().clear())
+                    .isInstanceOf(UnsupportedOperationException.class);
+            assertThatThrownBy(() -> snapshot.batches().get(0).messages().clear())
+                    .isInstanceOf(UnsupportedOperationException.class);
+            assertThat(page.getItems())
+                    .extracting(DashboardSession::getSessionId)
+                    .containsExactly("blocked-commit");
+            assertThat(page.getItems())
+                    .extracting(DashboardSession::getStorageStatus)
+                    .containsExactly(DashboardStorageStatus.PENDING);
+
+            repository.releaseCommit.countDown();
+            collection.get(5, TimeUnit.SECONDS);
+
+            assertThat(service.pendingData().isEmpty()).isTrue();
+            assertThat(service.commitGeneration()).isEqualTo(1L);
+            assertThat(snapshot.batches())
+                    .flatExtracting(SessionBatch::messages)
+                    .extracting(ChatMessage::messageId)
+                    .containsExactly("blocked commit");
+        } finally {
+            repository.releaseCommit.countDown();
+            collection.cancel(true);
+            dashboardReaders.shutdownNow();
+            collector.shutdownNow();
+            dashboard.close();
+            service.close();
+        }
+    }
+
+    @Test
+    void exposesSnapshotsDuringCommitRetryBackoff() throws Exception {
+        SessionKey key = new SessionKey("codex", "retry-backoff");
+        FakeRepository repository = new FakeRepository();
+        repository.failNextCommit = true;
+        ConversationSource source =
+                sourceWithOneMessage(
+                        "retry backoff", key, new ArrayList<>(), new ArrayList<>());
+        CollectorService service =
+                new CollectorService(
+                        configWithRetry(100, 1),
+                        Collections.singletonList(source),
+                        repository);
+        ExecutorService collector = Executors.newSingleThreadExecutor();
+        ExecutorService readers = Executors.newFixedThreadPool(3);
+        Future<?> collection = collector.submit(() -> {
+            service.runOnce();
+            return null;
+        });
+
+        try {
+            assertThat(repository.firstCommitAttempted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            Future<PendingDataSnapshot> pendingRead = readers.submit(service::pendingData);
+            Future<Long> generationRead = readers.submit(service::commitGeneration);
+            Future<CollectorStatus> statusRead = readers.submit(service::status);
+            assertThat(pendingRead.get(500, TimeUnit.MILLISECONDS).batches()).hasSize(1);
+            assertThat(generationRead.get(500, TimeUnit.MILLISECONDS)).isZero();
+            assertThat(statusRead.get(500, TimeUnit.MILLISECONDS).pendingMessages()).isOne();
+
+            collection.get(5, TimeUnit.SECONDS);
+            assertThat(repository.commitCalls).isEqualTo(2);
+            assertThat(service.pendingData().isEmpty()).isTrue();
+            assertThat(service.commitGeneration()).isEqualTo(1L);
+        } finally {
+            collection.cancel(true);
+            readers.shutdownNow();
+            collector.shutdownNow();
+            service.close();
+        }
+    }
 
     @Test
     void reservesBufferCapacityForEveryRemainingSource() throws Exception {
@@ -1145,6 +1281,19 @@ class CollectorServiceTest {
     }
 
     private ProjectConfig config(int maxScanRecordsPerSource, int maxBufferRecords) {
+        return config(maxScanRecordsPerSource, maxBufferRecords, 0, Duration.ofSeconds(1));
+    }
+
+    private ProjectConfig configWithRetry(
+            int maxScanRecordsPerSource, int maxBufferRecords) {
+        return config(maxScanRecordsPerSource, maxBufferRecords, 1, Duration.ofSeconds(1));
+    }
+
+    private ProjectConfig config(
+            int maxScanRecordsPerSource,
+            int maxBufferRecords,
+            int maxRetryAttempts,
+            Duration initialRetryDelay) {
         return new ProjectConfig(
                 "db",
                 "sessions",
@@ -1160,8 +1309,78 @@ class CollectorServiceTest {
                 1024,
                 maxScanRecordsPerSource,
                 maxBufferRecords,
-                0,
-                Duration.ofSeconds(1));
+                maxRetryAttempts,
+                initialRetryDelay);
+    }
+
+    private static final class BlockingRepository implements ChatRepository {
+        private final CountDownLatch commitStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseCommit = new CountDownLatch(1);
+
+        @Override
+        public void initialize() {}
+
+        @Override
+        public Map<SessionKey, ChatSession> loadSessions() {
+            return Collections.emptyMap();
+        }
+
+        @Override
+        public void commit(long commitIdentifier, List<SessionBatch> batches)
+                throws Exception {
+            commitStarted.countDown();
+            if (!releaseCommit.await(10, TimeUnit.SECONDS)) {
+                throw new IOException("timed out waiting to release blocked commit");
+            }
+        }
+
+        @Override
+        public void close() {}
+    }
+
+    private static final class EmptyDashboardDataStore implements DashboardDataStore {
+
+        @Override
+        public DashboardOverview overview() {
+            return new DashboardOverview(
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    Collections.emptyMap(),
+                    Collections.emptyMap(),
+                    null);
+        }
+
+        @Override
+        public DashboardPage<DashboardSession> listSessions(SessionQuery query) {
+            return new DashboardPage<>(
+                    Collections.emptyList(), query.getPage(), query.getPageSize(), 0L);
+        }
+
+        @Override
+        public DashboardPage<DashboardMessage> listMessages(MessageQuery query) {
+            return new DashboardPage<>(
+                    Collections.emptyList(), query.getPage(), query.getPageSize(), 0L);
+        }
+
+        @Override
+        public Optional<DashboardMessageDetail> messageDetail(
+                String sourceType, String sessionId, String messageId, long sequenceNo) {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<AttachmentData> attachment(
+                String sourceType,
+                String sessionId,
+                String messageId,
+                long sequenceNo,
+                int index,
+                long maxBytes) {
+            return Optional.empty();
+        }
     }
 
     private static final class FakeRepository implements ChatRepository {
@@ -1175,6 +1394,7 @@ class CollectorServiceTest {
         private volatile boolean closed;
         private final List<Long> committedIdentifiers = new ArrayList<>();
         private final List<List<SessionBatch>> commits = new ArrayList<>();
+        private final CountDownLatch firstCommitAttempted = new CountDownLatch(1);
         private final CountDownLatch successfulCommit = new CountDownLatch(1);
 
         private FakeRepository(ChatSession... initialSessions) {
@@ -1194,6 +1414,7 @@ class CollectorServiceTest {
         @Override
         public void commit(long commitIdentifier, List<SessionBatch> batches) {
             commitCalls++;
+            firstCommitAttempted.countDown();
             if (failNextFatalCommit != null) {
                 Error fatal = failNextFatalCommit;
                 failNextFatalCommit = null;

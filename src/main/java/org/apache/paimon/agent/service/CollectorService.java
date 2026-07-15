@@ -43,16 +43,17 @@ public final class CollectorService implements AutoCloseable {
     private final Instant startedAt;
 
     private long nextCommitIdentifier;
-    private long commitGeneration;
+    private volatile long commitGeneration;
     private int nextSourceIndex;
     private boolean pendingFrozen;
     private volatile boolean closed;
     private boolean resourcesClosed;
     private volatile boolean running;
-    private Instant lastScanAt;
-    private Instant lastCommitAt;
-    private Instant lastErrorAt;
-    private String lastError;
+    private volatile Instant lastScanAt;
+    private volatile Instant lastCommitAt;
+    private volatile Instant lastErrorAt;
+    private volatile String lastError;
+    private volatile PendingDataSnapshot dashboardPendingData = PendingDataSnapshot.empty();
 
     public CollectorService(
             ProjectConfig config,
@@ -116,6 +117,7 @@ public final class CollectorService implements AutoCloseable {
                                 + 1L
                         : pendingIdentifiers.iterator().next();
         restoreFrozenBatch(pendingIdentifiers);
+        publishDashboardPendingData();
     }
 
     private void restoreFrozenBatch(Set<Long> pendingIdentifiers) throws Exception {
@@ -301,6 +303,8 @@ public final class CollectorService implements AutoCloseable {
         } catch (Exception failure) {
             recordError(failure);
             throw failure;
+        } finally {
+            publishDashboardPendingData();
         }
     }
 
@@ -369,11 +373,13 @@ public final class CollectorService implements AutoCloseable {
                         recoverySessions.size());
                 return madeProgress ? ScanResult.PROGRESSED : ScanResult.IDLE;
             }
+            publishDashboardPendingData();
             commit();
             return ScanResult.PROGRESSED;
         }
 
         if (pendingMessageCount() >= config.maxBufferRecords()) {
+            publishDashboardPendingData();
             commit();
             return ScanResult.PROGRESSED;
         }
@@ -426,11 +432,11 @@ public final class CollectorService implements AutoCloseable {
                             batch.sourceRecordsRead(),
                             batch.startingCursor(),
                             batch.startingCommitId()));
-            return;
+        } else {
+            existing.session = batch.session();
+            existing.messages.addAll(batch.messages());
+            existing.sourceRecordsRead += batch.sourceRecordsRead();
         }
-        existing.session = batch.session();
-        existing.messages.addAll(batch.messages());
-        existing.sourceRecordsRead += batch.sourceRecordsRead();
     }
 
     private synchronized void commit() throws Exception {
@@ -498,6 +504,7 @@ public final class CollectorService implements AutoCloseable {
         lastCommitAt = Instant.now();
         lastError = null;
         lastErrorAt = null;
+        publishDashboardPendingData();
         LOG.info(
                 "Committed {} sessions and {} messages with commit identifier {}",
                 batches.size(),
@@ -542,7 +549,8 @@ public final class CollectorService implements AutoCloseable {
         return count;
     }
 
-    public synchronized CollectorStatus status() {
+    public CollectorStatus status() {
+        PendingDataSnapshot snapshot = dashboardPendingData;
         return new CollectorStatus(
                 running && !closed,
                 startedAt,
@@ -550,14 +558,26 @@ public final class CollectorService implements AutoCloseable {
                 lastCommitAt,
                 lastErrorAt,
                 lastError,
-                pending.size(),
-                pendingMessageCount());
+                snapshot.batches().size(),
+                snapshot.batches().stream()
+                        .mapToInt(batch -> batch.messages().size())
+                        .sum());
     }
 
-    /** Returns a stable copy for the read-only dashboard without exposing mutable buffers. */
-    public synchronized PendingDataSnapshot pendingData() {
+    /**
+     * Returns the last immutable pending snapshot without waiting for a Paimon commit or retry.
+     * Network I/O intentionally runs while holding the collector monitor to freeze commit
+     * boundaries, so Dashboard-facing reads must never acquire that monitor.
+     */
+    public PendingDataSnapshot pendingData() {
+        return dashboardPendingData;
+    }
+
+    /** Publishes a deep immutable copy while the collector owns all pending-state mutations. */
+    private void publishDashboardPendingData() {
         if (pending.isEmpty()) {
-            return PendingDataSnapshot.empty();
+            dashboardPendingData = PendingDataSnapshot.empty();
+            return;
         }
         List<SessionBatch> batches = new ArrayList<>(pending.size());
         for (PendingBatch value : pending.values()) {
@@ -569,11 +589,11 @@ public final class CollectorService implements AutoCloseable {
                             value.startingCursor,
                             value.startingCommitId));
         }
-        return new PendingDataSnapshot(nextCommitIdentifier, batches);
+        dashboardPendingData = new PendingDataSnapshot(nextCommitIdentifier, batches);
     }
 
     /** Monotonically advances after each commit has completed successfully. */
-    public synchronized long commitGeneration() {
+    public long commitGeneration() {
         return commitGeneration;
     }
 
