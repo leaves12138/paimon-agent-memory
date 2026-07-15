@@ -183,8 +183,10 @@ before pagination, so tool-heavy turns cannot push the user's question out of th
 larger batches (up to 100 rows and never above `dashboard.max-page-size`) as the user scrolls toward
 the top, without losing the current scroll position. No load-more click is required; a retry control
 appears only when an automatic older-message request fails.
-Message JSON and attachment metadata are loaded only after an explicit detail click; supported
-images are then fetched from Paimon only when the user opens their preview. The preview is bounded by
+Common GFM pipe tables in chat text are rendered as semantic, horizontally scrollable HTML tables.
+The attachment/detail action appears only when the message manifest contains a stored attachment.
+Its JSON and attachment metadata are loaded without projecting `ARRAY<BLOB>`; supported images are
+then fetched from Paimon only when the user opens their preview. The preview is bounded by
 `dashboard.max-attachment-preview-size`, while `dashboard.page-size`,
 `dashboard.max-page-size`, and `dashboard.max-scan-rows` bound interactive queries. On narrow
 screens the two panes become a session-list-to-chat navigation flow.
@@ -195,8 +197,9 @@ the refresh controls force an immediate reload. The first page loads only the se
 overview statistics and message history no longer compete for the same initial request. Data
 Evolution message scans use smaller read-only splits so indexed rows spread across historical files
 can be read in parallel. `ai_chat_messages` enables Morax-managed incremental BTree indexing and
-compaction for `session_id` through the table options `morax.btree-index.enabled=true` and
-`global-index.btree.index-column=session_id`. The Dashboard reads with
+compaction for `session_id` and `message_id` through the table options
+`morax.btree-index.enabled=true` and
+`global-index.btree.index-column=session_id,message_id`. The Dashboard reads with
 `global-index.search-mode=full`, so rows appended after the latest asynchronous index commit remain
 visible through a raw-data fallback. The index is an optimization, not a correctness requirement.
 

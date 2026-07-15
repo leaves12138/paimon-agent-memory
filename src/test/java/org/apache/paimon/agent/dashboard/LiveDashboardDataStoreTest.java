@@ -173,6 +173,7 @@ class LiveDashboardDataStoreTest {
         assertThat(pendingRow.getStorageStatus()).isEqualTo(DashboardStorageStatus.PENDING);
         assertThat(pendingRow.getContentPreview()).contains("pending needle");
         assertThat(pendingRow.getContentPreview().length()).isGreaterThan(240);
+        assertThat(pendingRow.getAttachmentCount()).isEqualTo(1);
         assertThat(messages.getItems())
                 .filteredOn(
                         message ->

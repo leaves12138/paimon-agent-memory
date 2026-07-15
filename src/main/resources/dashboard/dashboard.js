@@ -7,6 +7,8 @@
   const TRANSIENT_FETCH_MAX_RETRIES = 30;
   const TRANSIENT_FETCH_MIN_DELAY_MS = 250;
   const TRANSIENT_FETCH_MAX_DELAY_MS = 5000;
+  const MESSAGE_DETAIL_TIMEOUT_MS = 15000;
+  const ATTACHMENT_PREVIEW_TIMEOUT_MS = 30000;
   const ALLOWED_IMAGE_TYPES = new Set([
     "image/png",
     "image/jpeg",
@@ -1130,7 +1132,8 @@
     const key = messageKey(item);
     const role = normalizeRole(item.role);
     const conversational = isConversationalMessage(item, role);
-    const expanded = state.conversation.expandedKey === key;
+    const hasAttachments = safeNumber(item.attachmentCount, 0) > 0;
+    const expanded = hasAttachments && state.conversation.expandedKey === key;
     const detailId = "message-detail-" + hashKey(key);
     const listItem = element(
       "li",
@@ -1159,16 +1162,18 @@
       statusBadge(messageStatus(item))
     );
 
-    const actions = element("div", "message-actions");
-    const detailButton = element("button", "message-detail-button", expanded ? "收起详情" : "附件与原始记录");
-    detailButton.type = "button";
-    detailButton.dataset.messageKey = key;
-    detailButton.setAttribute("aria-expanded", String(expanded));
-    detailButton.setAttribute("aria-controls", detailId);
-    detailButton.addEventListener("click", function () { toggleMessageDetail(item, key, detailButton); });
-    actions.appendChild(detailButton);
-
-    article.append(head, content, meta, actions);
+    article.append(head, content, meta);
+    if (hasAttachments) {
+      const actions = element("div", "message-actions");
+      const detailButton = element("button", "message-detail-button", expanded ? "收起详情" : "附件与原始记录");
+      detailButton.type = "button";
+      detailButton.dataset.messageKey = key;
+      detailButton.setAttribute("aria-expanded", String(expanded));
+      detailButton.setAttribute("aria-controls", detailId);
+      detailButton.addEventListener("click", function () { toggleMessageDetail(item, key); });
+      actions.appendChild(detailButton);
+      article.appendChild(actions);
+    }
     if (expanded) {
       article.appendChild(buildMessageDetailArea(item, key, detailId));
     }
@@ -1205,6 +1210,28 @@
   }
 
   function appendTextBlocks(container, value) {
+    const lines = value.split("\n");
+    let plainLines = [];
+    let index = 0;
+    function flushPlainLines() {
+      appendPlainTextBlocks(container, plainLines.join("\n"));
+      plainLines = [];
+    }
+    while (index < lines.length) {
+      const table = markdownTableAt(lines, index);
+      if (!table) {
+        plainLines.push(lines[index]);
+        index += 1;
+        continue;
+      }
+      flushPlainLines();
+      appendMarkdownTable(container, table);
+      index = table.nextIndex;
+    }
+    flushPlainLines();
+  }
+
+  function appendPlainTextBlocks(container, value) {
     value.split(/\n{2,}/).forEach(function (rawBlock) {
       const block = rawBlock.trim();
       if (!block) {
@@ -1237,6 +1264,172 @@
       });
       container.appendChild(paragraph);
     });
+  }
+
+  function markdownTableAt(lines, index) {
+    if (index + 1 >= lines.length) {
+      return null;
+    }
+    const header = parseMarkdownTableRow(lines[index]);
+    if (!header || header.length < 2) {
+      return null;
+    }
+    const alignments = parseMarkdownTableDelimiter(lines[index + 1], header.length);
+    if (!alignments) {
+      return null;
+    }
+    const rows = [];
+    let nextIndex = index + 2;
+    while (nextIndex < lines.length && lines[nextIndex].trim()) {
+      const row = parseMarkdownTableRow(lines[nextIndex]);
+      if (!row) {
+        break;
+      }
+      while (row.length < header.length) {
+        row.push("");
+      }
+      rows.push(row.slice(0, header.length));
+      nextIndex += 1;
+    }
+    return { header: header, alignments: alignments, rows: rows, nextIndex: nextIndex };
+  }
+
+  function parseMarkdownTableDelimiter(line, columnCount) {
+    const cells = parseMarkdownTableRow(line);
+    if (!cells || cells.length !== columnCount) {
+      return null;
+    }
+    const alignments = [];
+    for (let index = 0; index < cells.length; index++) {
+      const value = cells[index].trim();
+      if (!/^:?-{3,}:?$/.test(value)) {
+        return null;
+      }
+      const left = value.startsWith(":");
+      const right = value.endsWith(":");
+      alignments.push(left && right ? "center" : (right ? "right" : "left"));
+    }
+    return alignments;
+  }
+
+  function parseMarkdownTableRow(line) {
+    const source = displayValue(line, "").trim();
+    if (!source || !source.includes("|")) {
+      return null;
+    }
+    const cells = [];
+    let cell = "";
+    let codeFenceLength = 0;
+    let hasSeparator = false;
+    let leadingSeparator = false;
+    let trailingSeparator = false;
+    for (let index = 0; index < source.length; index++) {
+      const character = source[index];
+      if (character === "\\"
+          && codeFenceLength === 0
+          && (source[index + 1] === "|" || source[index + 1] === "`")) {
+        cell += source[index + 1];
+        trailingSeparator = false;
+        index += 1;
+        continue;
+      }
+      if (character === "`") {
+        let runLength = 1;
+        while (source[index + runLength] === "`") {
+          runLength += 1;
+        }
+        if (codeFenceLength === 0
+            && hasClosingBacktickRun(source, index + runLength, runLength)) {
+          codeFenceLength = runLength;
+        } else if (codeFenceLength === runLength) {
+          codeFenceLength = 0;
+        }
+        cell += source.slice(index, index + runLength);
+        trailingSeparator = false;
+        index += runLength - 1;
+        continue;
+      }
+      if (character === "|" && codeFenceLength === 0) {
+        if (index === 0) {
+          leadingSeparator = true;
+        }
+        cells.push(cell.trim());
+        cell = "";
+        hasSeparator = true;
+        trailingSeparator = true;
+        continue;
+      }
+      cell += character;
+      trailingSeparator = false;
+    }
+    cells.push(cell.trim());
+    if (!hasSeparator) {
+      return null;
+    }
+    if (leadingSeparator) {
+      cells.shift();
+    }
+    if (trailingSeparator) {
+      cells.pop();
+    }
+    return cells;
+  }
+
+  function hasClosingBacktickRun(source, start, expectedLength) {
+    let index = start;
+    while (index < source.length) {
+      if (source[index] !== "`" || isEscapedMarkdownCharacter(source, index)) {
+        index += 1;
+        continue;
+      }
+      let runLength = 1;
+      while (source[index + runLength] === "`") {
+        runLength += 1;
+      }
+      if (runLength === expectedLength) {
+        return true;
+      }
+      index += runLength;
+    }
+    return false;
+  }
+
+  function isEscapedMarkdownCharacter(source, index) {
+    let slashes = 0;
+    for (let cursor = index - 1; cursor >= 0 && source[cursor] === "\\"; cursor--) {
+      slashes += 1;
+    }
+    return slashes % 2 === 1;
+  }
+
+  function appendMarkdownTable(container, model) {
+    const wrapper = element("div", "message-markdown-table-wrap");
+    const table = element("table", "message-markdown-table");
+    const head = element("thead");
+    const headerRow = element("tr");
+    model.header.forEach(function (value, index) {
+      const cell = element("th", "is-align-" + model.alignments[index]);
+      cell.scope = "col";
+      appendInlineMarkdown(cell, value);
+      headerRow.appendChild(cell);
+    });
+    head.appendChild(headerRow);
+    table.appendChild(head);
+    if (model.rows.length > 0) {
+      const body = element("tbody");
+      model.rows.forEach(function (row) {
+        const tableRow = element("tr");
+        row.forEach(function (value, index) {
+          const cell = element("td", "is-align-" + model.alignments[index]);
+          appendInlineMarkdown(cell, value);
+          tableRow.appendChild(cell);
+        });
+        body.appendChild(tableRow);
+      });
+      table.appendChild(body);
+    }
+    wrapper.appendChild(table);
+    container.appendChild(wrapper);
   }
 
   function appendInlineMarkdown(container, value) {
@@ -1410,6 +1603,11 @@
     const controller = new AbortController();
     const request = ++state.detailRequest;
     const selectedKey = state.selection.key;
+    let timedOut = false;
+    const timeout = window.setTimeout(function () {
+      timedOut = true;
+      controller.abort();
+    }, MESSAGE_DETAIL_TIMEOUT_MS);
     state.detailController = controller;
     state.detailCache.set(key, { status: "loading" });
     renderMessages();
@@ -1430,11 +1628,15 @@
       }
       state.detailCache.set(key, { status: "ready", data: payload });
     } catch (error) {
-      if (error.name === "AbortError" || request !== state.detailRequest || selectedKey !== state.selection.key) {
+      if (timedOut && request === state.detailRequest && selectedKey === state.selection.key) {
+        state.detailCache.set(key, { status: "error", error: "附件信息读取超时，请重试" });
+      } else if (error.name === "AbortError" || request !== state.detailRequest || selectedKey !== state.selection.key) {
         return;
+      } else {
+        state.detailCache.set(key, { status: "error", error: friendlyError(error) });
       }
-      state.detailCache.set(key, { status: "error", error: friendlyError(error) });
     } finally {
+      window.clearTimeout(timeout);
       if (request === state.detailRequest) {
         state.detailController = null;
         if (state.conversation.expandedKey === key && selectedKey === state.selection.key) {
@@ -1675,6 +1877,11 @@
     dom.closePreview.focus();
 
     const controller = new AbortController();
+    let timedOut = false;
+    const timeout = window.setTimeout(function () {
+      timedOut = true;
+      controller.abort();
+    }, ATTACHMENT_PREVIEW_TIMEOUT_MS);
     state.previewController = controller;
     try {
       const response = await sameOriginFetch(attachment.previewUrl, {
@@ -1699,20 +1906,101 @@
       }
       state.previewObjectUrl = URL.createObjectURL(blob);
       dom.previewImage.src = state.previewObjectUrl;
+      await waitForPreviewImage(dom.previewImage, controller.signal);
+      if (controller.signal.aborted || dom.previewModal.hidden) {
+        return;
+      }
       dom.previewImage.hidden = false;
       dom.previewLoading.hidden = true;
     } catch (error) {
-      if (error.name === "AbortError") {
+      if (error.name === "AbortError" && !timedOut) {
         return;
       }
       if (!dom.previewModal.hidden) {
         dom.previewLoading.classList.add("is-error");
         dom.previewLoading.replaceChildren(
           element("span", "error-mark", "!"),
-          element("strong", "", friendlyError(error))
+          element("strong", "", timedOut ? "附件读取超时，请重试" : friendlyError(error))
         );
         dom.previewLoading.hidden = false;
       }
+    } finally {
+      window.clearTimeout(timeout);
+      if (state.previewController === controller) {
+        state.previewController = null;
+      }
+    }
+  }
+
+  async function waitForPreviewImage(image, signal) {
+    if (!image.complete) {
+      await new Promise(function (resolve, reject) {
+        let settled = false;
+        function finish(callback, value) {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          image.removeEventListener("load", onLoad);
+          image.removeEventListener("error", onError);
+          signal.removeEventListener("abort", onAbort);
+          callback(value);
+        }
+        function onLoad() {
+          finish(resolve);
+        }
+        function onError() {
+          finish(reject, new Error("图片解码失败"));
+        }
+        function onAbort() {
+          finish(reject, new DOMException("附件预览已取消", "AbortError"));
+        }
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        image.addEventListener("load", onLoad, { once: true });
+        image.addEventListener("error", onError, { once: true });
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (image.complete) {
+          if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+            onLoad();
+          } else {
+            onError();
+          }
+        }
+      });
+    }
+    if (signal.aborted) {
+      throw new DOMException("附件预览已取消", "AbortError");
+    }
+    if (typeof image.decode === "function") {
+      await new Promise(function (resolve, reject) {
+        let settled = false;
+        function finish(callback, value) {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          callback(value);
+        }
+        function onAbort() {
+          finish(reject, new DOMException("附件预览已取消", "AbortError"));
+        }
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+        image.decode().then(
+          function () { finish(resolve); },
+          function () { finish(reject, new Error("图片解码失败")); }
+        );
+      });
+    }
+    if (!image.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) {
+      throw new Error("图片解码失败");
     }
   }
 

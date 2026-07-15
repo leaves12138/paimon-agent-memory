@@ -56,7 +56,7 @@ public final class PaimonChatRepository implements ChatRepository {
             "morax.btree-index.enabled";
     private static final String MORAX_BTREE_INDEX_COLUMN_OPTION =
             "global-index.btree.index-column";
-    private static final String MORAX_BTREE_INDEX_COLUMN = "session_id";
+    private static final String MORAX_BTREE_INDEX_COLUMN = "session_id,message_id";
     private static final String SUBAGENT_SOURCE_JSON_COLUMN = "subagent_source_json";
     private static final String PROJECTLESS_COLUMN = "projectless";
 
@@ -471,7 +471,7 @@ public final class PaimonChatRepository implements ChatRepository {
                 || !MORAX_BTREE_INDEX_COLUMN.equals(
                         messagesTable.options().get(MORAX_BTREE_INDEX_COLUMN_OPTION))) {
             throw new IllegalStateException(
-                    "ai_chat_messages must enable the Morax BTree index for session_id");
+                    "ai_chat_messages must enable the Morax BTree index for session_id,message_id");
         }
     }
 

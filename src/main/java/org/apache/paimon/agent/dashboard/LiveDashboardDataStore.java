@@ -387,9 +387,20 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 message.eventType(),
                 contentPreview,
                 message.contentJson().length(),
+                storedAttachmentCount(message),
                 message.createdAt(),
                 message.ingestedAt(),
                 DashboardStorageStatus.PENDING);
+    }
+
+    private static int storedAttachmentCount(ChatMessage message) {
+        int count = 0;
+        for (AttachmentPayload attachment : message.attachments()) {
+            if (!attachment.isMissing()) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private static boolean matches(ChatSession session, SessionQuery query) {

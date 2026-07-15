@@ -435,6 +435,7 @@ public final class DashboardServer implements AutoCloseable {
         value.put("eventType", message.getEventType());
         value.put("contentPreview", message.getContentPreview());
         value.put("contentLength", message.getContentLength());
+        value.put("attachmentCount", message.getAttachmentCount());
         value.put("createdAt", instant(message.getCreatedAt()));
         value.put("ingestedAt", instant(message.getIngestedAt()));
         value.put("storageStatus", message.getStorageStatus().apiValue());

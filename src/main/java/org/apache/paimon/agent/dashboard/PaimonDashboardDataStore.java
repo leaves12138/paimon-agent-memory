@@ -18,10 +18,13 @@ import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.table.source.TableScan;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.RangeHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -76,8 +79,9 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
     // Deliberately excludes column 7 (attachments / ARRAY<BLOB>).
     private static final int[] MESSAGE_LIST_COLUMNS = new int[] {0, 1, 2, 3, 4, 5, 6, 8, 9};
     private static final int[] MESSAGE_OVERVIEW_COLUMNS = new int[] {0, 1, 9};
-    private static final int[] MESSAGE_DETAIL_COLUMNS =
-            new int[] {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    // Message details come from content_json and its attachment manifest. ARRAY<BLOB> is fetched
+    // only by attachment(), after the user explicitly opens one concrete attachment.
+    private static final int[] MESSAGE_DETAIL_COLUMNS = new int[] {0, 1, 2, 3, 4, 5, 6, 8, 9};
     private static final int[] MESSAGE_ATTACHMENT_COLUMNS = new int[] {0, 1, 2, 3, 6, 7};
 
     private final Table sessionsTable;
@@ -467,36 +471,17 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
         String contentJson = requiredString(row, 6, "content_json");
         Map<Integer, AttachmentMetadata> metadata = attachmentMetadata(contentJson);
         List<DashboardAttachment> attachments = new ArrayList<>();
-        if (!row.isNullAt(7)) {
-            InternalArray values = row.getArray(7);
-            for (int index = 0; index < values.size(); index++) {
-                AttachmentMetadata item = metadata.get(index);
-                boolean present = !values.isNullAt(index);
-                long size = present ? descriptorLength(values.getBlob(index)) : metadataSize(item);
-                attachments.add(
-                        new DashboardAttachment(
-                                index,
-                                present,
-                                size,
-                                item == null ? null : item.mimeType,
-                                item == null ? null : item.fileName,
-                                item == null ? (present ? "stored" : "missing") : item.status,
-                                item == null ? null : item.sha256));
-            }
-        }
         for (Map.Entry<Integer, AttachmentMetadata> entry : metadata.entrySet()) {
-            if (entry.getKey() >= attachments.size()) {
-                AttachmentMetadata item = entry.getValue();
-                attachments.add(
-                        new DashboardAttachment(
-                                entry.getKey(),
-                                false,
-                                metadataSize(item),
-                                item.mimeType,
-                                item.fileName,
-                                item.status,
-                                item.sha256));
-            }
+            AttachmentMetadata item = entry.getValue();
+            attachments.add(
+                    new DashboardAttachment(
+                            entry.getKey(),
+                            isStored(item),
+                            metadataSize(item),
+                            item.mimeType,
+                            item.fileName,
+                            item.status,
+                            item.sha256));
         }
         attachments.sort(Comparator.comparingInt(DashboardAttachment::getIndex));
         return new DashboardMessageDetail(
@@ -508,8 +493,8 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                 nullableString(row, 5),
                 contentJson,
                 attachments,
-                nullableTimestamp(row, 8),
-                nullableTimestamp(row, 9));
+                nullableTimestamp(row, 7),
+                nullableTimestamp(row, 8));
     }
 
     private Map<Integer, AttachmentMetadata> attachmentMetadata(String contentJson) {
@@ -633,14 +618,28 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
             return messagePredicate(values, includeSequence, sequenceNo, messageId);
         }
 
-        // Only session_id has a global index. In FULL search mode, including any unindexed field
-        // in this compound predicate makes GlobalIndexCoverage add that field's uncovered ranges,
-        // which broadens the indexed result back toward a full-table scan. Plan with session_id
-        // alone, then execute the complete predicate in the reader and retain the callers' existing
-        // values.matches / key.matches checks for source isolation and exactness.
-        PredicateBuilder builder = new PredicateBuilder(messagesTable.rowType());
-        return builder.equal(
-                builder.indexOf("session_id"), BinaryString.fromString(values.sessionId));
+        // Plan with indexed fields only. Lists use session_id, while exact detail and attachment
+        // reads also use message_id so the independent B-tree indexes can narrow the row ranges
+        // before ARRAY<BLOB> is projected. Keep source_type and sequence_no in the reader predicate
+        // and key.matches checks for source isolation and exactness without broadening FULL-mode
+        // index coverage with unindexed fields.
+        return indexedMessagePlanningPredicate(
+                messagesTable.rowType(), values.sessionId, messageId);
+    }
+
+    static Predicate indexedMessagePlanningPredicate(
+            RowType rowType, String sessionId, String messageId) {
+        PredicateBuilder builder = new PredicateBuilder(rowType);
+        Predicate sessionPredicate =
+                builder.equal(
+                        builder.indexOf("session_id"), BinaryString.fromString(sessionId));
+        if (messageId == null) {
+            return sessionPredicate;
+        }
+        return PredicateBuilder.and(
+                sessionPredicate,
+                builder.equal(
+                        builder.indexOf("message_id"), BinaryString.fromString(messageId)));
     }
 
     private static void addStringPredicate(
@@ -979,7 +978,7 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                         : DashboardStorageStatus.PENDING);
     }
 
-    private static DashboardMessage message(InternalRow row, boolean conversationOnly) {
+    private DashboardMessage message(InternalRow row, boolean conversationOnly) {
         String contentJson = requiredString(row, 6, "content_json");
         String role = nullableString(row, 4);
         String eventType = nullableString(row, 5);
@@ -998,8 +997,71 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                 eventType,
                 contentPreview,
                 contentJson.length(),
+                storedAttachmentCount(contentJson),
                 nullableTimestamp(row, 7),
                 nullableTimestamp(row, 8));
+    }
+
+    private int storedAttachmentCount(String contentJson) {
+        if (contentJson == null || contentJson.isEmpty()) {
+            return 0;
+        }
+        try (JsonParser parser = objectMapper.getFactory().createParser(contentJson)) {
+            if (parser.nextToken() != JsonToken.START_OBJECT) {
+                return 0;
+            }
+            JsonToken token;
+            while ((token = parser.nextToken()) != null && token != JsonToken.END_OBJECT) {
+                if (token != JsonToken.FIELD_NAME) {
+                    parser.skipChildren();
+                    continue;
+                }
+                String field = parser.currentName();
+                JsonToken value = parser.nextToken();
+                if (!"_paimon_attachments".equals(field)) {
+                    parser.skipChildren();
+                    continue;
+                }
+                if (value != JsonToken.START_ARRAY) {
+                    return 0;
+                }
+                int count = 0;
+                while ((token = parser.nextToken()) != null && token != JsonToken.END_ARRAY) {
+                    if (token == JsonToken.START_OBJECT && isStoredAttachmentEntry(parser)) {
+                        count++;
+                    } else {
+                        parser.skipChildren();
+                    }
+                }
+                return count;
+            }
+        } catch (IOException | RuntimeException ignored) {
+            return 0;
+        }
+        return 0;
+    }
+
+    private static boolean isStoredAttachmentEntry(JsonParser parser) throws IOException {
+        boolean stored = false;
+        JsonToken token;
+        while ((token = parser.nextToken()) != null && token != JsonToken.END_OBJECT) {
+            if (token != JsonToken.FIELD_NAME) {
+                parser.skipChildren();
+                continue;
+            }
+            String field = parser.currentName();
+            JsonToken value = parser.nextToken();
+            if ("status".equals(field) && value == JsonToken.VALUE_STRING) {
+                stored = "stored".equalsIgnoreCase(parser.getValueAsString());
+            } else {
+                parser.skipChildren();
+            }
+        }
+        return stored;
+    }
+
+    private static boolean isStored(AttachmentMetadata metadata) {
+        return metadata != null && "stored".equalsIgnoreCase(metadata.status);
     }
 
     private static boolean matchesSessionExact(

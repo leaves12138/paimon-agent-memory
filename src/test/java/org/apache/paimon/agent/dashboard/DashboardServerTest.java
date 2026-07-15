@@ -81,7 +81,10 @@ class DashboardServerTest {
         assertThat(css.statusCode()).isEqualTo(200);
         assertThat(css.headers().firstValue("Content-Type"))
                 .contains("text/css; charset=utf-8");
-        assertThat(new String(css.body(), StandardCharsets.UTF_8)).contains(":root");
+        assertThat(new String(css.body(), StandardCharsets.UTF_8))
+                .contains(":root")
+                .contains(".message-markdown-table")
+                .contains(".message-markdown-table-wrap");
 
         HttpResponse<byte[]> javascript = request("GET", "dashboard.js");
         assertThat(javascript.statusCode()).isEqualTo(200);
@@ -111,6 +114,14 @@ class DashboardServerTest {
                 .contains("加载失败，重试更早消息")
                 .contains("refresh=true")
                 .contains("params.set(\"conversationOnly\", \"true\")")
+                .contains("markdownTableAt")
+                .contains("parseMarkdownTableDelimiter")
+                .contains("hasClosingBacktickRun")
+                .contains("safeNumber(item.attachmentCount, 0) > 0")
+                .contains("MESSAGE_DETAIL_TIMEOUT_MS = 15000")
+                .contains("ATTACHMENT_PREVIEW_TIMEOUT_MS = 30000")
+                .contains("await waitForPreviewImage(dom.previewImage, controller.signal)")
+                .contains("image.naturalWidth <= 0 || image.naturalHeight <= 0")
                 .doesNotContain(
                         "foundVisibleMessage",
                         "MAX_AUTO_HIDDEN_TOOL_PAGES",
@@ -190,6 +201,7 @@ class DashboardServerTest {
         assertThat(message.path("messageId").asText()).isEqualTo("message-1");
         assertThat(message.path("sequenceNo").asLong()).isEqualTo(7L);
         assertThat(message.path("contentPreview").asText()).isEqualTo("hello preview");
+        assertThat(message.path("attachmentCount").asInt()).isEqualTo(1);
         assertThat(message.path("storageStatus").asText()).isEqualTo("uploaded");
         assertThat(dataStore.lastMessageQuery.getSourceType()).isEqualTo("codex");
         assertThat(dataStore.lastMessageQuery.getSessionId()).isEqualTo("session-1");
@@ -560,6 +572,7 @@ class DashboardServerTest {
                             "message",
                             "hello preview",
                             16L,
+                            1,
                             CREATED_AT,
                             INGESTED_AT);
             return new DashboardPage<>(

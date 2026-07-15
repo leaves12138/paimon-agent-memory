@@ -2,7 +2,7 @@ package org.apache.paimon.agent.dashboard;
 
 import java.time.Instant;
 
-/** Message list item. It deliberately contains no attachment/BLOB field. */
+/** Message list item. It contains only an attachment count, never attachment/BLOB payloads. */
 public class DashboardMessage {
 
     private final String messageId;
@@ -13,6 +13,7 @@ public class DashboardMessage {
     private final String eventType;
     private final String contentPreview;
     private final long contentLength;
+    private final int attachmentCount;
     private final Instant createdAt;
     private final Instant ingestedAt;
     private final DashboardStorageStatus storageStatus;
@@ -37,6 +38,34 @@ public class DashboardMessage {
                 eventType,
                 contentPreview,
                 contentLength,
+                0,
+                createdAt,
+                ingestedAt,
+                DashboardStorageStatus.UPLOADED);
+    }
+
+    public DashboardMessage(
+            String messageId,
+            String sourceType,
+            String sessionId,
+            long sequenceNo,
+            String role,
+            String eventType,
+            String contentPreview,
+            long contentLength,
+            int attachmentCount,
+            Instant createdAt,
+            Instant ingestedAt) {
+        this(
+                messageId,
+                sourceType,
+                sessionId,
+                sequenceNo,
+                role,
+                eventType,
+                contentPreview,
+                contentLength,
+                attachmentCount,
                 createdAt,
                 ingestedAt,
                 DashboardStorageStatus.UPLOADED);
@@ -54,6 +83,37 @@ public class DashboardMessage {
             Instant createdAt,
             Instant ingestedAt,
             DashboardStorageStatus storageStatus) {
+        this(
+                messageId,
+                sourceType,
+                sessionId,
+                sequenceNo,
+                role,
+                eventType,
+                contentPreview,
+                contentLength,
+                0,
+                createdAt,
+                ingestedAt,
+                storageStatus);
+    }
+
+    public DashboardMessage(
+            String messageId,
+            String sourceType,
+            String sessionId,
+            long sequenceNo,
+            String role,
+            String eventType,
+            String contentPreview,
+            long contentLength,
+            int attachmentCount,
+            Instant createdAt,
+            Instant ingestedAt,
+            DashboardStorageStatus storageStatus) {
+        if (attachmentCount < 0) {
+            throw new IllegalArgumentException("attachmentCount must not be negative");
+        }
         this.messageId = messageId;
         this.sourceType = sourceType;
         this.sessionId = sessionId;
@@ -62,6 +122,7 @@ public class DashboardMessage {
         this.eventType = eventType;
         this.contentPreview = contentPreview;
         this.contentLength = contentLength;
+        this.attachmentCount = attachmentCount;
         this.createdAt = createdAt;
         this.ingestedAt = ingestedAt;
         this.storageStatus = storageStatus;
@@ -97,6 +158,10 @@ public class DashboardMessage {
 
     public long getContentLength() {
         return contentLength;
+    }
+
+    public int getAttachmentCount() {
+        return attachmentCount;
     }
 
     public Instant getCreatedAt() {

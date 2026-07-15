@@ -11,9 +11,14 @@ import org.apache.paimon.agent.model.SessionKey;
 import org.apache.paimon.agent.sink.PaimonChatRepository;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.PredicateVisitor;
 import org.apache.paimon.stats.SimpleStats;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.Split;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -43,6 +48,30 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PaimonDashboardDataStoreTest {
 
     @TempDir Path tempDir;
+
+    @Test
+    void plansMessageListsAndExactKeysWithOnlyTheirIndexedFields() {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {
+                            DataTypes.STRING(),
+                            DataTypes.STRING(),
+                            DataTypes.STRING(),
+                            DataTypes.BIGINT()
+                        },
+                        new String[] {"message_id", "source_type", "session_id", "sequence_no"});
+
+        Predicate list =
+                PaimonDashboardDataStore.indexedMessagePlanningPredicate(
+                        rowType, "session-1", null);
+        Predicate exact =
+                PaimonDashboardDataStore.indexedMessagePlanningPredicate(
+                        rowType, "session-1", "message-1");
+
+        assertThat(PredicateVisitor.collectFieldIds(rowType, list)).containsExactly(2);
+        assertThat(PredicateVisitor.collectFieldIds(rowType, exact))
+                .containsExactlyInAnyOrder(0, 2);
+    }
 
     @Test
     void readsBoundedPagesDetailsAndAttachmentsWithoutBlobReadsInLists() throws Exception {
@@ -142,6 +171,21 @@ class PaimonDashboardDataStoreTest {
                 assertThat(messages.getItems().get(0).getContentPreview()).contains("needle");
                 assertThat(messages.getItems().get(0).getContentPreview().length())
                         .isGreaterThan(240);
+                assertThat(messages.getItems().get(0).getAttachmentCount()).isEqualTo(1);
+                assertThat(
+                                store.listMessages(
+                                                new MessageQuery(
+                                                        "codex",
+                                                        "codex-session",
+                                                        "assistant",
+                                                        "message",
+                                                        null,
+                                                        1,
+                                                        10))
+                                        .getItems()
+                                        .get(0)
+                                        .getAttachmentCount())
+                        .isZero();
 
                 DashboardMessageDetail detail =
                         store.messageDetail("codex", "codex-session", "message-image", 10L)
@@ -208,6 +252,11 @@ class PaimonDashboardDataStoreTest {
                                                         null, null, null, null, null, 1, 10))
                                         .getTotal())
                         .isEqualTo(2L);
+                DashboardMessageDetail offlineDetail =
+                        store.messageDetail("codex", "codex-session", "message-image", 10L)
+                                .orElseThrow(AssertionError::new);
+                assertThat(offlineDetail.getAttachments()).hasSize(1);
+                assertThat(offlineDetail.getAttachments().get(0).getStatus()).isEqualTo("stored");
             }
 
             try (PaimonDashboardDataStore bounded =

@@ -432,7 +432,7 @@ class PaimonChatRepositoryTest {
     private static void assertMoraxBtreeOptions(Map<String, String> options) {
         assertThat(options)
                 .containsEntry(MORAX_BTREE_INDEX_ENABLED_OPTION, "true")
-                .containsEntry(MORAX_BTREE_INDEX_COLUMN_OPTION, "session_id");
+                .containsEntry(MORAX_BTREE_INDEX_COLUMN_OPTION, "session_id,message_id");
     }
 
     private static void assertMoraxBtreeOptionsAbsent(Map<String, String> options) {
