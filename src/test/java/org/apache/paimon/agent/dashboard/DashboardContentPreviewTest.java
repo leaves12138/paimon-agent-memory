@@ -100,6 +100,38 @@ class DashboardContentPreviewTest {
     }
 
     @Test
+    void conversationPreviewDropsPureClaudeToolsAndKeepsOnlyTextFromMixedRows() {
+        String toolUse =
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\","
+                        + "\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\","
+                        + "\"input\":{\"command\":\"pwd\"}}]}}";
+        String toolResult =
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\","
+                        + "\"content\":[{\"type\":\"tool_result\","
+                        + "\"content\":\"command finished\"}]}}";
+        String mixed =
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\","
+                        + "\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\","
+                        + "\"input\":{\"command\":\"pwd\"}},"
+                        + "{\"type\":\"text\",\"text\":\"检查完成\"}]}}";
+
+        assertThat(
+                        DashboardContentPreview.conversationPreviewMessage(
+                                toolUse, "assistant", "assistant"))
+                .isEmpty();
+        assertThat(
+                        DashboardContentPreview.conversationPreviewMessage(
+                                toolResult, "user", "user"))
+                .isEmpty();
+        assertThat(
+                        DashboardContentPreview.conversationPreviewMessage(
+                                mixed, "assistant", "assistant"))
+                .isEqualTo("检查完成");
+        assertThat(DashboardContentPreview.preview(mixed))
+                .isEqualTo("调用工具 Bash: command=pwd · 检查完成");
+    }
+
+    @Test
     void summarizesGeneratedImagesAttachmentsDocumentsAndToolResults() {
         String generated =
                 "{\"type\":\"event_msg\",\"payload\":{"

@@ -35,7 +35,7 @@ final class DashboardContentPreview {
         }
 
         try (JsonParser parser = JSON_FACTORY.createParser(contentJson)) {
-            ParsedPreview parsed = parse(contentJson, parser, maxChars);
+            ParsedPreview parsed = parse(contentJson, parser, maxChars, false);
             String value = parsed.render();
             return isBlank(value)
                     ? compactRaw(contentJson, maxChars)
@@ -48,6 +48,22 @@ final class DashboardContentPreview {
 
     static String previewMessage(String contentJson, String role, String eventType) {
         return preview(contentJson, messageLimit(role, eventType));
+    }
+
+    static String conversationPreviewMessage(
+            String contentJson, String role, String eventType) {
+        int maxChars = messageLimit(role, eventType);
+        if (contentJson == null || contentJson.isEmpty()) {
+            return "";
+        }
+        try (JsonParser parser = JSON_FACTORY.createParser(contentJson)) {
+            String value = parse(contentJson, parser, maxChars, true).renderConversation();
+            return isBlank(value) ? "" : normalizeAndTruncate(value, maxChars);
+        } catch (IOException | RuntimeException ignored) {
+            // Unknown or partially written message shapes are preserved instead of silently
+            // disappearing from the conversation. Known tool blocks are filtered structurally.
+            return compactRaw(contentJson, maxChars);
+        }
     }
 
     static int messageLimit(String role, String eventType) {
@@ -66,7 +82,8 @@ final class DashboardContentPreview {
         return DEFAULT_MAX_LENGTH;
     }
 
-    private static ParsedPreview parse(String source, JsonParser parser, int maxChars)
+    private static ParsedPreview parse(
+            String source, JsonParser parser, int maxChars, boolean conversationOnly)
             throws IOException {
         ParsedPreview result = new ParsedPreview(maxChars);
         Context context = null;
@@ -98,15 +115,17 @@ final class DashboardContentPreview {
             }
             if (token == JsonToken.END_OBJECT || token == JsonToken.END_ARRAY) {
                 if (block != null && context == block.context) {
-                    result.add(block.render(), block.describesAttachment());
+                    result.add(
+                            block.render(), block.describesAttachment(), block.isTool());
                     block = null;
                 }
                 if (payload != null && context == payload.context) {
-                    result.add(payload.render(), payload.describesAttachment());
+                    result.add(
+                            payload.render(), payload.describesAttachment(), payload.isTool());
                     payload = null;
                 }
                 context = context == null ? null : context.parent;
-                if (result.isFull()) {
+                if (result.isFull(conversationOnly)) {
                     break;
                 }
                 continue;
@@ -135,7 +154,7 @@ final class DashboardContentPreview {
                         || "content".equals(field)
                         || "output".equals(field)) {
                     Snippet text = stringValue(source, parser, maxChars);
-                    result.add(text.display(), false);
+                    result.add(text.display(), false, false);
                     if (text.truncated) {
                         break;
                     }
@@ -146,9 +165,12 @@ final class DashboardContentPreview {
             if (payload != null && context == payload.context) {
                 Snippet snippet = payload.accept(field, source, parser);
                 if (snippet != null && payload.shouldStop(snippet) && payload.canRender()) {
-                    result.add(payload.render(), payload.describesAttachment());
+                    boolean tool = payload.isTool();
+                    result.add(payload.render(), payload.describesAttachment(), tool);
                     payload = null;
-                    break;
+                    if (!conversationOnly || !tool) {
+                        break;
+                    }
                 }
                 continue;
             }
@@ -156,9 +178,12 @@ final class DashboardContentPreview {
             if (block != null && isDescendant(context, block.context)) {
                 Snippet snippet = block.accept(context, field, source, parser);
                 if (snippet != null && block.shouldStop(snippet) && block.canRender()) {
-                    result.add(block.render(), block.describesAttachment());
+                    boolean tool = block.isTool();
+                    result.add(block.render(), block.describesAttachment(), tool);
                     block = null;
-                    break;
+                    if (!conversationOnly || !tool) {
+                        break;
+                    }
                 }
                 continue;
             }
@@ -167,22 +192,25 @@ final class DashboardContentPreview {
                 String detailField = structuredField(context);
                 Snippet snippet = payload.acceptStructured(detailField, source, parser);
                 if (snippet != null && payload.shouldStop(snippet) && payload.canRender()) {
-                    result.add(payload.render(), payload.describesAttachment());
+                    boolean tool = payload.isTool();
+                    result.add(payload.render(), payload.describesAttachment(), tool);
                     payload = null;
-                    break;
+                    if (!conversationOnly || !tool) {
+                        break;
+                    }
                 }
                 continue;
             }
 
             if (isMessage(context) && "content".equals(field)) {
                 Snippet text = stringValue(source, parser, maxChars);
-                result.add(text.display(), false);
+                result.add(text.display(), false, false);
                 if (text.truncated) {
                     break;
                 }
             } else if (isDirectContentArray(context)) {
                 Snippet text = stringValue(source, parser, maxChars);
-                result.add(text.display(), false);
+                result.add(text.display(), false, false);
                 if (text.truncated) {
                     break;
                 }
@@ -495,6 +523,11 @@ final class DashboardContentPreview {
             return !isBlank(type);
         }
 
+        private boolean isTool() {
+            return type != null
+                    && (type.endsWith("_call") || type.endsWith("_call_output"));
+        }
+
         private String render() {
             if ("image_generation_end".equals(type)) {
                 return "生成图片";
@@ -582,6 +615,10 @@ final class DashboardContentPreview {
                     || (type != null && type.endsWith("_call_output"));
         }
 
+        private boolean isTool() {
+            return isToolCall() || isToolOutput();
+        }
+
         private boolean shouldStop(Snippet value) {
             return value.truncated || text.isFull() || nestedOutput.isFull() || detail.isFull();
         }
@@ -625,31 +662,51 @@ final class DashboardContentPreview {
 
     private static final class ParsedPreview {
         private final BoundedParts parts;
+        private final BoundedParts conversationParts;
         private String rootType;
         private boolean hasAttachments;
         private boolean attachmentDescribed;
+        private boolean conversationAttachmentDescribed;
 
         private ParsedPreview(int maxChars) {
             this.parts = new BoundedParts(maxChars);
+            this.conversationParts = new BoundedParts(maxChars);
         }
 
-        private void add(String value, boolean describesAttachment) {
+        private void add(String value, boolean describesAttachment, boolean tool) {
             parts.add(value);
             attachmentDescribed |= describesAttachment;
+            if (!tool) {
+                conversationParts.add(value);
+                conversationAttachmentDescribed |= describesAttachment;
+            }
         }
 
-        private boolean isFull() {
-            return parts.isFull();
+        private boolean isFull(boolean conversationOnly) {
+            return conversationOnly ? conversationParts.isFull() : parts.isFull();
         }
 
         private String render() {
             if ("attachment".equals(rootType) && parts.isEmpty()) {
-                add("附件", true);
+                add("附件", true, false);
             }
             if (hasAttachments && !attachmentDescribed) {
-                add("附件", true);
+                add("附件", true, false);
             }
             return parts.join();
+        }
+
+        private String renderConversation() {
+            if ("attachment".equals(rootType) && conversationParts.isEmpty()) {
+                conversationParts.add("附件");
+                conversationAttachmentDescribed = true;
+            }
+            if (hasAttachments
+                    && !conversationAttachmentDescribed
+                    && !conversationParts.isEmpty()) {
+                conversationParts.add("附件");
+            }
+            return conversationParts.join();
         }
     }
 

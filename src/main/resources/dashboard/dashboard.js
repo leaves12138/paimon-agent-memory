@@ -2,9 +2,6 @@
   "use strict";
 
   const API_ROOT = "/api";
-  // Keep the convenience scan for a conversational row bounded. A long run of tool-only
-  // events must not turn one click into an unbounded sequence of full-session page requests.
-  const MAX_AUTO_HIDDEN_TOOL_PAGES = 3;
   const ALLOWED_IMAGE_TYPES = new Set([
     "image/png",
     "image/jpeg",
@@ -695,7 +692,6 @@
     const request = ++conversation.request;
     const selectedKey = state.selection.key;
     const requestedPage = reset ? 1 : conversation.page + 1;
-    const visibleCountBefore = reset ? 0 : visibleConversationItems().length;
     const anchor = !reset ? captureScrollAnchor() : null;
     conversation.controller = controller;
     conversation.sessionKey = selectedKey;
@@ -712,58 +708,37 @@
     renderConversation();
 
     try {
-      let pageToFetch = requestedPage;
-      let firstPage = true;
-      let pagesFetched = 0;
-      do {
-        const params = new URLSearchParams();
-        params.set("page", String(pageToFetch));
-        if (state.pagination.configured) {
-          params.set("pageSize", String(conversation.pageSize));
-        }
-        params.set("sourceType", displayValue(session.sourceType, ""));
-        params.set("sessionId", displayValue(session.sessionId, ""));
-        if (opts.refresh && firstPage) {
-          params.set("refresh", "true");
-        }
+      const params = new URLSearchParams();
+      params.set("page", String(requestedPage));
+      if (state.pagination.configured) {
+        params.set("pageSize", String(conversation.pageSize));
+      }
+      params.set("sourceType", displayValue(session.sourceType, ""));
+      params.set("sessionId", displayValue(session.sessionId, ""));
+      if (!conversation.showTools) {
+        params.set("conversationOnly", "true");
+      }
+      if (opts.refresh) {
+        params.set("refresh", "true");
+      }
 
-        const payload = await fetchJson(API_ROOT + "/messages?" + params.toString(), controller.signal);
-        pagesFetched += 1;
-        if (request !== conversation.request || selectedKey !== state.selection.key) {
-          return false;
-        }
-        const pageItems = Array.isArray(payload.items) ? payload.items.slice().reverse() : [];
-        const merged = reset && firstPage
-          ? pageItems
-          : pageItems.concat(conversation.items);
-        conversation.items = uniqueMessages(merged).sort(compareMessages);
-        conversation.page = Math.max(1, positiveWholeNumber(payload.page, pageToFetch));
-        conversation.pageSize = positiveWholeNumber(payload.pageSize, conversation.pageSize);
-        conversation.total = Math.max(
-          conversation.total,
-          safeNumber(payload.total, conversation.items.length),
-          conversation.items.length
-        );
-        conversation.hasMore = typeof payload.hasMore === "boolean"
-          ? payload.hasMore
-          : conversation.page * conversation.pageSize < conversation.total;
-        conversation.truncated = conversation.truncated || payload.truncated === true;
-        firstPage = false;
-
-        const foundVisibleMessage = visibleConversationItems().length > visibleCountBefore;
-        if (conversation.showTools
-            || foundVisibleMessage
-            || !conversation.hasMore
-            || pagesFetched >= MAX_AUTO_HIDDEN_TOOL_PAGES) {
-          break;
-        }
-        const nextPage = conversation.page + 1;
-        if (nextPage <= pageToFetch) {
-          conversation.hasMore = false;
-          break;
-        }
-        pageToFetch = nextPage;
-      } while (true);
+      const payload = await fetchJson(API_ROOT + "/messages?" + params.toString(), controller.signal);
+      if (request !== conversation.request || selectedKey !== state.selection.key) {
+        return false;
+      }
+      const pageItems = Array.isArray(payload.items) ? payload.items.slice().reverse() : [];
+      const merged = reset ? pageItems : pageItems.concat(conversation.items);
+      conversation.items = uniqueMessages(merged).sort(compareMessages);
+      conversation.page = Math.max(1, positiveWholeNumber(payload.page, requestedPage));
+      conversation.pageSize = positiveWholeNumber(payload.pageSize, conversation.pageSize);
+      conversation.total = Math.max(
+        safeNumber(payload.total, conversation.items.length),
+        conversation.items.length
+      );
+      conversation.hasMore = typeof payload.hasMore === "boolean"
+        ? payload.hasMore
+        : conversation.page * conversation.pageSize < conversation.total;
+      conversation.truncated = conversation.truncated || payload.truncated === true;
 
       conversation.error = null;
       conversation.mode = conversation.items.length > 0 ? "ready" : "empty";
@@ -1656,15 +1631,10 @@
     dom.chatBack.addEventListener("click", leaveConversation);
     dom.showToolsToggle.addEventListener("change", function () {
       state.conversation.showTools = dom.showToolsToggle.checked;
-      renderMessages();
-      renderMessageStates();
+      cancelMessageDetail();
+      state.detailCache.clear();
       dom.chatLiveStatus.textContent = state.conversation.showTools ? "已显示工具调用" : "已隐藏工具调用";
-      if (!state.conversation.showTools
-          && visibleConversationItems().length === 0
-          && state.conversation.hasMore
-          && state.conversation.mode === "ready") {
-        loadMessages({ reset: false });
-      }
+      loadMessages({ reset: true });
     });
 
     dom.sessionSearch.addEventListener("input", function () {

@@ -327,11 +327,14 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                         messagePlanningPredicate(values, false, 0L, null),
                         filter,
                         row -> {
-                            DashboardMessage message = message(row);
-                            if (!values.matches(message)) {
+                            String contentJson = requiredString(row, 6, "content_json");
+                            DashboardMessage message =
+                                    message(row, values.conversationOnly);
+                            if (!values.matches(message)
+                                    || (values.conversationOnly
+                                            && message.getContentPreview().isEmpty())) {
                                 return;
                             }
-                            String contentJson = requiredString(row, 6, "content_json");
                             if (values.search == null
                                     || containsIgnoreCase(
                                             message.getMessageId(), values.search)
@@ -565,11 +568,63 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
         addStringPredicate(predicates, builder, "session_id", values.sessionId);
         addStringPredicate(predicates, builder, "role", values.role);
         addStringPredicate(predicates, builder, "event_type", values.eventType);
+        if (values.conversationOnly) {
+            predicates.add(conversationalMessagePredicate(builder));
+        }
         addStringPredicate(predicates, builder, "message_id", messageId);
         if (includeSequence) {
             predicates.add(builder.equal(builder.indexOf("sequence_no"), sequenceNo));
         }
         return predicates.isEmpty() ? null : PredicateBuilder.and(predicates);
+    }
+
+    private static Predicate conversationalMessagePredicate(PredicateBuilder builder) {
+        int role = builder.indexOf("role");
+        int eventType = builder.indexOf("event_type");
+        Predicate userOrAssistant =
+                PredicateBuilder.or(
+                        builder.equal(role, BinaryString.fromString("user")),
+                        builder.equal(role, BinaryString.fromString("assistant")));
+        Predicate standardEvent =
+                PredicateBuilder.or(
+                        builder.isNull(eventType),
+                        builder.equal(eventType, BinaryString.fromString("")),
+                        builder.equal(eventType, BinaryString.fromString("message")),
+                        builder.equal(eventType, BinaryString.fromString("user")),
+                        builder.equal(eventType, BinaryString.fromString("assistant")));
+        Predicate standardMessage = PredicateBuilder.and(userOrAssistant, standardEvent);
+        Predicate generatedImage =
+                PredicateBuilder.and(
+                        builder.equal(role, BinaryString.fromString("assistant")),
+                        builder.equal(
+                                eventType,
+                                BinaryString.fromString("image_generation_end")));
+        Predicate attachmentRole =
+                PredicateBuilder.and(
+                        builder.equal(role, BinaryString.fromString("attachment")),
+                        PredicateBuilder.or(
+                                builder.isNull(eventType),
+                                builder.equal(eventType, BinaryString.fromString("")),
+                                builder.equal(
+                                        eventType,
+                                        BinaryString.fromString("attachment"))));
+        Predicate allowedAttachmentRole =
+                PredicateBuilder.or(
+                        builder.isNull(role),
+                        PredicateBuilder.and(
+                                builder.notEqual(
+                                        role, BinaryString.fromString("system")),
+                                builder.notEqual(
+                                        role, BinaryString.fromString("developer")),
+                                builder.notEqual(
+                                        role, BinaryString.fromString("tool"))));
+        Predicate attachmentEvent =
+                PredicateBuilder.and(
+                        builder.equal(
+                                eventType, BinaryString.fromString("attachment")),
+                        allowedAttachmentRole);
+        return PredicateBuilder.or(
+                standardMessage, generatedImage, attachmentRole, attachmentEvent);
     }
 
     private Predicate messagePlanningPredicate(
@@ -923,10 +978,16 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                         : DashboardStorageStatus.PENDING);
     }
 
-    private static DashboardMessage message(InternalRow row) {
+    private static DashboardMessage message(InternalRow row, boolean conversationOnly) {
         String contentJson = requiredString(row, 6, "content_json");
         String role = nullableString(row, 4);
         String eventType = nullableString(row, 5);
+        String contentPreview =
+                conversationOnly
+                        ? DashboardContentPreview.conversationPreviewMessage(
+                                contentJson, role, eventType)
+                        : DashboardContentPreview.previewMessage(
+                                contentJson, role, eventType);
         return new DashboardMessage(
                 requiredString(row, 0, "message_id"),
                 requiredString(row, 1, "source_type"),
@@ -934,7 +995,7 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                 row.isNullAt(3) ? 0L : row.getLong(3),
                 role,
                 eventType,
-                DashboardContentPreview.previewMessage(contentJson, role, eventType),
+                contentPreview,
                 contentJson.length(),
                 nullableTimestamp(row, 7),
                 nullableTimestamp(row, 8));
@@ -1234,6 +1295,7 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
         private final String role;
         private final String eventType;
         private final String search;
+        private final boolean conversationOnly;
 
         private MessageCacheKey(MessageFilter filter) {
             this.sourceType = filter.sourceType;
@@ -1241,6 +1303,7 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
             this.role = filter.role;
             this.eventType = filter.eventType;
             this.search = filter.search;
+            this.conversationOnly = filter.conversationOnly;
         }
 
         @Override
@@ -1256,12 +1319,14 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                     && Objects.equals(sessionId, that.sessionId)
                     && Objects.equals(role, that.role)
                     && Objects.equals(eventType, that.eventType)
-                    && Objects.equals(search, that.search);
+                    && Objects.equals(search, that.search)
+                    && conversationOnly == that.conversationOnly;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(sourceType, sessionId, role, eventType, search);
+            return Objects.hash(
+                    sourceType, sessionId, role, eventType, search, conversationOnly);
         }
     }
 
@@ -1375,18 +1440,21 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
         private final String role;
         private final String eventType;
         private final String search;
+        private final boolean conversationOnly;
 
         private MessageFilter(
                 String sourceType,
                 String sessionId,
                 String role,
                 String eventType,
-                String search) {
+                String search,
+                boolean conversationOnly) {
             this.sourceType = sourceType;
             this.sessionId = sessionId;
             this.role = role;
             this.eventType = eventType;
             this.search = search;
+            this.conversationOnly = conversationOnly;
         }
 
         private static MessageFilter from(MessageQuery query) {
@@ -1395,14 +1463,18 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                     normalize(query.getSessionId()),
                     normalize(query.getRole()),
                     normalize(query.getEventType()),
-                    normalizedSearch(query.getSearch()));
+                    normalizedSearch(query.getSearch()),
+                    query.isConversationOnly());
         }
 
         private boolean matches(DashboardMessage message) {
             return (sourceType == null || sourceType.equals(message.getSourceType()))
                     && (sessionId == null || sessionId.equals(message.getSessionId()))
                     && (role == null || role.equals(message.getRole()))
-                    && (eventType == null || eventType.equals(message.getEventType()));
+                    && (eventType == null || eventType.equals(message.getEventType()))
+                    && (!conversationOnly
+                            || MessageQuery.isConversationalMessage(
+                                    message.getRole(), message.getEventType()));
         }
     }
 
@@ -1419,7 +1491,9 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
             this.sessionId = requiredKey(sessionId, "sessionId");
             this.messageId = requiredKey(messageId, "messageId");
             this.sequenceNo = sequenceNo;
-            this.filter = new MessageFilter(this.sourceType, this.sessionId, null, null, null);
+            this.filter =
+                    new MessageFilter(
+                            this.sourceType, this.sessionId, null, null, null, false);
         }
 
         private boolean matches(

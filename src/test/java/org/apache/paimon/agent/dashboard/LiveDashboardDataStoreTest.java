@@ -62,6 +62,57 @@ class LiveDashboardDataStoreTest {
                         Collections.singletonList(AttachmentPayload.of(image)),
                         NOW,
                         NOW);
+        ChatMessage pendingToolMessage =
+                new ChatMessage(
+                        "pending-tool-message",
+                        newKey,
+                        3L,
+                        "assistant",
+                        "custom_tool_call",
+                        "{\"name\":\"exec\"}",
+                        Collections.emptyList(),
+                        NOW.plusSeconds(1),
+                        NOW.plusSeconds(1));
+        ChatMessage pendingClaudeToolUse =
+                new ChatMessage(
+                        "pending-claude-tool-use",
+                        newKey,
+                        4L,
+                        "assistant",
+                        "assistant",
+                        "{\"type\":\"assistant\",\"message\":{\"content\":[{"
+                                + "\"type\":\"tool_use\",\"name\":\"Bash\","
+                                + "\"input\":{\"command\":\"pwd\"}}]}}",
+                        Collections.emptyList(),
+                        NOW.plusSeconds(2),
+                        NOW.plusSeconds(2));
+        ChatMessage pendingClaudeToolResult =
+                new ChatMessage(
+                        "pending-claude-tool-result",
+                        newKey,
+                        5L,
+                        "user",
+                        "user",
+                        "{\"type\":\"user\",\"message\":{\"content\":[{"
+                                + "\"type\":\"tool_result\","
+                                + "\"content\":\"finished\"}]}}",
+                        Collections.emptyList(),
+                        NOW.plusSeconds(3),
+                        NOW.plusSeconds(3));
+        ChatMessage pendingClaudeMixed =
+                new ChatMessage(
+                        "pending-claude-mixed",
+                        newKey,
+                        6L,
+                        "assistant",
+                        "assistant",
+                        "{\"type\":\"assistant\",\"message\":{\"content\":[{"
+                                + "\"type\":\"text\",\"text\":\"mixed answer\"},{"
+                                + "\"type\":\"tool_use\",\"name\":\"Bash\","
+                                + "\"input\":{\"command\":\"pwd\"}}]}}",
+                        Collections.emptyList(),
+                        NOW.plusSeconds(4),
+                        NOW.plusSeconds(4));
         ChatSession updatedExisting = chatSession(existingKey, "new pending title");
         ChatSession newSession = chatSession(newKey, "new session");
         PendingDataSnapshot snapshot =
@@ -71,7 +122,12 @@ class LiveDashboardDataStoreTest {
                                 new SessionBatch(updatedExisting, Collections.emptyList()),
                                 new SessionBatch(
                                         newSession,
-                                        Collections.singletonList(pendingMessage))));
+                                        Arrays.asList(
+                                                pendingMessage,
+                                                pendingToolMessage,
+                                                pendingClaudeToolUse,
+                                                pendingClaudeToolResult,
+                                                pendingClaudeMixed))));
 
         LiveDashboardDataStore store =
                 new LiveDashboardDataStore(uploaded, () -> snapshot, 20);
@@ -92,8 +148,18 @@ class LiveDashboardDataStoreTest {
 
         DashboardPage<DashboardMessage> messages =
                 store.listMessages(
-                        new MessageQuery(null, null, null, null, null, 1, 20));
-        assertThat(messages.getTotal()).isEqualTo(2L);
+                        new MessageQuery(
+                                null, null, null, null, null, true, 1, 20));
+        assertThat(messages.getTotal()).isEqualTo(3L);
+        assertThat(messages.getItems())
+                .extracting(DashboardMessage::getMessageId)
+                .containsExactlyInAnyOrder(
+                        "uploaded-message", "pending-message", "pending-claude-mixed")
+                .doesNotContain(
+                        "pending-tool-message",
+                        "pending-claude-tool-use",
+                        "pending-claude-tool-result");
+        assertThat(uploaded.lastMessageQuery.isConversationOnly()).isTrue();
         DashboardMessage pendingRow =
                 messages.getItems().stream()
                         .filter(item -> item.getMessageId().equals("pending-message"))
@@ -102,6 +168,12 @@ class LiveDashboardDataStoreTest {
         assertThat(pendingRow.getStorageStatus()).isEqualTo(DashboardStorageStatus.PENDING);
         assertThat(pendingRow.getContentPreview()).contains("pending needle");
         assertThat(pendingRow.getContentPreview().length()).isGreaterThan(240);
+        assertThat(messages.getItems())
+                .filteredOn(
+                        message ->
+                                "pending-claude-mixed".equals(message.getMessageId()))
+                .extracting(DashboardMessage::getContentPreview)
+                .containsExactly("mixed answer");
 
         DashboardMessageDetail detail =
                 store.messageDetail("claude", "session-new", "pending-message", 2L)
@@ -391,6 +463,7 @@ class LiveDashboardDataStoreTest {
     private static final class FakeUploadedStore implements DashboardDataStore {
         private final DashboardSession session;
         private final DashboardMessage message;
+        private MessageQuery lastMessageQuery;
         private boolean closed;
 
         private FakeUploadedStore(DashboardSession session, DashboardMessage message) {
@@ -414,6 +487,7 @@ class LiveDashboardDataStoreTest {
 
         @Override
         public DashboardPage<DashboardMessage> listMessages(MessageQuery query) {
+            lastMessageQuery = query;
             return new DashboardPage<>(
                     Collections.singletonList(message), 1, query.getPageSize(), 1L);
         }

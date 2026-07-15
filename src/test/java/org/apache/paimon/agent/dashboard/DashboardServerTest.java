@@ -90,9 +90,13 @@ class DashboardServerTest {
                 .contains("selectSession")
                 .contains("loadOlderMessages")
                 .contains("refresh=true")
-                .contains("foundVisibleMessage")
-                .contains("MAX_AUTO_HIDDEN_TOOL_PAGES = 3")
-                .doesNotContain("Authorization", "dashboard-url", "capabilityToken");
+                .contains("params.set(\"conversationOnly\", \"true\")")
+                .doesNotContain(
+                        "foundVisibleMessage",
+                        "MAX_AUTO_HIDDEN_TOOL_PAGES",
+                        "Authorization",
+                        "dashboard-url",
+                        "capabilityToken");
 
         HttpResponse<byte[]> overview = request("GET", "api/overview");
         assertThat(overview.statusCode()).isEqualTo(200);
@@ -157,7 +161,8 @@ class DashboardServerTest {
                 request(
                         "GET",
                         "api/messages?page=1&pageSize=4&sourceType=codex&sessionId=session-1"
-                                + "&role=user&eventType=message&query=hello&refresh=true");
+                                + "&role=user&eventType=message&query=hello"
+                                + "&conversationOnly=true&refresh=true");
         assertThat(messages.statusCode()).isEqualTo(200);
         JsonNode messagesBody = json(messages);
         JsonNode message = messagesBody.path("items").get(0);
@@ -170,6 +175,7 @@ class DashboardServerTest {
         assertThat(dataStore.lastMessageQuery.getRole()).isEqualTo("user");
         assertThat(dataStore.lastMessageQuery.getEventType()).isEqualTo("message");
         assertThat(dataStore.lastMessageQuery.getSearch()).isEqualTo("hello");
+        assertThat(dataStore.lastMessageQuery.isConversationOnly()).isTrue();
         assertThat(dataStore.invalidations).isEqualTo(2);
 
         String key =
@@ -227,6 +233,10 @@ class DashboardServerTest {
                 request("GET", "api/messages?refresh=now"),
                 400,
                 "refresh must be true or false");
+        assertError(
+                request("GET", "api/messages?conversationOnly=maybe"),
+                400,
+                "conversationOnly must be true or false");
 
         HttpResponse<byte[]> post = request("POST", "api/overview");
         assertError(post, 405, "Only GET and HEAD are supported");

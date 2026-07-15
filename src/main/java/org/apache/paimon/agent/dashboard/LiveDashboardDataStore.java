@@ -150,6 +150,7 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                                 query.getRole(),
                                 query.getEventType(),
                                 query.getSearch(),
+                                query.isConversationOnly(),
                                 1,
                                 maxRows));
         Map<String, DashboardMessage> rows = new LinkedHashMap<>();
@@ -158,8 +159,18 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
         }
         for (SessionBatch batch : pending.batches()) {
             for (ChatMessage message : batch.messages()) {
-                if (matches(message, query)) {
-                    DashboardMessage row = pendingMessage(message);
+                String preview =
+                        query.isConversationOnly()
+                                ? DashboardContentPreview.conversationPreviewMessage(
+                                        message.contentJson(),
+                                        message.role(),
+                                        message.eventType())
+                                : DashboardContentPreview.previewMessage(
+                                        message.contentJson(),
+                                        message.role(),
+                                        message.eventType());
+                if (matches(message, query, preview)) {
+                    DashboardMessage row = pendingMessage(message, preview);
                     rows.put(messageKey(row), row);
                 }
             }
@@ -365,7 +376,7 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 DashboardStorageStatus.PENDING);
     }
 
-    private static DashboardMessage pendingMessage(ChatMessage message) {
+    private static DashboardMessage pendingMessage(ChatMessage message, String contentPreview) {
         return new DashboardMessage(
                 message.messageId(),
                 message.sessionKey().sourceType(),
@@ -373,8 +384,7 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 message.sequenceNumber(),
                 message.role(),
                 message.eventType(),
-                DashboardContentPreview.previewMessage(
-                        message.contentJson(), message.role(), message.eventType()),
+                contentPreview,
                 message.contentJson().length(),
                 message.createdAt(),
                 message.ingestedAt(),
@@ -396,11 +406,18 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 || contains(session.cwd(), search);
     }
 
-    private static boolean matches(ChatMessage message, MessageQuery query) {
+    private static boolean matches(
+            ChatMessage message, MessageQuery query, String contentPreview) {
         if (!matches(normalize(query.getSourceType()), message.sessionKey().sourceType())
                 || !matches(normalize(query.getSessionId()), message.sessionKey().sessionId())
                 || !matches(normalize(query.getRole()), message.role())
-                || !matches(normalize(query.getEventType()), message.eventType())) {
+                || !matches(normalize(query.getEventType()), message.eventType())
+                || (query.isConversationOnly()
+                        && !MessageQuery.isConversationalMessage(
+                                message.role(), message.eventType()))) {
+            return false;
+        }
+        if (query.isConversationOnly() && contentPreview.isEmpty()) {
             return false;
         }
         String search = normalizedSearch(query.getSearch());

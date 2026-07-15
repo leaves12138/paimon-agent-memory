@@ -301,6 +301,7 @@ public final class DashboardServer implements AutoCloseable {
                         "role",
                         "eventType",
                         "query",
+                        "conversationOnly",
                         "refresh"));
         int page = positiveInt(single(values, "page", "1"), "page");
         int pageSize = pageSize(values);
@@ -309,6 +310,8 @@ public final class DashboardServer implements AutoCloseable {
         String role = optionalFilter(values, "role");
         String eventType = optionalFilter(values, "eventType");
         String search = optionalFilter(values, "query");
+        boolean conversationOnly =
+                Boolean.TRUE.equals(optionalBoolean(values, "conversationOnly"));
         refreshIfRequested(values);
         DashboardPage<DashboardMessage> result =
                 withScanSlot(
@@ -320,6 +323,7 @@ public final class DashboardServer implements AutoCloseable {
                                                 role,
                                                 eventType,
                                                 search,
+                                                conversationOnly,
                                                 page,
                                                 pageSize)));
         List<Map<String, Object>> items = new ArrayList<>();

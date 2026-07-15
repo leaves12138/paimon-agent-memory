@@ -239,6 +239,265 @@ class PaimonDashboardDataStoreTest {
     }
 
     @Test
+    void filtersConversationalMessagesInExecutionAndKeepsMessageCachesIsolated()
+            throws Exception {
+        Instant time = Instant.parse("2026-01-04T00:00:00Z");
+        SessionKey key = new SessionKey("claude", "conversation-only-session");
+        String pureToolUse =
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\","
+                        + "\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\","
+                        + "\"input\":{\"command\":\"pwd\"}}]}}";
+        String pureToolResult =
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\","
+                        + "\"content\":[{\"type\":\"tool_result\","
+                        + "\"content\":\"command finished\"}]}}";
+        String mixed =
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\","
+                        + "\"content\":[{\"type\":\"text\",\"text\":\"human answer\"},"
+                        + "{\"type\":\"tool_use\",\"name\":\"Bash\","
+                        + "\"input\":{\"command\":\"pwd\"}}]}}";
+        List<ChatMessage> messages =
+                Arrays.asList(
+                        message("user-message", key, 1L, "user", "message", time),
+                        message("assistant-message", key, 2L, "assistant", null, time),
+                        message("assistant-event", key, 3L, "assistant", "assistant", time),
+                        message("user-event", key, 4L, "user", "user", time),
+                        message(
+                                "assistant-tool-call",
+                                key,
+                                5L,
+                                "assistant",
+                                "custom_tool_call",
+                                time),
+                        message("tool-output", key, 6L, "tool", "message", time),
+                        message("developer-message", key, 7L, "developer", "message", time),
+                        message(
+                                "user-non-message",
+                                key,
+                                8L,
+                                "user",
+                                "custom_tool_call",
+                                time),
+                        message(
+                                "claude-tool-use",
+                                key,
+                                9L,
+                                "assistant",
+                                "assistant",
+                                pureToolUse,
+                                time),
+                        message(
+                                "claude-tool-result",
+                                key,
+                                10L,
+                                "user",
+                                "user",
+                                pureToolResult,
+                                time),
+                        message(
+                                "claude-mixed",
+                                key,
+                                11L,
+                                "assistant",
+                                "assistant",
+                                mixed,
+                                time));
+
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
+            repository.initialize();
+            repository.commit(
+                    0L,
+                    Collections.singletonList(
+                            new SessionBatch(
+                                    session(key, "Conversation filtering", false, time),
+                                    messages)));
+
+            try (PaimonDashboardDataStore store =
+                    new PaimonDashboardDataStore(repository, 100)) {
+                DashboardPage<DashboardMessage> all =
+                        store.listMessages(
+                                new MessageQuery(
+                                        "claude",
+                                        key.sessionId(),
+                                        null,
+                                        null,
+                                        null,
+                                        false,
+                                        1,
+                                        20));
+                assertThat(all.getTotal()).isEqualTo(11L);
+
+                DashboardPage<DashboardMessage> firstConversationalPage =
+                        store.listMessages(
+                                new MessageQuery(
+                                        "claude",
+                                        key.sessionId(),
+                                        null,
+                                        null,
+                                        null,
+                                        true,
+                                        1,
+                                        1));
+                assertThat(firstConversationalPage.getTotal()).isEqualTo(5L);
+                assertThat(firstConversationalPage.isHasMore()).isTrue();
+                assertThat(firstConversationalPage.getItems())
+                        .extracting(DashboardMessage::getMessageId)
+                        .contains("claude-mixed")
+                        .doesNotContain("claude-tool-use", "claude-tool-result");
+
+                DashboardPage<DashboardMessage> conversational =
+                        store.listMessages(
+                                new MessageQuery(
+                                        "claude",
+                                        key.sessionId(),
+                                        null,
+                                        null,
+                                        null,
+                                        true,
+                                        1,
+                                        20));
+                assertThat(conversational.getTotal()).isEqualTo(5L);
+                assertThat(conversational.getItems())
+                        .extracting(DashboardMessage::getMessageId)
+                        .containsExactlyInAnyOrder(
+                                "user-message",
+                                "assistant-message",
+                                "assistant-event",
+                                "user-event",
+                                "claude-mixed");
+                assertThat(conversational.getItems())
+                        .filteredOn(message -> "claude-mixed".equals(message.getMessageId()))
+                        .extracting(DashboardMessage::getContentPreview)
+                        .containsExactly("human answer");
+
+                assertThat(
+                                store.listMessages(
+                                                new MessageQuery(
+                                                        "claude",
+                                                        key.sessionId(),
+                                                        null,
+                                                        null,
+                                                        null,
+                                                        false,
+                                                        1,
+                                                        20))
+                                        .getTotal())
+                        .isEqualTo(11L);
+            }
+        }
+    }
+
+    @Test
+    void keepsGeneratedImagesAndNonToolAttachmentsInConversationPages() throws Exception {
+        Instant time = Instant.parse("2026-01-05T00:00:00Z");
+        SessionKey codexKey = new SessionKey("codex", "generated-image-session");
+        SessionKey claudeKey = new SessionKey("claude", "attachment-session");
+        ChatMessage generatedImage =
+                message(
+                        "generated-image",
+                        codexKey,
+                        1L,
+                        "assistant",
+                        "image_generation_end",
+                        "{\"type\":\"event_msg\",\"payload\":{"
+                                + "\"type\":\"image_generation_end\","
+                                + "\"result\":\"paimon-blob:0\"}}",
+                        time);
+        ChatMessage attachmentRole =
+                message(
+                        "attachment-role",
+                        claudeKey,
+                        1L,
+                        "attachment",
+                        "attachment",
+                        "{\"type\":\"attachment\"}",
+                        time);
+        ChatMessage userAttachment =
+                message(
+                        "user-attachment",
+                        claudeKey,
+                        2L,
+                        "user",
+                        "attachment",
+                        "{\"type\":\"attachment\",\"message\":{\"content\":[{"
+                                + "\"type\":\"file\",\"name\":\"notes.txt\"}]}}",
+                        time);
+        ChatMessage internalAttachment =
+                message(
+                        "system-attachment",
+                        claudeKey,
+                        3L,
+                        "system",
+                        "attachment",
+                        "{\"type\":\"attachment\"}",
+                        time);
+
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
+            repository.initialize();
+            repository.commit(
+                    0L,
+                    Arrays.asList(
+                            new SessionBatch(
+                                    session(
+                                            codexKey,
+                                            "Generated image",
+                                            false,
+                                            time),
+                                    Collections.singletonList(generatedImage)),
+                            new SessionBatch(
+                                    session(claudeKey, "Attachments", false, time),
+                                    Arrays.asList(
+                                            attachmentRole,
+                                            userAttachment,
+                                            internalAttachment))));
+
+            try (PaimonDashboardDataStore store =
+                    new PaimonDashboardDataStore(repository, 100)) {
+                DashboardPage<DashboardMessage> codex =
+                        store.listMessages(
+                                new MessageQuery(
+                                        "codex",
+                                        codexKey.sessionId(),
+                                        null,
+                                        null,
+                                        null,
+                                        true,
+                                        1,
+                                        10));
+                assertThat(codex.getTotal()).isEqualTo(1L);
+                assertThat(codex.getItems())
+                        .extracting(
+                                DashboardMessage::getMessageId,
+                                DashboardMessage::getContentPreview)
+                        .containsExactly(
+                                org.assertj.core.groups.Tuple.tuple(
+                                        "generated-image", "生成图片"));
+
+                DashboardPage<DashboardMessage> claude =
+                        store.listMessages(
+                                new MessageQuery(
+                                        "claude",
+                                        claudeKey.sessionId(),
+                                        null,
+                                        null,
+                                        null,
+                                        true,
+                                        1,
+                                        10));
+                assertThat(claude.getTotal()).isEqualTo(2L);
+                assertThat(claude.getItems())
+                        .extracting(DashboardMessage::getMessageId)
+                        .containsExactlyInAnyOrder(
+                                "attachment-role", "user-attachment")
+                        .doesNotContain("system-attachment");
+                assertThat(claude.getItems())
+                        .extracting(DashboardMessage::getContentPreview)
+                        .containsOnly("附件");
+            }
+        }
+    }
+
+    @Test
     void filtersSubagentsBeforeSessionSearchPaginationAndTotalsButKeepsOverviewAllRows()
             throws Exception {
         Instant time = Instant.parse("2026-01-03T00:00:00Z");
@@ -718,6 +977,43 @@ class PaimonDashboardDataStoreTest {
                 time,
                 time,
                 subagentSourceJson);
+    }
+
+    private static ChatMessage message(
+            String messageId,
+            SessionKey key,
+            long sequence,
+            String role,
+            String eventType,
+            Instant time) {
+        return message(
+                messageId,
+                key,
+                sequence,
+                role,
+                eventType,
+                "{\"text\":\"" + messageId + "\"}",
+                time);
+    }
+
+    private static ChatMessage message(
+            String messageId,
+            SessionKey key,
+            long sequence,
+            String role,
+            String eventType,
+            String contentJson,
+            Instant time) {
+        return new ChatMessage(
+                messageId,
+                key,
+                sequence,
+                role,
+                eventType,
+                contentJson,
+                Collections.emptyList(),
+                time.plusSeconds(sequence),
+                time.plusSeconds(sequence));
     }
 
     private AgentConfiguration configuration() {
