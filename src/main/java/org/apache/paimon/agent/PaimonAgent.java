@@ -125,7 +125,8 @@ public final class PaimonAgent {
                                     objectMapper,
                                     arguments.dataDirectory,
                                     service::status,
-                                    service::pendingData);
+                                    service::pendingData,
+                                    service::commitGeneration);
                     dashboard.start();
                 }
 
@@ -167,7 +168,8 @@ public final class PaimonAgent {
                         objectMapper,
                         arguments.dataDirectory,
                         CollectorStatus::offline,
-                        PendingDataSnapshot::empty);
+                        PendingDataSnapshot::empty,
+                        () -> 0L);
         CountDownLatch stopped = new CountDownLatch(1);
         Runtime.getRuntime()
                 .addShutdownHook(
@@ -214,7 +216,8 @@ public final class PaimonAgent {
             ObjectMapper objectMapper,
             Path dataDirectory,
             java.util.function.Supplier<CollectorStatus> collectorStatus,
-            java.util.function.Supplier<PendingDataSnapshot> pendingData)
+            java.util.function.Supplier<PendingDataSnapshot> pendingData,
+            java.util.function.LongSupplier commitGeneration)
             throws Exception {
         PaimonDashboardDataStore dataStore =
                 PaimonDashboardDataStore.open(
@@ -223,6 +226,7 @@ public final class PaimonAgent {
                 new LiveDashboardDataStore(
                         dataStore,
                         pendingData,
+                        commitGeneration,
                         configuration.project().dashboard().maxScanRows());
         try {
             return new DashboardServer(

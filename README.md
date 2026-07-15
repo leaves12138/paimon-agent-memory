@@ -122,10 +122,13 @@ large existing history does not leave its final partial chunk waiting for the fi
 
 ## Source behavior
 
-Codex session metadata comes from `~/.codex/state_5.sqlite`, and transcripts come from each
-`threads.rollout_path`. The collector stores canonical `response_item.message` events, tool calls,
-and generated images. It deliberately ignores duplicate `event_msg.user_message` and
-`event_msg.agent_message` projections. Codex images, generated images, and files under
+Codex session metadata comes from `~/.codex/state_5.sqlite`, the user-facing sidebar title comes
+from `~/.codex/session_index.jsonl`, and transcripts come from each `threads.rollout_path`. The
+sidebar title is kept separate from the first user message/preview and can be updated even when no
+new transcript records were appended. The collector stores canonical `response_item.message`
+events, tool calls, and generated images. It deliberately ignores duplicate
+`event_msg.user_message` and `event_msg.agent_message` projections. Codex images, generated images,
+and files under
 `~/.codex/attachments` are copied into the BLOB array. Native Codex subagent source metadata is
 stored on the session row so hidden worker threads remain attached to their parent task instead of
 appearing as duplicate sidebar conversations.
@@ -297,12 +300,16 @@ bin/paimon-agent restore --type claude --target ~/.claude --session-id <id> --ov
 
 For Codex, start and stop Codex once on the destination machine before the first restore. The
 restore command requires Codex's officially initialized `~/.codex/state_5.sqlite`; it will not
-create a partial replacement database. It writes a native rollout JSONL and a matching sidebar
-row. The original `response_item` events remain intact, while the restore adds deterministic
+create a partial replacement database. It writes a native rollout JSONL, a matching SQLite row,
+and the root task's formal title in `session_index.jsonl`; worker subagents remain absent from that
+sidebar index. The SQLite `title` and session-index `thread_name` use the stored formal title, while
+`first_user_message` and `preview` remain the actual first user prompt. The original `response_item`
+events remain intact, while the restore adds deterministic
 `task_started`, `user_message`, `agent_message`, and `task_complete` wrappers so Codex can rebuild
-browsable turns. When `--overwrite` is used, the old rollout is privately backed up and restored if
-the SQLite update fails. `--target-project` rewrites the restored cwd; otherwise an existing source
-cwd is reused, with the target Codex home's parent as the safe fallback. Selecting a visible Codex
+browsable turns. When `--overwrite` is used, the old rollout and title index are privately backed
+up and restored if the SQLite update fails. `--target-project` rewrites the restored cwd; otherwise
+an existing source cwd is reused, with the target Codex home's parent as the safe fallback.
+Selecting a visible Codex
 task also restores all of its stored subagent descendants, writes their native `source` metadata
 and spawn edges, and keeps those worker threads hidden from the destination sidebar. Supplying a
 subagent ID resolves to its complete visible root task. Restored multi-agent tasks retain Codex V2

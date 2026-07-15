@@ -20,8 +20,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.attribute.FileTime;
@@ -109,6 +112,7 @@ public final class CodexConversationSource implements ConversationSource {
         Map<String, CodexThread> threads = loadThreads();
         applyCanonicalRolloutMetadata(threads);
         addUnindexedRollouts(threads);
+        applyThreadNames(threads);
         List<CodexThread> ordered =
                 threads.values().stream()
                         .sorted(
@@ -526,6 +530,84 @@ public final class CodexConversationSource implements ConversationSource {
                 }
             }
         }
+    }
+
+    /**
+     * Applies the user-facing names maintained by Codex independently from its SQLite thread
+     * metadata. The SQLite title is frequently just the first user message, while
+     * session_index.jsonl contains the name shown in the Codex sidebar.
+     */
+    private void applyThreadNames(Map<String, CodexThread> threads) {
+        for (Map.Entry<String, IndexedThreadName> entry : loadThreadNames().entrySet()) {
+            IndexedThreadName indexed = entry.getValue();
+            CodexThread thread = threads.get(entry.getKey());
+            if (thread != null && !isBlank(indexed.title)) {
+                threads.put(
+                        entry.getKey(),
+                        thread.withTitle(indexed.title, indexed.updatedAt));
+            }
+        }
+    }
+
+    private Map<String, IndexedThreadName> loadThreadNames() {
+        Path index = codexHome.resolve("session_index.jsonl");
+        if (!Files.isRegularFile(index, LinkOption.NOFOLLOW_LINKS)) {
+            return java.util.Collections.emptyMap();
+        }
+
+        Map<String, IndexedThreadName> result = new HashMap<>();
+        long lineNumber = 0L;
+        try (BufferedReader reader = Files.newBufferedReader(index, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                lineNumber++;
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+                try {
+                    JsonNode value = objectMapper.readTree(line);
+                    JsonNode idNode = value == null ? null : value.get("id");
+                    JsonNode titleNode = value == null ? null : value.get("thread_name");
+                    JsonNode updatedAtNode = value == null ? null : value.get("updated_at");
+                    if (value == null
+                            || !value.isObject()
+                            || idNode == null
+                            || !idNode.isTextual()
+                            || titleNode == null
+                            || !titleNode.isTextual()
+                            || updatedAtNode == null
+                            || !updatedAtNode.isTextual()) {
+                        continue;
+                    }
+                    String id = idNode.asText();
+                    String title = titleNode.asText().trim();
+                    if (isBlank(id) || isBlank(title)) {
+                        continue;
+                    }
+                    // Codex writes this as an append-only index. Its native reader lets the last
+                    // valid, non-empty record win; updated_at is display metadata, not ordering.
+                    Instant updatedAt = parseInstant(updatedAtNode.asText());
+                    IndexedThreadName previous = result.get(id);
+                    if (previous != null
+                            && previous.updatedAt != null
+                            && (updatedAt == null || previous.updatedAt.isAfter(updatedAt))) {
+                        updatedAt = previous.updatedAt;
+                    }
+                    result.put(
+                            id,
+                            new IndexedThreadName(title, updatedAt));
+                } catch (Exception e) {
+                    LOG.debug(
+                            "Skipping malformed Codex session index record at {}:{}",
+                            index,
+                            lineNumber);
+                }
+            }
+        } catch (IOException e) {
+            LOG.warn("Unable to read Codex session title index from {}", index, e);
+            return java.util.Collections.emptyMap();
+        }
+        return result;
     }
 
     private CodexThread discoverThread(Path path, boolean archived) {
@@ -990,8 +1072,36 @@ public final class CodexConversationSource implements ConversationSource {
                     true);
         }
 
+        private CodexThread withTitle(String value, Instant titleUpdatedAt) {
+            Instant mergedUpdatedAt = updatedAt;
+            if (titleUpdatedAt != null
+                    && (mergedUpdatedAt == null || titleUpdatedAt.isAfter(mergedUpdatedAt))) {
+                mergedUpdatedAt = titleUpdatedAt;
+            }
+            return new CodexThread(
+                    sessionId,
+                    rolloutPath,
+                    value,
+                    cwd,
+                    archived,
+                    createdAt,
+                    mergedUpdatedAt,
+                    subagentSourceJson,
+                    sessionSourceKnown);
+        }
+
         private Instant updatedAt() {
             return updatedAt;
+        }
+    }
+
+    private static final class IndexedThreadName {
+        private final String title;
+        private final Instant updatedAt;
+
+        private IndexedThreadName(String title, Instant updatedAt) {
+            this.title = title;
+            this.updatedAt = updatedAt;
         }
     }
 }

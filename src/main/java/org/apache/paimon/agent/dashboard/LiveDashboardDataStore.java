@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /** Merges the collector's immutable pending snapshot with rows already readable from Paimon. */
@@ -29,20 +30,33 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
 
     private final DashboardDataStore uploaded;
     private final Supplier<PendingDataSnapshot> pendingData;
+    private final LongSupplier commitGeneration;
     private final int maxRows;
     private final ObjectMapper objectMapper;
 
     private boolean pendingStateObserved;
     private boolean pendingWasNonEmpty;
     private long pendingCommitIdentifier = -1L;
+    private boolean commitGenerationObserved;
+    private long observedCommitGeneration;
     private volatile boolean closed;
 
     public LiveDashboardDataStore(
             DashboardDataStore uploaded,
             Supplier<PendingDataSnapshot> pendingData,
             int maxRows) {
+        this(uploaded, pendingData, () -> 0L, maxRows);
+    }
+
+    public LiveDashboardDataStore(
+            DashboardDataStore uploaded,
+            Supplier<PendingDataSnapshot> pendingData,
+            LongSupplier commitGeneration,
+            int maxRows) {
         this.uploaded = Objects.requireNonNull(uploaded, "uploaded");
         this.pendingData = Objects.requireNonNull(pendingData, "pendingData");
+        this.commitGeneration =
+                Objects.requireNonNull(commitGeneration, "commitGeneration");
         if (maxRows <= 0) {
             throw new IllegalArgumentException("maxRows must be greater than zero");
         }
@@ -298,20 +312,29 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
     private synchronized PendingDataSnapshot snapshot() {
         PendingDataSnapshot value = pendingData.get();
         value = value == null ? PendingDataSnapshot.empty() : value;
+        long currentCommitGeneration = commitGeneration.getAsLong();
         boolean nonEmpty = !value.isEmpty();
         long commitIdentifier = nonEmpty ? value.commitIdentifier() : -1L;
-        if (pendingStateObserved
-                && pendingWasNonEmpty
-                && (!nonEmpty || commitIdentifier != pendingCommitIdentifier)) {
+        boolean generationAdvanced =
+                commitGenerationObserved
+                        && currentCommitGeneration != observedCommitGeneration;
+        boolean observedPendingCommitCompleted =
+                pendingStateObserved
+                        && pendingWasNonEmpty
+                        && (!nonEmpty || commitIdentifier != pendingCommitIdentifier);
+        if (generationAdvanced || observedPendingCommitCompleted) {
             // pendingData() is synchronized with CollectorService.commitPending(). Once its
-            // commit identifier advances (or the buffer becomes empty), the Paimon commit has
-            // completed. Drop uploaded caches before removing the overlay, otherwise newly
-            // committed rows can disappear for the cache TTL.
+            // generation advances, the Paimon commit has completed. Keep the pending transition
+            // fallback for standalone/legacy callers which do not provide a generation. Drop
+            // uploaded caches before removing the overlay, otherwise newly committed rows can
+            // disappear for the cache TTL.
             uploaded.invalidate();
         }
         pendingStateObserved = true;
         pendingWasNonEmpty = nonEmpty;
         pendingCommitIdentifier = commitIdentifier;
+        commitGenerationObserved = true;
+        observedCommitGeneration = currentCommitGeneration;
         return value;
     }
 

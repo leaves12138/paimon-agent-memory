@@ -190,15 +190,26 @@ class RestoreServiceTest {
                 Statement statement = connection.createStatement();
                 ResultSet row =
                         statement.executeQuery(
-                                "SELECT title, preview, rollout_path FROM threads WHERE id = '"
+                                "SELECT title, first_user_message, preview, rollout_path "
+                                        + "FROM threads WHERE id = '"
                                         + sessionId
                                         + "'")) {
             assertThat(row.next()).isTrue();
             assertThat(row.getString("title")).isEqualTo("Restored title");
+            assertThat(row.getString("first_user_message"))
+                    .isEqualTo("hello restored codex");
             assertThat(row.getString("preview")).isEqualTo("hello restored codex");
             assertThat(Path.of(row.getString("rollout_path")))
                     .isEqualTo(rollouts.get(0).toRealPath());
         }
+        List<String> sessionIndex =
+                Files.readAllLines(codexHome.resolve("session_index.jsonl"), StandardCharsets.UTF_8);
+        assertThat(sessionIndex).hasSize(1);
+        JsonNode sessionIndexEntry = mapper.readTree(sessionIndex.get(0));
+        assertThat(sessionIndexEntry.path("id").asText()).isEqualTo(sessionId);
+        assertThat(sessionIndexEntry.path("thread_name").asText()).isEqualTo("Restored title");
+        assertThat(sessionIndexEntry.path("updated_at").asText())
+                .isEqualTo("2026-01-01T00:01:00Z");
         assertThat(data.resolve("restore")).isEmptyDirectory();
 
         RestoreSummary second =
@@ -269,6 +280,13 @@ class RestoreServiceTest {
                         Collections.emptyList());
         Path codexHome = tempDir.resolve("subagent-codex-home");
         initializeCodexState(codexHome);
+        String unrelatedIndexLine =
+                "{\"id\":\"unrelated\",\"thread_name\":\"Keep me\","
+                        + "\"updated_at\":\"2025-12-31T00:00:00Z\"}";
+        Files.writeString(
+                codexHome.resolve("session_index.jsonl"),
+                unrelatedIndexLine + "\n",
+                StandardCharsets.UTF_8);
 
         RestoreSummary summary =
                 new RestoreService(
@@ -392,6 +410,20 @@ class RestoreServiceTest {
                 .isEqualTo(childId);
         assertThat(grandchildMeta.path("payload").path("multi_agent_version").asText())
                 .isEqualTo("v2");
+
+        List<String> sessionIndex =
+                Files.readAllLines(codexHome.resolve("session_index.jsonl"), StandardCharsets.UTF_8);
+        assertThat(sessionIndex).hasSize(2);
+        assertThat(sessionIndex.get(0)).isEqualTo(unrelatedIndexLine);
+        List<JsonNode> indexEntries = new ArrayList<>();
+        for (String line : sessionIndex) {
+            indexEntries.add(mapper.readTree(line));
+        }
+        assertThat(indexEntries)
+                .extracting(entry -> entry.path("id").asText())
+                .containsExactly("unrelated", rootId)
+                .doesNotContain(childId, grandchildId);
+        assertThat(indexEntries.get(1).path("thread_name").asText()).isEqualTo("Visible root");
     }
 
     @Test
@@ -871,6 +903,127 @@ class RestoreServiceTest {
     }
 
     @Test
+    void appendsOverwrittenCodexTitleAfterRemovingStaleIndexEntries() throws Exception {
+        String sessionId = "019f5952-14cd-7d21-a7f7-87b31cb62da8";
+        SessionKey key = new SessionKey("codex", sessionId);
+        ChatSession session = session(key, "replacement", tempDir.toString());
+        ChatMessage message =
+                message(
+                        key,
+                        "replacement-index-message",
+                        1L,
+                        "user",
+                        "response_item",
+                        "{\"timestamp\":\"2026-01-01T00:00:00Z\","
+                                + "\"type\":\"response_item\",\"payload\":{"
+                                + "\"type\":\"message\",\"role\":\"user\",\"content\":[{"
+                                + "\"type\":\"input_text\",\"text\":\"first prompt\"}]}}",
+                        Collections.emptyList());
+        Path codexHome = tempDir.resolve("overwrite-index-codex-home");
+        initializeCodexState(codexHome);
+        String otherSession = "another-session";
+        String otherIndexLine =
+                "{\"id\":\""
+                        + otherSession
+                        + "\",\"thread_name\":\"replacement\","
+                        + "\"updated_at\":\"2026-01-01T00:00:01Z\"}";
+        Files.writeString(
+                codexHome.resolve("session_index.jsonl"),
+                "{\"id\":\""
+                        + sessionId
+                        + "\",\"thread_name\":\"old\"}\n"
+                        + otherIndexLine
+                        + "\n{\"id\":\""
+                        + sessionId
+                        + "\",\"thread_name\":\"stale duplicate\"}\n",
+                StandardCharsets.UTF_8);
+        Path oldRollout =
+                Files.createDirectories(codexHome.resolve("sessions/2026/01/01"))
+                        .resolve("old-index-rollout.jsonl");
+        Files.writeString(oldRollout, "old rollout\n", StandardCharsets.UTF_8);
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, "
+                            + "model_provider, cwd, title, sandbox_policy, approval_mode) VALUES ('"
+                            + sessionId
+                            + "', '"
+                            + oldRollout
+                            + "', 1, 1, 'vscode', 'openai', '/tmp', 'old', '{}', 'on-request')");
+        }
+
+        RestoreSummary summary =
+                new RestoreService(new FakeRepository(session, message), mapper)
+                        .restore(
+                                new RestoreOptions(
+                                        RestoreType.CODEX,
+                                        codexHome,
+                                        tempDir.resolve("overwrite-index-data"),
+                                        null,
+                                        null,
+                                        true));
+
+        assertThat(summary.restoredSessions()).isEqualTo(1);
+        List<String> index =
+                Files.readAllLines(codexHome.resolve("session_index.jsonl"), StandardCharsets.UTF_8);
+        assertThat(index).hasSize(2);
+        assertThat(index.get(0)).isEqualTo(otherIndexLine);
+        assertThat(mapper.readTree(index.get(1)).path("id").asText()).isEqualTo(sessionId);
+        assertThat(mapper.readTree(index.get(1)).path("thread_name").asText())
+                .isEqualTo("replacement");
+    }
+
+    @Test
+    void removesNewCodexTitleIndexWhenSqliteInsertFails() throws Exception {
+        String sessionId = "019f5952-14cd-7d21-a7f7-87b31cb62da9";
+        SessionKey key = new SessionKey("codex", sessionId);
+        ChatSession session = session(key, "new title", tempDir.toString());
+        ChatMessage message =
+                message(
+                        key,
+                        "failed-index-message",
+                        1L,
+                        "user",
+                        "response_item",
+                        "{\"timestamp\":\"2026-01-01T00:00:00Z\","
+                                + "\"type\":\"response_item\",\"payload\":{"
+                                + "\"type\":\"message\",\"role\":\"user\",\"content\":[{"
+                                + "\"type\":\"input_text\",\"text\":\"first prompt\"}]}}",
+                        Collections.emptyList());
+        Path codexHome = tempDir.resolve("new-index-rollback-codex-home");
+        initializeCodexState(codexHome);
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TRIGGER reject_new_restore BEFORE INSERT ON threads "
+                            + "BEGIN SELECT RAISE(FAIL, 'blocked new insert'); END");
+        }
+
+        assertThatThrownBy(
+                        () ->
+                                new RestoreService(
+                                                new FakeRepository(session, message), mapper)
+                                        .restore(
+                                                new RestoreOptions(
+                                                        RestoreType.CODEX,
+                                                        codexHome,
+                                                        tempDir.resolve("new-index-rollback-data"),
+                                                        null,
+                                                        null,
+                                                        false)))
+                .hasMessageContaining("blocked new insert");
+
+        assertThat(codexHome.resolve("session_index.jsonl")).doesNotExist();
+        try (Stream<Path> files = Files.walk(codexHome)) {
+            assertThat(files.filter(path -> path.toString().endsWith(".jsonl"))).isEmpty();
+        }
+    }
+
+    @Test
     void rollsBackAnExistingCodexRolloutWhenSidebarUpdateFails() throws Exception {
         String sessionId = "019f5952-14cd-7d21-a7f7-87b31cb62da7";
         SessionKey key = new SessionKey("codex", sessionId);
@@ -894,6 +1047,17 @@ class RestoreServiceTest {
                                         "attachment".getBytes(StandardCharsets.UTF_8))));
         Path codexHome = tempDir.resolve("rollback-codex-home");
         initializeCodexState(codexHome);
+        String originalSessionIndex =
+                "{\"id\":\"unrelated\",\"thread_name\":\"Keep me\","
+                        + "\"updated_at\":\"2025-12-31T00:00:00Z\"}\n"
+                        + "{\"id\":\""
+                        + sessionId
+                        + "\",\"thread_name\":\"old\","
+                        + "\"updated_at\":\"2026-01-01T00:00:00Z\"}\n";
+        Files.writeString(
+                codexHome.resolve("session_index.jsonl"),
+                originalSessionIndex,
+                StandardCharsets.UTF_8);
         Path oldRollout = Files.createDirectories(codexHome.resolve("sessions/2026/01/01"))
                 .resolve("old-rollout.jsonl");
         Files.writeString(oldRollout, "old rollout\n", StandardCharsets.UTF_8);
@@ -929,6 +1093,11 @@ class RestoreServiceTest {
 
         assertThat(Files.readString(oldRollout, StandardCharsets.UTF_8))
                 .isEqualTo("old rollout\n");
+        assertThat(
+                        Files.readString(
+                                codexHome.resolve("session_index.jsonl"),
+                                StandardCharsets.UTF_8))
+                .isEqualTo(originalSessionIndex);
         try (Stream<Path> attachments =
                 Files.walk(codexHome.resolve("attachments/restored"))) {
             assertThat(attachments.filter(Files::isRegularFile)).isEmpty();
@@ -1012,6 +1181,7 @@ class RestoreServiceTest {
                             + "source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, "
                             + "title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, "
                             + "approval_mode TEXT NOT NULL, preview TEXT NOT NULL DEFAULT '', "
+                            + "first_user_message TEXT NOT NULL DEFAULT '', "
                             + "thread_source TEXT, agent_path TEXT, agent_nickname TEXT, "
                             + "agent_role TEXT)");
             statement.execute(

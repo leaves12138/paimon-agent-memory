@@ -35,6 +35,94 @@ class CodexConversationSourceTest {
     @TempDir Path tempDir;
 
     @Test
+    void usesLastValidSidebarThreadNameAndPublishesRenameWithoutNewMessages() throws Exception {
+        Path directory = tempDir.resolve("sessions/2026/01/01");
+        Files.createDirectories(directory);
+        Path rollout = directory.resolve("named.jsonl");
+        Files.writeString(rollout, canonicalUser("First user question") + "\n");
+        createStateDatabase(
+                new ThreadRow("named", rollout, "First user question", 2));
+        Path index = tempDir.resolve("session_index.jsonl");
+        Files.writeString(
+                index,
+                String.join(
+                                "\n",
+                                "{\"id\":\"named\",\"thread_name\":\"Old name\","
+                                        + "\"updated_at\":\"2026-01-01T00:00:00Z\"}",
+                                "{not-json",
+                                "{\"id\":\"named\",\"thread_name\":\"Tie loser\","
+                                        + "\"updated_at\":\"2026-01-01T00:00:01Z\"}",
+                                "{\"id\":\"named\",\"thread_name\":\"Official sidebar title\","
+                                        + "\"updated_at\":\"2026-01-01T00:00:01Z\"}",
+                                "{\"id\":\"named\",\"thread_name\":\"Missing timestamp\"}",
+                                "{\"id\":\"named\",\"thread_name\":42,"
+                                        + "\"updated_at\":\"2026-01-01T00:00:08Z\"}",
+                                "{\"id\":\"named\",\"thread_name\":\"   \","
+                                        + "\"updated_at\":\"2026-01-01T00:00:09Z\"}")
+                        + "\n",
+                StandardCharsets.UTF_8);
+        ObjectMapper mapper = new ObjectMapper();
+        CodexConversationSource source =
+                new CodexConversationSource(
+                        tempDir, mapper, new AttachmentResolver(mapper, true, false, 1024));
+
+        SessionBatch first = source.scan(Collections.emptyMap(), 100).get(0);
+
+        assertThat(first.session().title()).isEqualTo("Official sidebar title");
+        assertThat(first.session().updatedAt())
+                .isEqualTo(Instant.parse("2026-01-01T00:00:01Z"));
+
+        Files.writeString(
+                index,
+                "{\"id\":\"named\",\"thread_name\":\"Earlier-clock rename\","
+                        + "\"updated_at\":\"2025-01-01T00:00:00Z\"}\n"
+                        + "{\"id\":\"named\",\"thread_name\":\"  Renamed sidebar title  \","
+                        + "\"updated_at\":\"unknown\"}\n",
+                StandardCharsets.UTF_8,
+                StandardOpenOption.APPEND);
+
+        List<SessionBatch> renamed =
+                source.scan(
+                        Collections.singletonMap(first.session().key(), first.session()),
+                        100);
+
+        assertThat(renamed).singleElement();
+        assertThat(renamed.get(0).messages()).isEmpty();
+        assertThat(renamed.get(0).sourceRecordsRead()).isZero();
+        assertThat(renamed.get(0).session().title()).isEqualTo("Renamed sidebar title");
+        assertThat(renamed.get(0).session().updatedAt())
+                .isEqualTo(Instant.parse("2026-01-01T00:00:01Z"));
+    }
+
+    @Test
+    void appliesSidebarThreadNameToRolloutMissingFromSqlite() throws Exception {
+        Path directory = tempDir.resolve("sessions/2026/01/01");
+        Files.createDirectories(directory);
+        Path rollout = directory.resolve("unindexed.jsonl");
+        Files.writeString(
+                rollout,
+                "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_meta\","
+                        + "\"payload\":{\"id\":\"unindexed\",\"cwd\":\"/tmp/project\"}}\n"
+                        + canonicalUser("first prompt")
+                        + "\n",
+                StandardCharsets.UTF_8);
+        Files.writeString(
+                tempDir.resolve("session_index.jsonl"),
+                "{\"id\":\"unindexed\",\"thread_name\":\"Discovered title\","
+                        + "\"updated_at\":\"2026-01-01T00:00:02Z\"}\n",
+                StandardCharsets.UTF_8);
+        ObjectMapper mapper = new ObjectMapper();
+        CodexConversationSource source =
+                new CodexConversationSource(
+                        tempDir, mapper, new AttachmentResolver(mapper, true, false, 1024));
+
+        SessionBatch batch = source.scan(Collections.emptyMap(), 100).get(0);
+
+        assertThat(batch.session().key().sessionId()).isEqualTo("unindexed");
+        assertThat(batch.session().title()).isEqualTo("Discovered title");
+    }
+
+    @Test
     void rotatesHotSessionsBetweenBoundedScans() throws Exception {
         Path directory = tempDir.resolve("sessions/2026/01/01");
         Files.createDirectories(directory);

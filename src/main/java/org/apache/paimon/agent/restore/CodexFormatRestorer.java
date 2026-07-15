@@ -27,6 +27,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -36,7 +37,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
-/** Restores Codex rollout JSONL plus the sidebar row in state_5.sqlite. */
+/** Restores Codex rollout JSONL plus its native SQLite and session-index metadata. */
 final class CodexFormatRestorer implements ConversationFormatRestorer {
 
     private static final DateTimeFormatter DAY =
@@ -47,6 +48,7 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
 
     private final Path codexHome;
     private final Path stateDatabase;
+    private final Path sessionIndex;
     private final Path targetProject;
     private final ObjectMapper objectMapper;
     private final Map<String, Path> existingRollouts = new HashMap<>();
@@ -63,6 +65,9 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
         this.codexHome =
                 RestoreFiles.canonicalTargetDirectory(codexHome, false, "Codex target home");
         this.stateDatabase = this.codexHome.resolve("state_5.sqlite");
+        this.sessionIndex =
+                RestoreFiles.resolveContainedFile(
+                        this.codexHome, Paths.get("session_index.jsonl"));
         this.targetProject = canonicalProject(targetProject, "Codex target project");
         this.objectMapper = objectMapper;
         if (Files.isSymbolicLink(this.stateDatabase)
@@ -212,11 +217,26 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
         }
 
         boolean committed = false;
+        SessionIndexBackup sessionIndexBackup = null;
         try {
             RestoreFiles.writeLinesAtomically(rollout, rolloutLines);
+            if (subagentMetadata(session) == null) {
+                sessionIndexBackup = backupSessionIndex();
+                upsertSessionIndex(
+                        session.key().sessionId(),
+                        isBlank(session.title()) ? preview : session.title(),
+                        updatedAt);
+            }
             upsertThread(session, rollout, cwd, preview, createdAt, updatedAt, overwrite);
             committed = true;
         } catch (Exception failure) {
+            if (sessionIndexBackup != null) {
+                try {
+                    rollbackSessionIndex(sessionIndexBackup);
+                } catch (Exception rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                }
+            }
             try {
                 rollbackRollout(rollout, backup, existed);
             } catch (Exception rollbackFailure) {
@@ -224,13 +244,122 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
             }
             throw failure;
         } finally {
-            if (committed && backup != null) {
-                try {
-                    Files.deleteIfExists(backup);
-                } catch (IOException ignored) {
-                    // A private backup is safer than deleting the restored rollout on cleanup failure.
-                }
+            if (committed && sessionIndexBackup != null) {
+                deleteBackupQuietly(sessionIndexBackup.backup);
             }
+            if (committed) {
+                deleteBackupQuietly(backup);
+            }
+        }
+    }
+
+    private SessionIndexBackup backupSessionIndex() throws IOException {
+        if (Files.isSymbolicLink(sessionIndex)) {
+            throw new IOException(
+                    "Codex session index must not be a symbolic link: " + sessionIndex);
+        }
+        boolean existed = Files.exists(sessionIndex, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        if (!existed) {
+            return new SessionIndexBackup(false, null);
+        }
+        if (!Files.isRegularFile(sessionIndex, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("Codex session index is not a regular file: " + sessionIndex);
+        }
+        Path backup =
+                Files.createTempFile(codexHome, ".paimon-agent-session-index-backup-", ".jsonl");
+        try {
+            Files.copy(
+                    sessionIndex,
+                    backup,
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.COPY_ATTRIBUTES);
+            RestoreFiles.setOwnerOnlyFilePermissions(backup);
+            return new SessionIndexBackup(true, backup);
+        } catch (IOException failure) {
+            try {
+                Files.deleteIfExists(backup);
+            } catch (IOException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
+    }
+
+    private void upsertSessionIndex(String sessionId, String title, Instant updatedAt)
+            throws Exception {
+        List<String> current =
+                Files.exists(sessionIndex)
+                        ? Files.readAllLines(sessionIndex, StandardCharsets.UTF_8)
+                        : Collections.emptyList();
+        ObjectNode entry = objectMapper.createObjectNode();
+        entry.put("id", sessionId);
+        entry.put("thread_name", title);
+        entry.put("updated_at", updatedAt.toString());
+        String encoded = objectMapper.writeValueAsString(entry);
+
+        List<String> updated = new ArrayList<>(current.size() + 1);
+        for (String line : current) {
+            boolean matches = false;
+            try {
+                JsonNode candidate = objectMapper.readTree(line);
+                matches =
+                        candidate != null
+                                && candidate.isObject()
+                                && sessionId.equals(candidate.path("id").asText());
+            } catch (IOException ignored) {
+                // Preserve malformed records belonging to other sessions verbatim.
+            }
+            if (!matches) {
+                updated.add(line);
+            }
+        }
+        // Codex resolves its append-only index from the tail. Always place the restored metadata
+        // last after removing stale duplicates so native name lookup observes this entry as newest.
+        updated.add(encoded);
+        RestoreFiles.writeLinesAtomically(sessionIndex, updated);
+    }
+
+    private void rollbackSessionIndex(SessionIndexBackup backup) throws IOException {
+        if (!backup.existed) {
+            Files.deleteIfExists(sessionIndex);
+            return;
+        }
+        if (backup.backup == null || !Files.exists(backup.backup)) {
+            throw new IOException(
+                    "Codex session index backup disappeared before rollback: " + sessionIndex);
+        }
+        moveReplacing(backup.backup, sessionIndex);
+    }
+
+    private static void deleteBackupQuietly(Path backup) {
+        if (backup != null) {
+            try {
+                Files.deleteIfExists(backup);
+            } catch (IOException ignored) {
+                // A private backup is safer than deleting restored state on cleanup failure.
+            }
+        }
+    }
+
+    private static void moveReplacing(Path source, Path target) throws IOException {
+        try {
+            Files.move(
+                    source,
+                    target,
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static final class SessionIndexBackup {
+        private final boolean existed;
+        private final Path backup;
+
+        private SessionIndexBackup(boolean existed, Path backup) {
+            this.existed = existed;
+            this.backup = backup;
         }
     }
 
@@ -243,15 +372,7 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
         if (backup == null || !Files.exists(backup)) {
             throw new IOException("Codex rollout backup disappeared before rollback: " + rollout);
         }
-        try {
-            Files.move(
-                    backup,
-                    rollout,
-                    StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException ignored) {
-            Files.move(backup, rollout, StandardCopyOption.REPLACE_EXISTING);
-        }
+        moveReplacing(backup, rollout);
     }
 
     private String sessionMeta(ChatSession session, Instant createdAt, String cwd)

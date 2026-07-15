@@ -16,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -302,6 +303,50 @@ class LiveDashboardDataStoreTest {
                 .extracting(DashboardSession::getSessionId)
                 .containsExactlyInAnyOrder("session-commit-21", "session-commit-22");
         assertThat(uploaded.invalidations).isEqualTo(1);
+    }
+
+    @Test
+    void invalidatesWhenCommitCompletesBetweenDashboardReads() throws Exception {
+        SessionKey key = new SessionKey("codex", "session-generation");
+        AtomicReference<PendingDataSnapshot> pending =
+                new AtomicReference<>(PendingDataSnapshot.empty());
+        AtomicLong commitGeneration = new AtomicLong();
+        CachingUploadedStore uploaded = new CachingUploadedStore();
+        DashboardMessage message =
+                new DashboardMessage(
+                        "message-generation",
+                        "codex",
+                        "session-generation",
+                        1L,
+                        "user",
+                        "message",
+                        "unchanged message",
+                        17L,
+                        NOW,
+                        NOW);
+        uploaded.commit(dashboardSession(key, "old title"), message);
+        uploaded.invalidate();
+
+        LiveDashboardDataStore store =
+                new LiveDashboardDataStore(
+                        uploaded, pending::get, commitGeneration::get, 20);
+        assertThat(
+                        store.listSessions(new SessionQuery(null, null, null, 1, 20))
+                                .getItems())
+                .extracting(DashboardSession::getTitle)
+                .containsExactly("old title");
+
+        // The collector commits between requests, so the Dashboard never observes a non-empty
+        // pending overlay. The generation must still evict the uploaded cache.
+        uploaded.commit(dashboardSession(key, "renamed title"), message);
+        commitGeneration.incrementAndGet();
+
+        assertThat(
+                        store.listSessions(new SessionQuery(null, null, null, 1, 20))
+                                .getItems())
+                .extracting(DashboardSession::getTitle)
+                .containsExactly("renamed title");
+        assertThat(uploaded.invalidations).isEqualTo(2);
     }
 
     private static DashboardSession dashboardSession(SessionKey key, String title) {

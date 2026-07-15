@@ -43,6 +43,7 @@ public final class CollectorService implements AutoCloseable {
     private final Instant startedAt;
 
     private long nextCommitIdentifier;
+    private long commitGeneration;
     private int nextSourceIndex;
     private boolean pendingFrozen;
     private volatile boolean closed;
@@ -492,6 +493,7 @@ public final class CollectorService implements AutoCloseable {
         pending.clear();
         pendingFrozen = false;
         nextCommitIdentifier++;
+        commitGeneration++;
         lastCommitAt = Instant.now();
         lastError = null;
         lastErrorAt = null;
@@ -567,6 +569,11 @@ public final class CollectorService implements AutoCloseable {
                             value.startingCommitId));
         }
         return new PendingDataSnapshot(nextCommitIdentifier, batches);
+    }
+
+    /** Monotonically advances after each commit has completed successfully. */
+    public synchronized long commitGeneration() {
+        return commitGeneration;
     }
 
     private synchronized void recordError(Throwable error) {

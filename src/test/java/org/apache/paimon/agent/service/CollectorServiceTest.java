@@ -62,6 +62,33 @@ class CollectorServiceTest {
     }
 
     @Test
+    void advancesCommitGenerationOnlyWhenACommitCompletes() throws Exception {
+        SessionKey key = new SessionKey("codex", "generation");
+        FakeRepository repository = new FakeRepository();
+        repository.failNextCommit = true;
+        ConversationSource source =
+                sourceWithOneMessage(
+                        "generation", key, new ArrayList<>(), new ArrayList<>());
+
+        try (CollectorService service =
+                new CollectorService(
+                        config(), Collections.singletonList(source), repository)) {
+            assertThat(service.commitGeneration()).isZero();
+
+            assertThatThrownBy(service::runOnce)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("uncertain test failure");
+            assertThat(service.commitGeneration()).isZero();
+
+            service.runOnce();
+            assertThat(service.commitGeneration()).isEqualTo(1L);
+
+            service.runOnce();
+            assertThat(service.commitGeneration()).isEqualTo(1L);
+        }
+    }
+
+    @Test
     void drainsAllChunksAndCommitsBoundedBatchesInOneWakeUp() throws Exception {
         SessionKey key = new SessionKey("codex", "large-session");
         List<Integer> budgets = new ArrayList<>();
