@@ -498,6 +498,10 @@ kbd {
   margin: 0 0 13px;
 }
 
+.project-group.is-tasks {
+  margin-top: 22px;
+}
+
 .project-section {
   min-width: 0;
 }
@@ -509,6 +513,10 @@ kbd {
   align-items: center;
   gap: 8px;
   padding: 2px 7px;
+}
+
+.project-heading.task-heading {
+  padding-left: 29px;
 }
 
 .project-folder {
@@ -543,6 +551,11 @@ kbd {
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.project-group.is-tasks .project-title {
+  color: #aaa9a6;
+  font-weight: 560;
 }
 
 .project-session-list {

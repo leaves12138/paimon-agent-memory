@@ -227,6 +227,129 @@ class RestoreServiceTest {
     }
 
     @Test
+    void updatesCodexProjectlessStateWithoutLosingOtherGlobalFields() throws Exception {
+        String addedId = "019f5952-14cd-7d21-a7f7-87b31cb62db0";
+        String removedId = "019f5952-14cd-7d21-a7f7-87b31cb62db1";
+        SessionKey addedKey = new SessionKey("codex", addedId);
+        SessionKey removedKey = new SessionKey("codex", removedId);
+        ChatSession added =
+                session(addedKey, "projectless", tempDir.toString()).withProjectless(true);
+        ChatSession removed =
+                session(removedKey, "project", tempDir.toString()).withProjectless(false);
+        Path codexHome = tempDir.resolve("projectless-codex-home");
+        initializeCodexState(codexHome);
+        Files.writeString(
+                codexHome.resolve(".codex-global-state.json"),
+                "{\"keep\":{\"nested\":7},\"projectless-thread-ids\":["
+                        + "\"keep-id\",\""
+                        + addedId
+                        + "\",\"keep-id\",\""
+                        + removedId
+                        + "\",\""
+                        + addedId
+                        + "\"]}\n",
+                StandardCharsets.UTF_8);
+
+        RestoreSummary summary =
+                new RestoreService(
+                                new FakeRepository(
+                                        java.util.Arrays.asList(added, removed),
+                                        message(
+                                                addedKey,
+                                                "added-prompt",
+                                                1L,
+                                                "user",
+                                                "response_item",
+                                                codexPrompt("projectless prompt"),
+                                                Collections.emptyList()),
+                                        message(
+                                                removedKey,
+                                                "removed-prompt",
+                                                1L,
+                                                "user",
+                                                "response_item",
+                                                codexPrompt("project prompt"),
+                                                Collections.emptyList())),
+                                mapper)
+                        .restore(
+                                new RestoreOptions(
+                                        RestoreType.CODEX,
+                                        codexHome,
+                                        tempDir.resolve("projectless-data"),
+                                        null,
+                                        null,
+                                        false));
+
+        assertThat(summary.restoredSessions()).isEqualTo(2);
+        JsonNode state = mapper.readTree(codexHome.resolve(".codex-global-state.json").toFile());
+        assertThat(state.path("keep").path("nested").asInt()).isEqualTo(7);
+        List<String> projectlessIds = new ArrayList<>();
+        state.path("projectless-thread-ids")
+                .forEach(value -> projectlessIds.add(value.asText()));
+        assertThat(projectlessIds).containsExactly("keep-id", addedId);
+    }
+
+    @Test
+    void leavesCodexGlobalStateUntouchedForUnknownRootsAndSubagents() throws Exception {
+        String rootId = "019f5952-14cd-7d21-a7f7-87b31cb62db2";
+        String childId = "019f5952-14cd-7d21-a7f7-87b31cb62db3";
+        SessionKey rootKey = new SessionKey("codex", rootId);
+        SessionKey childKey = new SessionKey("codex", childId);
+        ChatSession root = session(rootKey, "root", tempDir.toString()).withProjectless(null);
+        ChatSession child =
+                session(childKey, "subagent", tempDir.toString())
+                        .withSubagentSourceJson(
+                                "{\"thread_spawn\":{\"parent_thread_id\":\""
+                                        + rootId
+                                        + "\",\"depth\":1}}")
+                        .withProjectless(true);
+        Path codexHome = tempDir.resolve("untouched-global-state-codex-home");
+        initializeCodexState(codexHome);
+        String original = "not-json-and-must-not-be-read\n";
+        Files.writeString(
+                codexHome.resolve(".codex-global-state.json"),
+                original,
+                StandardCharsets.UTF_8);
+
+        RestoreSummary summary =
+                new RestoreService(
+                                new FakeRepository(
+                                        java.util.Arrays.asList(root, child),
+                                        message(
+                                                rootKey,
+                                                "root-projectless-prompt",
+                                                1L,
+                                                "user",
+                                                "response_item",
+                                                codexPrompt("root prompt"),
+                                                Collections.emptyList()),
+                                        message(
+                                                childKey,
+                                                "child-projectless-prompt",
+                                                1L,
+                                                "user",
+                                                "response_item",
+                                                codexPrompt("child prompt"),
+                                                Collections.emptyList())),
+                                mapper)
+                        .restore(
+                                new RestoreOptions(
+                                        RestoreType.CODEX,
+                                        codexHome,
+                                        tempDir.resolve("untouched-global-state-data"),
+                                        null,
+                                        null,
+                                        false));
+
+        assertThat(summary.restoredSessions()).isEqualTo(2);
+        assertThat(
+                        Files.readString(
+                                codexHome.resolve(".codex-global-state.json"),
+                                StandardCharsets.UTF_8))
+                .isEqualTo(original);
+    }
+
+    @Test
     void restoresCompleteCodexRootGraphWhenNestedSubagentIsRequested() throws Exception {
         String rootId = "019f5952-14cd-7d21-a7f7-87b31cb62da6";
         String childId = "019f608e-7cb4-76f0-b006-89a317303fdb";
@@ -732,6 +855,22 @@ class RestoreServiceTest {
         assertThatThrownBy(() -> new CodexFormatRestorer(linkedSidecarHome, mapper))
                 .hasMessageContaining("sidecar")
                 .hasMessageContaining("symbolic link");
+
+        Path linkedGlobalStateHome = tempDir.resolve("linked-global-state-home");
+        initializeCodexState(linkedGlobalStateHome);
+        Path outsideGlobalState =
+                Files.writeString(
+                        tempDir.resolve("outside-global-state.json"),
+                        "{\"outside\":true}\n",
+                        StandardCharsets.UTF_8);
+        createSymbolicLinkOrSkip(
+                linkedGlobalStateHome.resolve(".codex-global-state.json"),
+                outsideGlobalState);
+        assertThatThrownBy(() -> new CodexFormatRestorer(linkedGlobalStateHome, mapper))
+                .hasMessageContaining(".codex-global-state.json")
+                .hasMessageContaining("symbolic link");
+        assertThat(Files.readString(outsideGlobalState, StandardCharsets.UTF_8))
+                .isEqualTo("{\"outside\":true}\n");
     }
 
     @Test
@@ -976,10 +1115,11 @@ class RestoreServiceTest {
     }
 
     @Test
-    void removesNewCodexTitleIndexWhenSqliteInsertFails() throws Exception {
+    void rollsBackNewCodexIndexesAndProjectlessStateWhenSqliteInsertFails() throws Exception {
         String sessionId = "019f5952-14cd-7d21-a7f7-87b31cb62da9";
         SessionKey key = new SessionKey("codex", sessionId);
-        ChatSession session = session(key, "new title", tempDir.toString());
+        ChatSession session =
+                session(key, "new title", tempDir.toString()).withProjectless(true);
         ChatMessage message =
                 message(
                         key,
@@ -994,6 +1134,12 @@ class RestoreServiceTest {
                         Collections.emptyList());
         Path codexHome = tempDir.resolve("new-index-rollback-codex-home");
         initializeCodexState(codexHome);
+        String originalGlobalState =
+                "{\"keep\":true,\"projectless-thread-ids\":[\"existing\"]}\n";
+        Files.writeString(
+                codexHome.resolve(".codex-global-state.json"),
+                originalGlobalState,
+                StandardCharsets.UTF_8);
         try (Connection connection =
                         DriverManager.getConnection(
                                 "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
@@ -1018,8 +1164,72 @@ class RestoreServiceTest {
                 .hasMessageContaining("blocked new insert");
 
         assertThat(codexHome.resolve("session_index.jsonl")).doesNotExist();
+        assertThat(
+                        Files.readString(
+                                codexHome.resolve(".codex-global-state.json"),
+                                StandardCharsets.UTF_8))
+                .isEqualTo(originalGlobalState);
         try (Stream<Path> files = Files.walk(codexHome)) {
             assertThat(files.filter(path -> path.toString().endsWith(".jsonl"))).isEmpty();
+        }
+    }
+
+    @Test
+    void rollsBackCodexRolloutAndIndexWhenProjectlessStateIsInvalid() throws Exception {
+        String sessionId = "019f5952-14cd-7d21-a7f7-87b31cb62db4";
+        SessionKey key = new SessionKey("codex", sessionId);
+        ChatSession session =
+                session(key, "invalid global state", tempDir.toString())
+                        .withProjectless(true);
+        ChatMessage prompt =
+                message(
+                        key,
+                        "invalid-global-state-prompt",
+                        1L,
+                        "user",
+                        "response_item",
+                        codexPrompt("prompt"),
+                        Collections.emptyList());
+        Path codexHome = tempDir.resolve("invalid-global-state-codex-home");
+        initializeCodexState(codexHome);
+        String originalGlobalState = "[]\n";
+        Files.writeString(
+                codexHome.resolve(".codex-global-state.json"),
+                originalGlobalState,
+                StandardCharsets.UTF_8);
+
+        assertThatThrownBy(
+                        () ->
+                                new RestoreService(new FakeRepository(session, prompt), mapper)
+                                        .restore(
+                                                new RestoreOptions(
+                                                        RestoreType.CODEX,
+                                                        codexHome,
+                                                        tempDir.resolve("invalid-global-state-data"),
+                                                        null,
+                                                        null,
+                                                        false)))
+                .hasMessageContaining("global state")
+                .hasMessageContaining("JSON object");
+
+        assertThat(codexHome.resolve("session_index.jsonl")).doesNotExist();
+        assertThat(
+                        Files.readString(
+                                codexHome.resolve(".codex-global-state.json"),
+                                StandardCharsets.UTF_8))
+                .isEqualTo(originalGlobalState);
+        try (Stream<Path> files = Files.walk(codexHome)) {
+            assertThat(files.filter(path -> path.toString().endsWith(".jsonl"))).isEmpty();
+        }
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                Statement statement = connection.createStatement();
+                ResultSet rows =
+                        statement.executeQuery(
+                                "SELECT COUNT(*) FROM threads WHERE id = '" + sessionId + "'")) {
+            assertThat(rows.next()).isTrue();
+            assertThat(rows.getInt(1)).isZero();
         }
     }
 

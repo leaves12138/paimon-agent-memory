@@ -373,6 +373,7 @@ public final class LiveDashboardDataStore implements DashboardDataStore {
                 session.lastMessageAt(),
                 session.ingestedAt(),
                 session.subagentSourceJson(),
+                session.projectless(),
                 DashboardStorageStatus.PENDING);
     }
 

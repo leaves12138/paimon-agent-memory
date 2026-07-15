@@ -113,7 +113,8 @@ class LiveDashboardDataStoreTest {
                         Collections.emptyList(),
                         NOW.plusSeconds(4),
                         NOW.plusSeconds(4));
-        ChatSession updatedExisting = chatSession(existingKey, "new pending title");
+        ChatSession updatedExisting =
+                chatSession(existingKey, "new pending title").withProjectless(true);
         ChatSession newSession = chatSession(newKey, "new session");
         PendingDataSnapshot snapshot =
                 new PendingDataSnapshot(
@@ -145,6 +146,10 @@ class LiveDashboardDataStoreTest {
         assertThat(sessions.getItems())
                 .extracting(DashboardSession::getPendingCommitId)
                 .containsOnly(7L);
+        assertThat(sessions.getItems())
+                .filteredOn(session -> existingKey.sessionId().equals(session.getSessionId()))
+                .extracting(DashboardSession::getProjectless)
+                .containsExactly(true);
 
         DashboardPage<DashboardMessage> messages =
                 store.listMessages(

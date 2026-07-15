@@ -20,6 +20,7 @@ public final class ChatSession {
     private final Instant lastMessageAt;
     private final Instant ingestedAt;
     private final String subagentSourceJson;
+    private final Boolean projectless;
 
     public ChatSession(
             SessionKey key,
@@ -126,6 +127,40 @@ public final class ChatSession {
             Instant lastMessageAt,
             Instant ingestedAt,
             String subagentSourceJson) {
+        this(
+                key,
+                title,
+                cwd,
+                archived,
+                sourcePath,
+                sourceCursor,
+                lastCommitId,
+                pendingCommitId,
+                pendingCursor,
+                createdAt,
+                updatedAt,
+                lastMessageAt,
+                ingestedAt,
+                subagentSourceJson,
+                null);
+    }
+
+    public ChatSession(
+            SessionKey key,
+            String title,
+            String cwd,
+            boolean archived,
+            String sourcePath,
+            String sourceCursor,
+            long lastCommitId,
+            Long pendingCommitId,
+            String pendingCursor,
+            Instant createdAt,
+            Instant updatedAt,
+            Instant lastMessageAt,
+            Instant ingestedAt,
+            String subagentSourceJson,
+            Boolean projectless) {
         this.key = Objects.requireNonNull(key, "key");
         this.title = title;
         this.cwd = cwd;
@@ -140,6 +175,7 @@ public final class ChatSession {
         this.lastMessageAt = lastMessageAt;
         this.ingestedAt = ingestedAt;
         this.subagentSourceJson = subagentSourceJson;
+        this.projectless = projectless;
     }
 
     public SessionKey key() {
@@ -202,6 +238,10 @@ public final class ChatSession {
         return subagentSourceJson;
     }
 
+    public Boolean projectless() {
+        return projectless;
+    }
+
     public ChatSession withSubagentSourceJson(String value) {
         return new ChatSession(
                 key,
@@ -217,6 +257,26 @@ public final class ChatSession {
                 updatedAt,
                 lastMessageAt,
                 ingestedAt,
+                value,
+                projectless);
+    }
+
+    public ChatSession withProjectless(Boolean value) {
+        return new ChatSession(
+                key,
+                title,
+                cwd,
+                archived,
+                sourcePath,
+                sourceCursor,
+                lastCommitId,
+                pendingCommitId,
+                pendingCursor,
+                createdAt,
+                updatedAt,
+                lastMessageAt,
+                ingestedAt,
+                subagentSourceJson,
                 value);
     }
 
@@ -235,7 +295,8 @@ public final class ChatSession {
                 updatedAt,
                 lastMessageAt,
                 ingestionTime,
-                subagentSourceJson);
+                subagentSourceJson,
+                projectless);
     }
 
     public ChatSession withPendingCommit(
@@ -258,7 +319,8 @@ public final class ChatSession {
                 updatedAt,
                 lastMessageAt,
                 ingestionTime,
-                subagentSourceJson);
+                subagentSourceJson,
+                projectless);
     }
 
     public ChatSession withPendingBoundary(long pendingId, String targetCursor) {
@@ -276,6 +338,7 @@ public final class ChatSession {
                 updatedAt,
                 lastMessageAt,
                 ingestedAt,
-                subagentSourceJson);
+                subagentSourceJson,
+                projectless);
     }
 }

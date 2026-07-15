@@ -81,7 +81,8 @@ class PaimonDashboardDataStoreTest {
                         Collections.emptyList(),
                         second.plusSeconds(1),
                         second.plusSeconds(1));
-        ChatSession codex = session(codexKey, "Customer demo", false, second);
+        ChatSession codex =
+                session(codexKey, "Customer demo", false, second).withProjectless(true);
         ChatSession claude = session(claudeKey, "Archived chat", true, first);
 
         try (PaimonChatRepository repository = new PaimonChatRepository(configuration)) {
@@ -113,6 +114,9 @@ class PaimonDashboardDataStoreTest {
                 assertThat(sessionPage.getItems())
                         .extracting(DashboardSession::getSessionId)
                         .containsExactly("codex-session");
+                assertThat(sessionPage.getItems())
+                        .extracting(DashboardSession::getProjectless)
+                        .containsExactly(true);
                 assertThat(sessionPage.isHasMore()).isTrue();
                 assertThat(
                                 store.listSessions(

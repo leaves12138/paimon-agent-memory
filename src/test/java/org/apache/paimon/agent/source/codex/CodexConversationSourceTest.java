@@ -35,6 +35,132 @@ class CodexConversationSourceTest {
     @TempDir Path tempDir;
 
     @Test
+    void assignsTrueAndFalseFromAuthoritativeProjectlessState() throws Exception {
+        Path directory = tempDir.resolve("sessions/2026/01/01");
+        Files.createDirectories(directory);
+        Path projectless = directory.resolve("projectless.jsonl");
+        Path project = directory.resolve("project.jsonl");
+        Files.writeString(projectless, canonicalUser("without project") + "\n");
+        Files.writeString(project, canonicalUser("with project") + "\n");
+        createStateDatabase(
+                new ThreadRow("projectless", projectless, "No project", 2),
+                new ThreadRow("project", project, "Project", 1));
+        writeGlobalState("{\"projectless-thread-ids\":[\"projectless\"]}");
+        ObjectMapper mapper = new ObjectMapper();
+        CodexConversationSource source =
+                new CodexConversationSource(
+                        tempDir, mapper, new AttachmentResolver(mapper, true, false, 1024));
+
+        List<SessionBatch> batches = source.scan(Collections.emptyMap(), 100);
+
+        assertThat(batches)
+                .filteredOn(batch -> batch.session().key().sessionId().equals("projectless"))
+                .singleElement()
+                .satisfies(batch -> assertThat(batch.session().projectless()).isTrue());
+        assertThat(batches)
+                .filteredOn(batch -> batch.session().key().sessionId().equals("project"))
+                .singleElement()
+                .satisfies(batch -> assertThat(batch.session().projectless()).isFalse());
+    }
+
+    @Test
+    void unknownProjectlessStateInheritsCheckpointAndNeverBlocksCollection() throws Exception {
+        Path directory = tempDir.resolve("sessions/2026/01/01");
+        Files.createDirectories(directory);
+        Path rollout = directory.resolve("unknown.jsonl");
+        Files.writeString(rollout, canonicalUser("first") + "\n");
+        createStateDatabase(new ThreadRow("unknown", rollout, "Unknown", 1));
+        ObjectMapper mapper = new ObjectMapper();
+        CodexConversationSource source =
+                new CodexConversationSource(
+                        tempDir, mapper, new AttachmentResolver(mapper, true, false, 1024));
+
+        SessionBatch missing = source.scan(Collections.emptyMap(), 100).get(0);
+        assertThat(missing.session().projectless()).isNull();
+
+        writeGlobalState("{\"projectless-thread-ids\":[\"unknown\"]}");
+        SessionBatch known =
+                source.scan(
+                                Collections.singletonMap(
+                                        missing.session().key(), missing.session()),
+                                100)
+                        .get(0);
+        assertThat(known.messages()).isEmpty();
+        assertThat(known.session().projectless()).isTrue();
+
+        writeGlobalState("{\"projectless-thread-ids\":[42]}");
+        Files.writeString(
+                rollout,
+                canonicalUser("invalid field") + "\n",
+                StandardOpenOption.APPEND);
+        SessionBatch invalid =
+                source.scan(Collections.singletonMap(known.session().key(), known.session()), 100)
+                        .get(0);
+        assertThat(invalid.messages()).singleElement();
+        assertThat(invalid.session().projectless()).isTrue();
+
+        writeGlobalState("{not-json");
+        Files.writeString(
+                rollout,
+                canonicalUser("corrupt file") + "\n",
+                StandardOpenOption.APPEND);
+        SessionBatch corrupt =
+                source.scan(
+                                Collections.singletonMap(
+                                        invalid.session().key(), invalid.session()),
+                                100)
+                        .get(0);
+        assertThat(corrupt.messages()).singleElement();
+        assertThat(corrupt.session().projectless()).isTrue();
+
+        Path globalState = tempDir.resolve(".codex-global-state.json");
+        Files.delete(globalState);
+        Path symlinkTarget = tempDir.resolve("symlink-target.json");
+        Files.writeString(symlinkTarget, "{\"projectless-thread-ids\":[]}");
+        Files.createSymbolicLink(globalState, symlinkTarget.getFileName());
+        Files.writeString(rollout, canonicalUser("symlink") + "\n", StandardOpenOption.APPEND);
+        SessionBatch symlink =
+                source.scan(
+                                Collections.singletonMap(
+                                        corrupt.session().key(), corrupt.session()),
+                                100)
+                        .get(0);
+        assertThat(symlink.messages()).singleElement();
+        assertThat(symlink.session().projectless()).isTrue();
+    }
+
+    @Test
+    void snapshotsProjectlessStateOnceAndPublishesMetadataOnlyChanges() throws Exception {
+        Path directory = tempDir.resolve("sessions/2026/01/01");
+        Files.createDirectories(directory);
+        Path rollout = directory.resolve("snapshot.jsonl");
+        Files.writeString(rollout, canonicalUser("first") + "\n");
+        createStateDatabase(new ThreadRow("snapshot", rollout, "Snapshot", 1));
+        writeGlobalState("{\"projectless-thread-ids\":[\"snapshot\"]}");
+        ObjectMapper mapper = new ObjectMapper();
+        CodexConversationSource source =
+                new CodexConversationSource(
+                        tempDir, mapper, new AttachmentResolver(mapper, true, false, 1024));
+
+        SessionBatch captured;
+        try (ConversationSource.ScanCycle cycle = source.openScanCycle()) {
+            writeGlobalState("{\"projectless-thread-ids\":[]}");
+            captured = cycle.scan(Collections.emptyMap(), 100, Collections.emptySet()).get(0);
+        }
+        assertThat(captured.session().projectless()).isTrue();
+
+        List<SessionBatch> changed =
+                source.scan(
+                        Collections.singletonMap(captured.session().key(), captured.session()),
+                        100);
+
+        assertThat(changed).singleElement();
+        assertThat(changed.get(0).messages()).isEmpty();
+        assertThat(changed.get(0).sourceRecordsRead()).isZero();
+        assertThat(changed.get(0).session().projectless()).isFalse();
+    }
+
+    @Test
     void usesLastValidSidebarThreadNameAndPublishesRenameWithoutNewMessages() throws Exception {
         Path directory = tempDir.resolve("sessions/2026/01/01");
         Files.createDirectories(directory);
@@ -398,6 +524,13 @@ class CodexConversationSourceTest {
 
     private void createStateDatabase(Path rollout) throws Exception {
         createStateDatabase(new ThreadRow("session-1", rollout, "Test title", 2));
+    }
+
+    private void writeGlobalState(String value) throws Exception {
+        Files.writeString(
+                tempDir.resolve(".codex-global-state.json"),
+                value,
+                StandardCharsets.UTF_8);
     }
 
     private void createStateDatabase(ThreadRow... rows) throws Exception {

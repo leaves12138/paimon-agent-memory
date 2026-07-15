@@ -58,6 +58,7 @@ public final class PaimonChatRepository implements ChatRepository {
             "global-index.btree.index-column";
     private static final String MORAX_BTREE_INDEX_COLUMN = "session_id";
     private static final String SUBAGENT_SOURCE_JSON_COLUMN = "subagent_source_json";
+    private static final String PROJECTLESS_COLUMN = "projectless";
 
     private final AgentConfiguration configuration;
     private final ProjectConfig project;
@@ -132,7 +133,7 @@ public final class PaimonChatRepository implements ChatRepository {
             validateSessionsTableForUpgrade(sessionsTable);
             validateMessagesTable(messagesTable);
             validateTableOwnership(true);
-            ensureSessionsSubagentSourceColumn(sessionsIdentifier);
+            ensureSessionsMetadataColumns(sessionsIdentifier);
         }
         validateSessionsTable(sessionsTable);
         validateMessagesTable(messagesTable);
@@ -351,14 +352,19 @@ public final class PaimonChatRepository implements ChatRepository {
     }
 
     private Schema sessionsSchema() {
-        return sessionsSchema(true);
+        return sessionsSchema(true, true);
+    }
+
+    private Schema sessionsSchemaWithSubagentSource() {
+        return sessionsSchema(true, false);
     }
 
     private Schema legacySessionsSchema() {
-        return sessionsSchema(false);
+        return sessionsSchema(false, false);
     }
 
-    private Schema sessionsSchema(boolean includeSubagentSource) {
+    private Schema sessionsSchema(
+            boolean includeSubagentSource, boolean includeProjectless) {
         Schema.Builder builder =
                 Schema.newBuilder()
                 .column("source_type", DataTypes.STRING())
@@ -377,6 +383,9 @@ public final class PaimonChatRepository implements ChatRepository {
                 .column("ingested_at", DataTypes.TIMESTAMP(3));
         if (includeSubagentSource) {
             builder.column(SUBAGENT_SOURCE_JSON_COLUMN, DataTypes.STRING());
+        }
+        if (includeProjectless) {
+            builder.column(PROJECTLESS_COLUMN, DataTypes.BOOLEAN());
         }
         return builder
                 .primaryKey("source_type", "session_id")
@@ -406,17 +415,27 @@ public final class PaimonChatRepository implements ChatRepository {
                 .build();
     }
 
-    private void ensureSessionsSubagentSourceColumn(Identifier sessionsIdentifier)
+    private void ensureSessionsMetadataColumns(Identifier sessionsIdentifier)
             throws Exception {
-        boolean present =
+        Set<String> columns =
                 sessionsTable.rowType().getFields().stream()
-                        .anyMatch(field -> SUBAGENT_SOURCE_JSON_COLUMN.equals(field.name()));
-        if (!present) {
+                        .map(DataField::name)
+                        .collect(java.util.stream.Collectors.toSet());
+        List<SchemaChange> changes = new ArrayList<>();
+        if (!columns.contains(SUBAGENT_SOURCE_JSON_COLUMN)) {
+            changes.add(
+                    SchemaChange.addColumn(
+                            SUBAGENT_SOURCE_JSON_COLUMN, DataTypes.STRING()));
+        }
+        if (!columns.contains(PROJECTLESS_COLUMN)) {
+            changes.add(
+                    SchemaChange.addColumn(
+                            PROJECTLESS_COLUMN, DataTypes.BOOLEAN()));
+        }
+        if (!changes.isEmpty()) {
             catalog.alterTable(
                     sessionsIdentifier,
-                    Collections.singletonList(
-                            SchemaChange.addColumn(
-                                    SUBAGENT_SOURCE_JSON_COLUMN, DataTypes.STRING())),
+                    changes,
                     false);
             sessionsTable = catalog.getTable(sessionsIdentifier);
 
@@ -499,7 +518,8 @@ public final class PaimonChatRepository implements ChatRepository {
                 timestamp(session.updatedAt()),
                 timestamp(session.lastMessageAt()),
                 timestamp(session.ingestedAt()),
-                string(session.subagentSourceJson()));
+                string(session.subagentSourceJson()),
+                session.projectless());
     }
 
     private static GenericRow toMessageRow(ChatMessage message) {
@@ -538,7 +558,8 @@ public final class PaimonChatRepository implements ChatRepository {
                 nullableTimestamp(row, 11),
                 nullableTimestamp(row, 12),
                 nullableTimestamp(row, 13),
-                nullableString(row, 14));
+                nullableString(row, 14),
+                row.isNullAt(15) ? null : row.getBoolean(15));
     }
 
     private static ChatMessage fromMessageRow(InternalRow row) {
@@ -590,9 +611,12 @@ public final class PaimonChatRepository implements ChatRepository {
         validateSessionsTableStructure(table);
         RowType actual = table.rowType();
         if (!rowTypeMatches(actual, sessionsSchema().rowType())
+                && !rowTypeMatches(actual, sessionsSchemaWithSubagentSource().rowType())
                 && !rowTypeMatches(actual, legacySessionsSchema().rowType())) {
             throw new IllegalStateException(
-                    "ai_chat_sessions row type must be the current schema or the legacy schema without "
+                    "ai_chat_sessions row type must be the current schema or a supported legacy schema without "
+                            + PROJECTLESS_COLUMN
+                            + " and/or "
                             + SUBAGENT_SOURCE_JSON_COLUMN
                             + ", but found "
                             + actual);

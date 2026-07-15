@@ -88,6 +88,11 @@ class DashboardServerTest {
                 .contains("\"use strict\"")
                 .contains("/api")
                 .contains("selectSession")
+                .contains("groupSessionsByProject")
+                .contains("isStandaloneTaskSession")
+                .contains("Documents[\\\\/]Codex")
+                .contains("label: \"Tasks\"")
+                .contains("projectGroups.concat(tasks)")
                 .contains("prepareConversationSelection")
                 .contains("loadOlderMessages")
                 .contains("PREFERRED_CONVERSATION_PAGE_SIZE = 100")
@@ -157,6 +162,7 @@ class DashboardServerTest {
         assertThat(session.path("sessionId").asText()).isEqualTo("session-1");
         assertThat(session.path("title").asText()).isEqualTo("Demo session");
         assertThat(session.path("archived").asBoolean()).isFalse();
+        assertThat(session.path("projectless").asBoolean()).isTrue();
         assertThat(session.path("storageStatus").asText()).isEqualTo("uploaded");
         assertThat(dataStore.lastSessionQuery.getSourceType()).isEqualTo("codex");
         assertThat(dataStore.lastSessionQuery.getSearch()).isEqualTo("demo");
@@ -469,7 +475,10 @@ class DashboardServerTest {
                             CREATED_AT,
                             CREATED_AT.plusSeconds(1),
                             CREATED_AT.plusSeconds(2),
-                            INGESTED_AT);
+                            INGESTED_AT,
+                            null,
+                            true,
+                            DashboardStorageStatus.UPLOADED);
             return new DashboardPage<>(
                     Collections.singletonList(session),
                     query.getPage(),

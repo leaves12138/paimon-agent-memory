@@ -49,6 +49,7 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
     private final Path codexHome;
     private final Path stateDatabase;
     private final Path sessionIndex;
+    private final Path globalState;
     private final Path targetProject;
     private final ObjectMapper objectMapper;
     private final Map<String, Path> existingRollouts = new HashMap<>();
@@ -68,6 +69,9 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
         this.sessionIndex =
                 RestoreFiles.resolveContainedFile(
                         this.codexHome, Paths.get("session_index.jsonl"));
+        this.globalState =
+                RestoreFiles.resolveContainedFile(
+                        this.codexHome, Paths.get(".codex-global-state.json"));
         this.targetProject = canonicalProject(targetProject, "Codex target project");
         this.objectMapper = objectMapper;
         if (Files.isSymbolicLink(this.stateDatabase)
@@ -218,18 +222,31 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
 
         boolean committed = false;
         SessionIndexBackup sessionIndexBackup = null;
+        GlobalStateBackup globalStateBackup = null;
         try {
             RestoreFiles.writeLinesAtomically(rollout, rolloutLines);
-            if (subagentMetadata(session) == null) {
+            boolean visibleRoot = subagentMetadata(session) == null;
+            if (visibleRoot) {
                 sessionIndexBackup = backupSessionIndex();
                 upsertSessionIndex(
                         session.key().sessionId(),
                         isBlank(session.title()) ? preview : session.title(),
                         updatedAt);
             }
+            if (visibleRoot && session.projectless() != null) {
+                globalStateBackup = backupGlobalState();
+                updateProjectlessState(session.key().sessionId(), session.projectless());
+            }
             upsertThread(session, rollout, cwd, preview, createdAt, updatedAt, overwrite);
             committed = true;
         } catch (Exception failure) {
+            if (globalStateBackup != null) {
+                try {
+                    rollbackGlobalState(globalStateBackup);
+                } catch (Exception rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                }
+            }
             if (sessionIndexBackup != null) {
                 try {
                     rollbackSessionIndex(sessionIndexBackup);
@@ -244,6 +261,9 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
             }
             throw failure;
         } finally {
+            if (committed && globalStateBackup != null) {
+                deleteBackupQuietly(globalStateBackup.backup);
+            }
             if (committed && sessionIndexBackup != null) {
                 deleteBackupQuietly(sessionIndexBackup.backup);
             }
@@ -251,6 +271,105 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
                 deleteBackupQuietly(backup);
             }
         }
+    }
+
+    private GlobalStateBackup backupGlobalState() throws IOException {
+        requireRegularOrMissingGlobalState();
+        boolean existed =
+                Files.exists(globalState, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        if (!existed) {
+            return new GlobalStateBackup(false, null);
+        }
+        Path backup =
+                Files.createTempFile(
+                        codexHome, ".paimon-agent-global-state-backup-", ".json");
+        try {
+            Files.copy(
+                    globalState,
+                    backup,
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.COPY_ATTRIBUTES);
+            RestoreFiles.setOwnerOnlyFilePermissions(backup);
+            return new GlobalStateBackup(true, backup);
+        } catch (IOException failure) {
+            try {
+                Files.deleteIfExists(backup);
+            } catch (IOException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
+    }
+
+    private void updateProjectlessState(String sessionId, boolean projectless)
+            throws Exception {
+        requireRegularOrMissingGlobalState();
+        ObjectNode state;
+        if (Files.exists(globalState, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            JsonNode parsed = objectMapper.readTree(globalState.toFile());
+            if (parsed == null || !parsed.isObject()) {
+                throw new IOException(
+                        "Codex global state must contain a JSON object: " + globalState);
+            }
+            state = (ObjectNode) parsed;
+        } else {
+            state = objectMapper.createObjectNode();
+        }
+
+        JsonNode existing = state.get("projectless-thread-ids");
+        if (existing != null && !existing.isNull() && !existing.isArray()) {
+            throw new IOException(
+                    "Codex global state field projectless-thread-ids must be an array: "
+                            + globalState);
+        }
+
+        ArrayNode updated = objectMapper.createArrayNode();
+        Set<String> seen = new HashSet<>();
+        if (existing != null && existing.isArray()) {
+            for (JsonNode value : existing) {
+                if (!value.isTextual()) {
+                    throw new IOException(
+                            "Codex global state field projectless-thread-ids must contain only strings: "
+                                    + globalState);
+                }
+                String id = value.asText();
+                if (!sessionId.equals(id) && seen.add(id)) {
+                    updated.add(id);
+                }
+            }
+        }
+        if (projectless) {
+            updated.add(sessionId);
+        }
+        state.set("projectless-thread-ids", updated);
+        RestoreFiles.writeLinesAtomically(
+                globalState,
+                Collections.singletonList(objectMapper.writeValueAsString(state)));
+    }
+
+    private void requireRegularOrMissingGlobalState() throws IOException {
+        if (Files.isSymbolicLink(globalState)) {
+            throw new IOException(
+                    "Codex global state must not be a symbolic link: " + globalState);
+        }
+        if (Files.exists(globalState, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                && !Files.isRegularFile(
+                        globalState, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException(
+                    "Codex global state is not a regular file: " + globalState);
+        }
+    }
+
+    private void rollbackGlobalState(GlobalStateBackup backup) throws IOException {
+        if (!backup.existed) {
+            Files.deleteIfExists(globalState);
+            return;
+        }
+        if (backup.backup == null || !Files.exists(backup.backup)) {
+            throw new IOException(
+                    "Codex global state backup disappeared before rollback: " + globalState);
+        }
+        moveReplacing(backup.backup, globalState);
     }
 
     private SessionIndexBackup backupSessionIndex() throws IOException {
@@ -358,6 +477,16 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
         private final Path backup;
 
         private SessionIndexBackup(boolean existed, Path backup) {
+            this.existed = existed;
+            this.backup = backup;
+        }
+    }
+
+    private static final class GlobalStateBackup {
+        private final boolean existed;
+        private final Path backup;
+
+        private GlobalStateBackup(boolean existed, Path backup) {
             this.existed = existed;
             this.backup = backup;
         }

@@ -20,6 +20,7 @@ public final class DashboardSession {
     private final Instant lastMessageAt;
     private final Instant ingestedAt;
     private final String subagentSourceJson;
+    private final Boolean projectless;
     private final DashboardStorageStatus storageStatus;
 
     public DashboardSession(
@@ -110,6 +111,44 @@ public final class DashboardSession {
             Instant ingestedAt,
             String subagentSourceJson,
             DashboardStorageStatus storageStatus) {
+        this(
+                sourceType,
+                sessionId,
+                title,
+                cwd,
+                archived,
+                sourcePath,
+                sourceCursor,
+                lastCommitId,
+                pendingCommitId,
+                pendingCursor,
+                createdAt,
+                updatedAt,
+                lastMessageAt,
+                ingestedAt,
+                subagentSourceJson,
+                null,
+                storageStatus);
+    }
+
+    public DashboardSession(
+            String sourceType,
+            String sessionId,
+            String title,
+            String cwd,
+            boolean archived,
+            String sourcePath,
+            String sourceCursor,
+            long lastCommitId,
+            Long pendingCommitId,
+            String pendingCursor,
+            Instant createdAt,
+            Instant updatedAt,
+            Instant lastMessageAt,
+            Instant ingestedAt,
+            String subagentSourceJson,
+            Boolean projectless,
+            DashboardStorageStatus storageStatus) {
         this.sourceType = sourceType;
         this.sessionId = sessionId;
         this.title = title;
@@ -125,6 +164,7 @@ public final class DashboardSession {
         this.lastMessageAt = lastMessageAt;
         this.ingestedAt = ingestedAt;
         this.subagentSourceJson = subagentSourceJson;
+        this.projectless = projectless;
         this.storageStatus = storageStatus;
     }
 
@@ -186,6 +226,10 @@ public final class DashboardSession {
 
     public String getSubagentSourceJson() {
         return subagentSourceJson;
+    }
+
+    public Boolean getProjectless() {
+        return projectless;
     }
 
     public DashboardStorageStatus getStorageStatus() {

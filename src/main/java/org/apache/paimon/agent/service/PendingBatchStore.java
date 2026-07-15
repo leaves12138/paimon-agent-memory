@@ -36,7 +36,7 @@ import java.util.Set;
 public final class PendingBatchStore {
 
     private static final int MAGIC = 0x5041494d;
-    private static final int VERSION = 3;
+    private static final int VERSION = 4;
     private static final int MIN_SUPPORTED_VERSION = 2;
     private static final int MAX_COLLECTION_ENTRIES = 10_000_000;
     private static final int CHECKSUM_BYTES = 32;
@@ -236,6 +236,10 @@ public final class PendingBatchStore {
         writeInstant(output, session.lastMessageAt());
         writeInstant(output, session.ingestedAt());
         writeString(output, session.subagentSourceJson());
+        output.writeBoolean(session.projectless() != null);
+        if (session.projectless() != null) {
+            output.writeBoolean(session.projectless());
+        }
     }
 
     private static ChatSession readSession(DataInputStream input, long fileSize, int version)
@@ -256,6 +260,8 @@ public final class PendingBatchStore {
         Instant ingestedAt = readInstant(input);
         String subagentSourceJson =
                 version >= 3 ? readString(input, fileSize) : null;
+        Boolean projectless =
+                version >= 4 && input.readBoolean() ? input.readBoolean() : null;
         return new ChatSession(
                 key,
                 title,
@@ -270,7 +276,8 @@ public final class PendingBatchStore {
                 updatedAt,
                 lastMessageAt,
                 ingestedAt,
-                subagentSourceJson);
+                subagentSourceJson,
+                projectless);
     }
 
     private static void writeMessage(DataOutputStream output, ChatMessage message)

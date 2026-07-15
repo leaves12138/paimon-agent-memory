@@ -812,7 +812,8 @@ class CollectorServiceTest {
                         Instant.EPOCH,
                         Instant.EPOCH,
                         Instant.EPOCH,
-                        "{\"thread_spawn\":{\"parent_thread_id\":\"root\",\"depth\":1}}");
+                        "{\"thread_spawn\":{\"parent_thread_id\":\"root\",\"depth\":1}}")
+                        .withProjectless(true);
         ChatMessage message =
                 new ChatMessage(
                         "wal-message",
@@ -923,6 +924,13 @@ class CollectorServiceTest {
                                 .session()
                                 .subagentSourceJson())
                 .isEqualTo(session.subagentSourceJson());
+        assertThat(
+                        restartedRepository
+                                .committedBatches
+                                .get(0)
+                                .session()
+                                .projectless())
+                .isTrue();
         assertThat(
                         restartedRepository
                                 .committedBatches

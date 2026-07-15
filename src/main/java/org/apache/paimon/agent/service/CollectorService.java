@@ -411,7 +411,8 @@ public final class CollectorService implements AutoCloseable {
                 || !Objects.equals(previous.updatedAt(), current.updatedAt())
                 || !Objects.equals(previous.lastMessageAt(), current.lastMessageAt())
                 || !Objects.equals(
-                        previous.subagentSourceJson(), current.subagentSourceJson());
+                        previous.subagentSourceJson(), current.subagentSourceJson())
+                || !Objects.equals(previous.projectless(), current.projectless());
     }
 
     private void merge(SessionBatch batch) {

@@ -44,6 +44,7 @@ class PaimonChatRepositoryTest {
     private static final Identifier MESSAGES_IDENTIFIER =
             Identifier.create("ai_memory", "ai_chat_messages");
     private static final String SUBAGENT_SOURCE_JSON_COLUMN = "subagent_source_json";
+    private static final String PROJECTLESS_COLUMN = "projectless";
     private static final String MORAX_BTREE_INDEX_ENABLED_OPTION =
             "morax.btree-index.enabled";
     private static final String MORAX_BTREE_INDEX_COLUMN_OPTION =
@@ -52,12 +53,12 @@ class PaimonChatRepositoryTest {
     @TempDir Path tempDir;
 
     @Test
-    void createsSessionsTableWithNullableSubagentSourceColumn() throws Exception {
+    void createsSessionsTableWithNullableMetadataColumns() throws Exception {
         try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
             repository.initialize();
             assertThat(repository.sessionsTableForRead().rowType().getFields())
                     .extracting(field -> field.name())
-                    .endsWith(SUBAGENT_SOURCE_JSON_COLUMN);
+                    .endsWith(SUBAGENT_SOURCE_JSON_COLUMN, PROJECTLESS_COLUMN);
             assertThat(
                             repository
                                     .sessionsTableForRead()
@@ -67,11 +68,20 @@ class PaimonChatRepositoryTest {
                                     .type()
                                     .isNullable())
                     .isTrue();
+            assertThat(
+                            repository
+                                    .sessionsTableForRead()
+                                    .rowType()
+                                    .getFields()
+                                    .get(15)
+                                    .type()
+                                    .isNullable())
+                    .isTrue();
         }
     }
 
     @Test
-    void onlyTheOwningWriterAddsSubagentColumnToLegacySessionsTable() throws Exception {
+    void onlyTheOwningWriterAddsMetadataColumnsToLegacySessionsTable() throws Exception {
         SessionKey key = new SessionKey("codex", "legacy-root");
         Instant instant = Instant.parse("2026-01-01T00:00:00Z");
         try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
@@ -82,16 +92,16 @@ class PaimonChatRepositoryTest {
                             new SessionBatch(
                                     session(key, instant, instant), Collections.emptyList())));
         }
-        dropSubagentSourceColumn();
-        assertSubagentSourceColumnAbsent();
+        dropSessionMetadataColumns();
+        assertSessionMetadataColumnsAbsent();
 
         try (PaimonChatRepository restoreReader =
                 new PaimonChatRepository(configuration("restore-machine"))) {
             assertThatThrownBy(restoreReader::initializeForRestore)
                     .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining(SUBAGENT_SOURCE_JSON_COLUMN);
+                    .hasMessageContaining(PROJECTLESS_COLUMN);
         }
-        assertSubagentSourceColumnAbsent();
+        assertSessionMetadataColumnsAbsent();
 
         try (PaimonChatRepository foreignWriter =
                 new PaimonChatRepository(configuration("another-writer"))) {
@@ -99,14 +109,39 @@ class PaimonChatRepositoryTest {
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("only one writer per table pair");
         }
-        assertSubagentSourceColumnAbsent();
+        assertSessionMetadataColumnsAbsent();
 
         try (PaimonChatRepository owningWriter = new PaimonChatRepository(configuration())) {
             owningWriter.initialize();
             assertThat(owningWriter.sessionsTableForRead().rowType().getFields())
                     .extracting(field -> field.name())
-                    .endsWith(SUBAGENT_SOURCE_JSON_COLUMN);
+                    .endsWith(SUBAGENT_SOURCE_JSON_COLUMN, PROJECTLESS_COLUMN);
             assertThat(owningWriter.loadSessions().get(key).subagentSourceJson()).isNull();
+            assertThat(owningWriter.loadSessions().get(key).projectless()).isNull();
+        }
+    }
+
+    @Test
+    void owningWriterAddsProjectlessColumnToPreviousSessionsSchema() throws Exception {
+        try (PaimonChatRepository repository = new PaimonChatRepository(configuration())) {
+            repository.initialize();
+        }
+        dropProjectlessColumn();
+        assertProjectlessColumnAbsent();
+
+        try (PaimonChatRepository restoreReader =
+                new PaimonChatRepository(configuration("restore-machine"))) {
+            assertThatThrownBy(restoreReader::initializeForRestore)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining(PROJECTLESS_COLUMN);
+        }
+        assertProjectlessColumnAbsent();
+
+        try (PaimonChatRepository owningWriter = new PaimonChatRepository(configuration())) {
+            owningWriter.initialize();
+            assertThat(owningWriter.sessionsTableForRead().rowType().getFields())
+                    .extracting(field -> field.name())
+                    .endsWith(SUBAGENT_SOURCE_JSON_COLUMN, PROJECTLESS_COLUMN);
         }
     }
 
@@ -168,7 +203,8 @@ class PaimonChatRepositoryTest {
                         createdAt,
                         createdAt,
                         ingestedAt,
-                        "{\"thread_spawn\":{\"parent_thread_id\":\"root\",\"depth\":1}}");
+                        "{\"thread_spawn\":{\"parent_thread_id\":\"root\",\"depth\":1}}")
+                        .withProjectless(true);
         ChatMessage selectedMessage =
                 new ChatMessage(
                         "m1",
@@ -210,6 +246,7 @@ class PaimonChatRepositoryTest {
             assertThat(repository.loadSessions().get(selectedKey).pendingCursor()).isNull();
             assertThat(repository.loadSessions().get(selectedKey).subagentSourceJson())
                     .isEqualTo(selectedSession.subagentSourceJson());
+            assertThat(repository.loadSessions().get(selectedKey).projectless()).isTrue();
 
             List<ChatMessage> selected = new ArrayList<>();
             repository.forEachMessage(
@@ -342,21 +379,40 @@ class PaimonChatRepositoryTest {
         }
     }
 
-    private void dropSubagentSourceColumn() throws Exception {
+    private void dropSessionMetadataColumns() throws Exception {
         try (Catalog catalog = localCatalog()) {
             catalog.alterTable(
                     SESSIONS_IDENTIFIER,
-                    Collections.singletonList(
+                    Arrays.asList(
+                            SchemaChange.dropColumn(PROJECTLESS_COLUMN),
                             SchemaChange.dropColumn(SUBAGENT_SOURCE_JSON_COLUMN)),
                     false);
         }
     }
 
-    private void assertSubagentSourceColumnAbsent() throws Exception {
+    private void assertSessionMetadataColumnsAbsent() throws Exception {
         try (Catalog catalog = localCatalog()) {
             assertThat(catalog.getTable(SESSIONS_IDENTIFIER).rowType().getFields())
                     .extracting(field -> field.name())
-                    .doesNotContain(SUBAGENT_SOURCE_JSON_COLUMN);
+                    .doesNotContain(SUBAGENT_SOURCE_JSON_COLUMN, PROJECTLESS_COLUMN);
+        }
+    }
+
+    private void dropProjectlessColumn() throws Exception {
+        try (Catalog catalog = localCatalog()) {
+            catalog.alterTable(
+                    SESSIONS_IDENTIFIER,
+                    Collections.singletonList(SchemaChange.dropColumn(PROJECTLESS_COLUMN)),
+                    false);
+        }
+    }
+
+    private void assertProjectlessColumnAbsent() throws Exception {
+        try (Catalog catalog = localCatalog()) {
+            assertThat(catalog.getTable(SESSIONS_IDENTIFIER).rowType().getFields())
+                    .extracting(field -> field.name())
+                    .doesNotContain(PROJECTLESS_COLUMN)
+                    .contains(SUBAGENT_SOURCE_JSON_COLUMN);
         }
     }
 

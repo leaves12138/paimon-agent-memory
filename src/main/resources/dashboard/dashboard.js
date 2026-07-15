@@ -570,8 +570,22 @@
 
   function groupSessionsByProject(items) {
     const groups = new Map();
+    let tasks = null;
     items.forEach(function (item) {
       const cwd = displayValue(item.cwd, "").trim().replace(/[\\/]+$/, "");
+      if (isStandaloneTaskSession(item, cwd)) {
+        if (!tasks) {
+          tasks = {
+            key: "\u0000tasks",
+            cwd: "",
+            label: "Tasks",
+            isTasks: true,
+            items: []
+          };
+        }
+        tasks.items.push(item);
+        return;
+      }
       const key = cwd || "\u0000other";
       let group = groups.get(key);
       if (!group) {
@@ -586,20 +600,42 @@
       }
       group.items.push(item);
     });
-    return Array.from(groups.values());
+    const projectGroups = Array.from(groups.values());
+    return tasks ? projectGroups.concat(tasks) : projectGroups;
+  }
+
+  function isStandaloneTaskSession(item, cwd) {
+    if (displayValue(item && item.sourceType, "").trim().toLowerCase() !== "codex") {
+      return false;
+    }
+    if (item && item.projectless === true) {
+      return true;
+    }
+    if (item && item.projectless === false) {
+      return false;
+    }
+    if (!cwd) {
+      return true;
+    }
+    // Codex creates these dated workspaces for conversations that are not attached to a project.
+    return /(?:^|[\\/])Documents[\\/]Codex[\\/]\d{4}-\d{2}-\d{2}[\\/][^\\/]+$/.test(cwd);
   }
 
   function buildSessionGroup(group) {
-    const wrapper = element("li", "project-group");
+    const wrapper = element("li", "project-group" + (group.isTasks ? " is-tasks" : ""));
     const section = element("section", "project-section");
     section.setAttribute("aria-label", group.label);
 
-    const heading = element("div", "project-heading");
-    const folder = element("span", "project-folder");
-    folder.setAttribute("aria-hidden", "true");
+    const heading = element("div", "project-heading" + (group.isTasks ? " task-heading" : ""));
     const title = element("h2", "project-title", group.label);
     title.title = group.cwd || group.label;
-    heading.append(folder, title);
+    if (group.isTasks) {
+      heading.appendChild(title);
+    } else {
+      const folder = element("span", "project-folder");
+      folder.setAttribute("aria-hidden", "true");
+      heading.append(folder, title);
+    }
 
     const list = element("ul", "project-session-list");
     const selectedIndex = group.items.findIndex(function (item) {

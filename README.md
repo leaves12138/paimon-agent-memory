@@ -30,6 +30,7 @@ This is a normal primary-key table containing the current sidebar state. Its pri
 | `last_message_at` | TIMESTAMP(3) | Last collected message time |
 | `ingested_at` | TIMESTAMP(3) | Collector update time |
 | `subagent_source_json` | STRING | Native Codex subagent metadata; null for visible root sessions and Claude |
+| `projectless` | BOOLEAN | Native Codex no-project state; null when the client state is unavailable or for unsupported sources |
 
 ### `ai_chat_messages`
 
@@ -158,8 +159,10 @@ The conversation view merges the collector's current in-memory batch with rows a
 Paimon. Sessions with a new local increment are marked `有待提交更新`, while individual messages
 are marked `待上传` or `已上传`. Pending attachment bytes can be previewed through the same
 size-limited, loopback-only endpoint. Codex subagent threads are hidden from the session sidebar,
-matching the native Codex task list. A standalone Dashboard has no access to another process's
-in-memory batch and therefore shows Paimon rows only.
+matching the native Codex task list. Codex conversations created without a project are collected
+under one final `Tasks` section instead of treating their generated dated workspace names as
+projects. A standalone Dashboard has no access to another process's in-memory batch and therefore
+shows Paimon rows only.
 
 After starting the service, open the Dashboard directly with either loopback URL:
 
@@ -269,10 +272,10 @@ with mode `0600`; the `config/` and `data/` directories use mode `0700`. Tar own
 to `root:root`; when a non-root user extracts the package, the files are owned by that user instead.
 
 When upgrading a version-1 installation whose `ai_chat_sessions` table predates
-`subagent_source_json`, stop the old daemon and start the new collector first with the same
-`collector.id`. The owning writer validates both tables, adds the nullable column, and backfills
-Codex metadata. Run standalone `dashboard` or `restore` commands only after that writer upgrade has
-completed; read-only commands deliberately never alter the table schema.
+`subagent_source_json` or `projectless`, stop the old daemon and start the new collector first with
+the same `collector.id`. The owning writer validates both tables, adds the missing nullable
+columns, and backfills Codex metadata. Run standalone `dashboard` or `restore` commands only after
+that writer upgrade has completed; read-only commands deliberately never alter the table schema.
 
 The control script keeps the PID, process log, exact pending-commit WAL, and local restore/cache
 data under `data/`:
@@ -307,9 +310,11 @@ For Codex, start and stop Codex once on the destination machine before the first
 restore command requires Codex's officially initialized `~/.codex/state_5.sqlite`; it will not
 create a partial replacement database. It writes a native rollout JSONL, a matching SQLite row,
 and the root task's formal title in `session_index.jsonl`; worker subagents remain absent from that
-sidebar index. The SQLite `title` and session-index `thread_name` use the stored formal title, while
-`first_user_message` and `preview` remain the actual first user prompt. The original `response_item`
-events remain intact, while the restore adds deterministic
+sidebar index. For visible root tasks whose project state was collected, restore also updates
+Codex's `projectless-thread-ids`, so no-project conversations remain under `Tasks`. The SQLite
+`title` and session-index `thread_name` use the stored formal title, while `first_user_message` and
+`preview` remain the actual first user prompt. The original `response_item` events remain intact,
+while the restore adds deterministic
 `task_started`, `user_message`, `agent_message`, and `task_complete` wrappers so Codex can rebuild
 browsable turns. When `--overwrite` is used, the old rollout and title index are privately backed
 up and restored if the SQLite update fails. `--target-project` rewrites the restored cwd; otherwise

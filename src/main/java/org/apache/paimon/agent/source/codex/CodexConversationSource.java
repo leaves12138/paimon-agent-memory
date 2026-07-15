@@ -22,11 +22,14 @@ import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.nio.channels.Channels;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileTime;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -113,6 +116,7 @@ public final class CodexConversationSource implements ConversationSource {
         applyCanonicalRolloutMetadata(threads);
         addUnindexedRollouts(threads);
         applyThreadNames(threads);
+        applyProjectlessState(threads, loadProjectlessThreadIds());
         List<CodexThread> ordered =
                 threads.values().stream()
                         .sorted(
@@ -372,6 +376,10 @@ public final class CodexConversationSource implements ConversationSource {
                 thread.sessionSourceKnown
                         ? thread.subagentSourceJson
                         : previous == null ? null : previous.subagentSourceJson();
+        Boolean projectless =
+                thread.projectless != null
+                        ? thread.projectless
+                        : previous == null ? null : previous.projectless();
         ChatSession session =
                 new ChatSession(
                         key,
@@ -381,11 +389,14 @@ public final class CodexConversationSource implements ConversationSource {
                         thread.rolloutPath.toAbsolutePath().normalize().toString(),
                         SourceCursors.file(processedOffset, currentFileKey, lastAnchor),
                         lastCommitId,
+                        null,
+                        null,
                         createdAt,
                         updatedAt,
                         lastMessageAt,
                         now,
-                        subagentSourceJson);
+                        subagentSourceJson,
+                        projectless);
 
         boolean cursorChanged = processedOffset != startOffset;
         boolean pendingBoundaryReached =
@@ -608,6 +619,60 @@ public final class CodexConversationSource implements ConversationSource {
             return java.util.Collections.emptyMap();
         }
         return result;
+    }
+
+    private void applyProjectlessState(
+            Map<String, CodexThread> threads, Set<String> projectlessThreadIds) {
+        if (projectlessThreadIds == null) {
+            return;
+        }
+        for (Map.Entry<String, CodexThread> entry : new ArrayList<>(threads.entrySet())) {
+            CodexThread thread = entry.getValue();
+            threads.put(
+                    entry.getKey(),
+                    thread.withProjectless(projectlessThreadIds.contains(thread.sessionId)));
+        }
+    }
+
+    /**
+     * Returns the authoritative projectless thread set, or {@code null} when the global state is
+     * unavailable or cannot be trusted. A known empty array is intentionally different from an
+     * unknown state: it marks every captured thread as project-backed.
+     */
+    private Set<String> loadProjectlessThreadIds() {
+        Path state = codexHome.resolve(".codex-global-state.json");
+        if (!Files.isRegularFile(state, LinkOption.NOFOLLOW_LINKS)) {
+            return null;
+        }
+        try (SeekableByteChannel channel =
+                        Files.newByteChannel(
+                                state, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+                BufferedReader reader =
+                        new BufferedReader(
+                                Channels.newReader(
+                                        channel, StandardCharsets.UTF_8.newDecoder(), -1))) {
+            JsonNode root = objectMapper.readTree(reader);
+            JsonNode ids =
+                    root == null || !root.isObject()
+                            ? null
+                            : root.get("projectless-thread-ids");
+            if (ids == null || !ids.isArray()) {
+                return null;
+            }
+            Set<String> result = new HashSet<>();
+            for (JsonNode id : ids) {
+                if (!id.isTextual() || isBlank(id.asText())) {
+                    return null;
+                }
+                result.add(id.asText());
+            }
+            return result;
+        } catch (Exception e) {
+            // This file is maintained by the desktop app and may be replaced while a scan starts.
+            // Treat an unreadable snapshot as unknown rather than interrupting conversation ingest.
+            LOG.debug("Unable to read Codex projectless thread state from {}", state, e);
+            return null;
+        }
     }
 
     private CodexThread discoverThread(Path path, boolean archived) {
@@ -883,7 +948,8 @@ public final class CodexConversationSource implements ConversationSource {
                 || !java.util.Objects.equals(previous.sourcePath(), current.sourcePath())
                 || !java.util.Objects.equals(previous.updatedAt(), current.updatedAt())
                 || !java.util.Objects.equals(
-                        previous.subagentSourceJson(), current.subagentSourceJson());
+                        previous.subagentSourceJson(), current.subagentSourceJson())
+                || !java.util.Objects.equals(previous.projectless(), current.projectless());
     }
 
     private static long nullableLong(ResultSet rows, String millisColumn, String secondsColumn)
@@ -1037,6 +1103,7 @@ public final class CodexConversationSource implements ConversationSource {
         private final Instant updatedAt;
         private final String subagentSourceJson;
         private final boolean sessionSourceKnown;
+        private final Boolean projectless;
 
         private CodexThread(
                 String sessionId,
@@ -1048,6 +1115,30 @@ public final class CodexConversationSource implements ConversationSource {
                 Instant updatedAt,
                 String subagentSourceJson,
                 boolean sessionSourceKnown) {
+            this(
+                    sessionId,
+                    rolloutPath,
+                    title,
+                    cwd,
+                    archived,
+                    createdAt,
+                    updatedAt,
+                    subagentSourceJson,
+                    sessionSourceKnown,
+                    null);
+        }
+
+        private CodexThread(
+                String sessionId,
+                Path rolloutPath,
+                String title,
+                String cwd,
+                boolean archived,
+                Instant createdAt,
+                Instant updatedAt,
+                String subagentSourceJson,
+                boolean sessionSourceKnown,
+                Boolean projectless) {
             this.sessionId = sessionId;
             this.rolloutPath = rolloutPath;
             this.title = title;
@@ -1057,6 +1148,7 @@ public final class CodexConversationSource implements ConversationSource {
             this.updatedAt = updatedAt;
             this.subagentSourceJson = subagentSourceJson;
             this.sessionSourceKnown = sessionSourceKnown;
+            this.projectless = projectless;
         }
 
         private CodexThread withSessionSource(String value) {
@@ -1069,7 +1161,8 @@ public final class CodexConversationSource implements ConversationSource {
                     createdAt,
                     updatedAt,
                     value,
-                    true);
+                    true,
+                    projectless);
         }
 
         private CodexThread withTitle(String value, Instant titleUpdatedAt) {
@@ -1087,7 +1180,22 @@ public final class CodexConversationSource implements ConversationSource {
                     createdAt,
                     mergedUpdatedAt,
                     subagentSourceJson,
-                    sessionSourceKnown);
+                    sessionSourceKnown,
+                    projectless);
+        }
+
+        private CodexThread withProjectless(boolean value) {
+            return new CodexThread(
+                    sessionId,
+                    rolloutPath,
+                    title,
+                    cwd,
+                    archived,
+                    createdAt,
+                    updatedAt,
+                    subagentSourceJson,
+                    sessionSourceKnown,
+                    value);
         }
 
         private Instant updatedAt() {

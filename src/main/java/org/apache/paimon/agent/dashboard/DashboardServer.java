@@ -412,6 +412,7 @@ public final class DashboardServer implements AutoCloseable {
         value.put("updatedAt", instant(session.getUpdatedAt()));
         value.put("lastMessageAt", instant(session.getLastMessageAt()));
         value.put("ingestedAt", instant(session.getIngestedAt()));
+        value.put("projectless", session.getProjectless());
         value.put("storageStatus", session.getStorageStatus().apiValue());
         return value;
     }

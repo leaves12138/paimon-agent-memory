@@ -71,7 +71,7 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
     private static final long MESSAGE_CACHE_PREVIEW_CHARS = 16L * 1024L * 1024L;
 
     private static final int[] SESSION_COLUMNS =
-            new int[] {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+            new int[] {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
     private static final int[] SESSION_OVERVIEW_COLUMNS = new int[] {0, 4, 8, 13};
     // Deliberately excludes column 7 (attachments / ARRAY<BLOB>).
     private static final int[] MESSAGE_LIST_COLUMNS = new int[] {0, 1, 2, 3, 4, 5, 6, 8, 9};
@@ -973,6 +973,7 @@ public final class PaimonDashboardDataStore implements DashboardDataStore {
                 nullableTimestamp(row, 12),
                 nullableTimestamp(row, 13),
                 nullableString(row, 14),
+                row.isNullAt(15) ? null : row.getBoolean(15),
                 row.isNullAt(8)
                         ? DashboardStorageStatus.UPLOADED
                         : DashboardStorageStatus.PENDING);
