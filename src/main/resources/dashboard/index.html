@@ -135,7 +135,11 @@
 
             <div class="chat-scroll" id="chat-scroll" tabindex="0">
               <div class="chat-history">
-                <button class="button button-quiet load-older-button" id="load-older-messages" type="button" hidden>加载更早消息</button>
+                <div class="older-messages-loading" id="older-messages-loading" role="status" aria-live="polite" hidden>
+                  <span class="loader" aria-hidden="true"></span>
+                  <span>正在加载更早消息…</span>
+                </div>
+                <button class="button button-quiet load-older-button" id="load-older-messages" type="button" hidden>加载失败，重试更早消息</button>
                 <ol class="message-list" id="message-list" role="log" aria-label="聊天历史" aria-live="off"></ol>
 
                 <div class="workspace-state message-state" id="message-loading" role="status" aria-live="polite" hidden>

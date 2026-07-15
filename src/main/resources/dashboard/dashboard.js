@@ -2,6 +2,8 @@
   "use strict";
 
   const API_ROOT = "/api";
+  const PREFERRED_CONVERSATION_PAGE_SIZE = 100;
+  const AUTO_LOAD_OLDER_MIN_THRESHOLD = 320;
   const ALLOWED_IMAGE_TYPES = new Set([
     "image/png",
     "image/jpeg",
@@ -38,7 +40,8 @@
     pagination: {
       configured: false,
       defaultPageSize: 25,
-      maxPageSize: 25
+      maxPageSize: 25,
+      conversationPageSize: 25
     },
     overviewController: null,
     overviewRequest: 0,
@@ -74,8 +77,11 @@
       truncated: false,
       mode: "idle",
       error: null,
+      olderError: null,
       controller: null,
       request: 0,
+      autoLoadFrame: null,
+      restoringScroll: false,
       expandedKey: null,
       showTools: false
     },
@@ -134,6 +140,7 @@
     messageSummary: byId("message-summary"),
     showToolsToggle: byId("show-tools-toggle"),
     chatScroll: byId("chat-scroll"),
+    olderMessagesLoading: byId("older-messages-loading"),
     loadOlderMessages: byId("load-older-messages"),
     messageList: byId("message-list"),
     messageLoading: byId("message-loading"),
@@ -419,16 +426,24 @@
   function configurePagination(defaultValue, maximumValue) {
     const defaultPageSize = positiveWholeNumber(defaultValue, state.pagination.defaultPageSize);
     const maxPageSize = Math.max(defaultPageSize, positiveWholeNumber(maximumValue, defaultPageSize));
+    const conversationPageSize = Math.min(
+      maxPageSize,
+      Math.max(defaultPageSize, PREFERRED_CONVERSATION_PAGE_SIZE)
+    );
     const firstConfiguration = !state.pagination.configured;
     state.pagination.configured = true;
     state.pagination.defaultPageSize = defaultPageSize;
     state.pagination.maxPageSize = maxPageSize;
+    state.pagination.conversationPageSize = conversationPageSize;
     if (firstConfiguration) {
       state.sessions.pageSize = defaultPageSize;
-      state.conversation.pageSize = defaultPageSize;
     } else {
       state.sessions.pageSize = Math.min(state.sessions.pageSize, maxPageSize);
-      state.conversation.pageSize = Math.min(state.conversation.pageSize, maxPageSize);
+    }
+    if (state.conversation.items.length === 0
+        && state.conversation.mode !== "loading"
+        && state.conversation.mode !== "loading-older") {
+      state.conversation.pageSize = conversationPageSize;
     }
   }
 
@@ -649,7 +664,7 @@
     if (changed) {
       cancelMessageDetail();
       state.detailCache.clear();
-      state.conversation.expandedKey = null;
+      prepareConversationSelection(key);
     }
     if (opts.openMobile !== false) {
       document.body.classList.add("is-chat-open");
@@ -663,7 +678,34 @@
     if (opts.openMobile !== false && window.matchMedia("(max-width: 760px)").matches) {
       window.requestAnimationFrame(function () { dom.chatTitle.focus({ preventScroll: true }); });
     }
+    if (!state.pagination.configured) {
+      await loadOverview();
+      if (key !== state.selection.key) {
+        return false;
+      }
+    }
     return loadMessages({ reset: true });
+  }
+
+  function prepareConversationSelection(key) {
+    const conversation = state.conversation;
+    cancelAutoLoadFrame();
+    if (conversation.controller) {
+      conversation.controller.abort();
+    }
+    conversation.controller = null;
+    conversation.request += 1;
+    conversation.sessionKey = key;
+    conversation.items = [];
+    conversation.page = 1;
+    conversation.total = 0;
+    conversation.hasMore = false;
+    conversation.truncated = false;
+    conversation.mode = "loading";
+    conversation.error = null;
+    conversation.olderError = null;
+    conversation.restoringScroll = false;
+    conversation.expandedKey = null;
   }
 
   function leaveConversation() {
@@ -685,19 +727,32 @@
     const opts = options || {};
     const reset = opts.reset !== false;
     const conversation = state.conversation;
+    if (!reset && (conversation.mode === "loading"
+        || conversation.mode === "loading-older"
+        || conversation.restoringScroll
+        || !conversation.hasMore)) {
+      return false;
+    }
+    if (reset) {
+      cancelAutoLoadFrame();
+    }
     if (conversation.controller) {
       conversation.controller.abort();
+    }
+    if (reset && state.pagination.configured) {
+      conversation.pageSize = state.pagination.conversationPageSize;
     }
     const controller = new AbortController();
     const request = ++conversation.request;
     const selectedKey = state.selection.key;
     const requestedPage = reset ? 1 : conversation.page + 1;
-    const anchor = !reset ? captureScrollAnchor() : null;
     conversation.controller = controller;
     conversation.sessionKey = selectedKey;
     conversation.mode = reset ? "loading" : "loading-older";
     conversation.error = null;
+    conversation.olderError = null;
     if (reset) {
+      conversation.restoringScroll = false;
       conversation.items = [];
       conversation.page = 1;
       conversation.total = 0;
@@ -741,12 +796,15 @@
       conversation.truncated = conversation.truncated || payload.truncated === true;
 
       conversation.error = null;
+      conversation.olderError = null;
       conversation.mode = conversation.items.length > 0 ? "ready" : "empty";
+      const anchor = !reset ? captureScrollAnchor() : null;
+      conversation.restoringScroll = !reset;
       renderConversation();
       if (reset) {
-        scrollChatToBottom();
+        scrollChatToBottom(request, selectedKey);
       } else {
-        restoreScrollAnchor(anchor);
+        restoreScrollAnchor(anchor, request, selectedKey);
         dom.chatLiveStatus.textContent = "已加载更早的消息，当前显示 " + formatCount(conversation.items.length) + " 条";
       }
       return true;
@@ -754,10 +812,22 @@
       if (error.name === "AbortError" || request !== conversation.request || selectedKey !== state.selection.key) {
         return false;
       }
-      conversation.error = friendlyError(error);
-      conversation.mode = "error";
+      if (!reset && conversation.items.length > 0) {
+        conversation.error = null;
+        conversation.olderError = friendlyError(error);
+        conversation.mode = "ready";
+        dom.chatLiveStatus.textContent = "更早的消息加载失败，可在聊天顶部重试";
+      } else {
+        conversation.error = friendlyError(error);
+        conversation.olderError = null;
+        conversation.mode = "error";
+      }
       renderConversation();
       return false;
+    } finally {
+      if (request === conversation.request) {
+        conversation.controller = null;
+      }
     }
   }
 
@@ -784,25 +854,109 @@
   }
 
   function captureScrollAnchor() {
-    return {
+    const containerTop = dom.chatScroll.getBoundingClientRect().top;
+    const visibleMessage = Array.from(dom.messageList.querySelectorAll(".message-item")).find(function (item) {
+      return item.getBoundingClientRect().bottom > containerTop;
+    });
+    const anchor = {
       height: dom.chatScroll.scrollHeight,
-      top: dom.chatScroll.scrollTop
+      top: dom.chatScroll.scrollTop,
+      messageKey: null,
+      messageOffset: 0
     };
+    if (visibleMessage) {
+      anchor.messageKey = visibleMessage.dataset.messageKey || null;
+      anchor.messageOffset = visibleMessage.getBoundingClientRect().top - containerTop;
+    }
+    return anchor;
   }
 
-  function restoreScrollAnchor(anchor) {
+  function isCurrentConversationRequest(request, selectedKey) {
+    return request === state.conversation.request
+      && selectedKey === state.selection.key
+      && selectedKey === state.conversation.sessionKey;
+  }
+
+  function restoreScrollAnchor(anchor, request, selectedKey) {
     if (!anchor) {
+      if (isCurrentConversationRequest(request, selectedKey)) {
+        state.conversation.restoringScroll = false;
+      }
       return;
     }
     window.requestAnimationFrame(function () {
-      dom.chatScroll.scrollTop = dom.chatScroll.scrollHeight - anchor.height + anchor.top;
+      if (!isCurrentConversationRequest(request, selectedKey)) {
+        return;
+      }
+      const anchoredMessage = anchor.messageKey
+        ? Array.from(dom.messageList.querySelectorAll(".message-item")).find(function (item) {
+          return item.dataset.messageKey === anchor.messageKey;
+        })
+        : null;
+      if (anchoredMessage) {
+        const containerTop = dom.chatScroll.getBoundingClientRect().top;
+        const currentOffset = anchoredMessage.getBoundingClientRect().top - containerTop;
+        dom.chatScroll.scrollTop += currentOffset - anchor.messageOffset;
+      } else {
+        dom.chatScroll.scrollTop = dom.chatScroll.scrollHeight - anchor.height + anchor.top;
+      }
+      window.requestAnimationFrame(function () {
+        if (!isCurrentConversationRequest(request, selectedKey)) {
+          return;
+        }
+        state.conversation.restoringScroll = false;
+        maybeAutoLoadOlderMessages();
+      });
     });
   }
 
-  function scrollChatToBottom() {
+  function scrollChatToBottom(request, selectedKey) {
     window.requestAnimationFrame(function () {
+      if (!isCurrentConversationRequest(request, selectedKey)) {
+        return;
+      }
       dom.chatScroll.scrollTop = dom.chatScroll.scrollHeight;
+      window.requestAnimationFrame(function () {
+        if (isCurrentConversationRequest(request, selectedKey)) {
+          maybeAutoLoadOlderMessages();
+        }
+      });
     });
+  }
+
+  function scheduleAutoLoadOlderMessages() {
+    if (state.conversation.autoLoadFrame !== null) {
+      return;
+    }
+    state.conversation.autoLoadFrame = window.requestAnimationFrame(function () {
+      state.conversation.autoLoadFrame = null;
+      maybeAutoLoadOlderMessages();
+    });
+  }
+
+  function cancelAutoLoadFrame() {
+    if (state.conversation.autoLoadFrame !== null) {
+      window.cancelAnimationFrame(state.conversation.autoLoadFrame);
+      state.conversation.autoLoadFrame = null;
+    }
+  }
+
+  function maybeAutoLoadOlderMessages() {
+    const conversation = state.conversation;
+    if (!state.selection.session
+        || !conversation.hasMore
+        || conversation.mode !== "ready"
+        || conversation.restoringScroll
+        || conversation.olderError) {
+      return;
+    }
+    const threshold = Math.max(
+      AUTO_LOAD_OLDER_MIN_THRESHOLD,
+      dom.chatScroll.clientHeight * 0.5
+    );
+    if (dom.chatScroll.scrollTop <= threshold) {
+      loadMessages({ reset: false });
+    }
   }
 
   function renderConversation() {
@@ -879,6 +1033,7 @@
       "li",
       "message-item " + (conversational ? "is-" + role : "is-event") + (expanded ? " is-expanded" : "")
     );
+    listItem.dataset.messageKey = key;
     const article = element("article", "message-card");
     article.setAttribute("aria-label", roleLabel(role, item.sourceType) + "，" + formatDate(item.createdAt || item.ingestedAt, false));
 
@@ -1106,14 +1261,22 @@
     dom.messageEmptyTitle.textContent = onlyHiddenTools ? "工具调用已隐藏" : "这个会话还没有消息";
     dom.messageEmptyDescription.textContent = onlyHiddenTools
       ? (conversation.hasMore
-        ? "点击“加载更早消息”继续查找对话，或打开“显示工具调用”查看这些记录。"
+        ? "向上滚动会继续查找更早的对话，或打开“显示工具调用”查看这些记录。"
         : "打开“显示工具调用”即可查看这些记录。")
       : "下一次采集完成后，新消息会显示在这里。";
     dom.messageError.hidden = conversation.mode !== "error";
     dom.messageErrorMessage.textContent = conversation.error || "";
-    dom.loadOlderMessages.hidden = !conversation.hasMore || loadingInitial || conversation.mode === "error";
+    dom.olderMessagesLoading.hidden = !loadingOlder;
+    dom.loadOlderMessages.hidden = !conversation.olderError;
     dom.loadOlderMessages.disabled = loadingOlder;
-    dom.loadOlderMessages.textContent = loadingOlder ? "正在加载…" : "加载更早消息";
+    dom.loadOlderMessages.textContent = "加载失败，重试更早消息";
+    dom.loadOlderMessages.title = conversation.olderError || "";
+    dom.loadOlderMessages.setAttribute(
+      "aria-label",
+      conversation.olderError
+        ? "加载失败，重试更早消息：" + conversation.olderError
+        : "加载失败，重试更早消息"
+    );
     dom.refreshChat.disabled = loadingInitial || loadingOlder;
 
     const suffix = conversation.truncated ? "+" : "";
@@ -1628,6 +1791,7 @@
       loadSessions({ reset: Boolean(state.sessions.error) });
     });
     dom.loadOlderMessages.addEventListener("click", function () { loadMessages({ reset: false }); });
+    dom.chatScroll.addEventListener("scroll", scheduleAutoLoadOlderMessages, { passive: true });
     dom.chatBack.addEventListener("click", leaveConversation);
     dom.showToolsToggle.addEventListener("change", function () {
       state.conversation.showTools = dom.showToolsToggle.checked;

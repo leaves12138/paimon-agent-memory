@@ -177,7 +177,9 @@ Claude sessions are listed on the left, and selecting one opens its chronologica
 the right. By default, human-visible messages, attachments, and generated images are filtered
 before pagination, so tool-heavy turns cannot push the user's question out of the visible page. Enabling
 `显示工具调用` reloads the same session from the raw event stream. Older messages are loaded in
-bounded pages without losing the current scroll position.
+larger batches (up to 100 rows and never above `dashboard.max-page-size`) as the user scrolls toward
+the top, without losing the current scroll position. No load-more click is required; a retry control
+appears only when an automatic older-message request fails.
 Message JSON and attachment metadata are loaded only after an explicit detail click; supported
 images are then fetched from Paimon only when the user opens their preview. The preview is bounded by
 `dashboard.max-attachment-preview-size`, while `dashboard.page-size`,
