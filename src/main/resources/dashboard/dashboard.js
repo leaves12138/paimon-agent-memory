@@ -4,6 +4,9 @@
   const API_ROOT = "/api";
   const PREFERRED_CONVERSATION_PAGE_SIZE = 100;
   const AUTO_LOAD_OLDER_MIN_THRESHOLD = 320;
+  const TRANSIENT_FETCH_MAX_RETRIES = 30;
+  const TRANSIENT_FETCH_MIN_DELAY_MS = 250;
+  const TRANSIENT_FETCH_MAX_DELAY_MS = 5000;
   const ALLOWED_IMAGE_TYPES = new Set([
     "image/png",
     "image/jpeg",
@@ -303,32 +306,96 @@
   }
 
   async function fetchJson(path, signal) {
-    const response = await sameOriginFetch(path, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      signal: signal
+    let transientRetries = 0;
+    while (true) {
+      const response = await sameOriginFetch(path, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        signal: signal
+      });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        if (response.ok) {
+          throw new Error("服务返回了无法识别的数据格式");
+        }
+      }
+      if (!response.ok) {
+        const retryAfter = response.headers.get("Retry-After");
+        const transientBusy =
+          (response.status === 429 || response.status === 503) && hasValue(retryAfter);
+        if (transientBusy && transientRetries < TRANSIENT_FETCH_MAX_RETRIES) {
+          const retryDelay = transientRetryDelay(retryAfter, transientRetries);
+          transientRetries += 1;
+          await waitForRetry(retryDelay, signal);
+          continue;
+        }
+        let message = payload && (payload.message || payload.error);
+        if (!message) {
+          message = "请求失败（HTTP " + response.status + "）";
+        }
+        if (response.status === 403) {
+          message = "请求被拒绝，请确认正在通过本机地址访问。";
+        }
+        const requestError = new Error(displayValue(message));
+        requestError.status = response.status;
+        throw requestError;
+      }
+      return payload && typeof payload === "object" ? payload : {};
+    }
+  }
+
+  function transientRetryDelay(retryAfter, retryNumber) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return explicitRetryDelay(seconds * 1000);
+    }
+    const retryAt = Date.parse(retryAfter);
+    if (Number.isFinite(retryAt)) {
+      return explicitRetryDelay(Math.max(0, retryAt - Date.now()));
+    }
+    return boundedRetryDelay(TRANSIENT_FETCH_MIN_DELAY_MS * Math.pow(2, retryNumber));
+  }
+
+  function explicitRetryDelay(value) {
+    return Math.max(TRANSIENT_FETCH_MIN_DELAY_MS, Math.round(value));
+  }
+
+  function boundedRetryDelay(value) {
+    return Math.min(
+      TRANSIENT_FETCH_MAX_DELAY_MS,
+      Math.max(TRANSIENT_FETCH_MIN_DELAY_MS, Math.round(value))
+    );
+  }
+
+  function waitForRetry(delay, signal) {
+    return new Promise(function (resolve, reject) {
+      if (signal && signal.aborted) {
+        reject(abortedRequestError());
+        return;
+      }
+      const timer = window.setTimeout(function () {
+        if (signal) {
+          signal.removeEventListener("abort", abortRetry);
+        }
+        resolve();
+      }, delay);
+      function abortRetry() {
+        window.clearTimeout(timer);
+        signal.removeEventListener("abort", abortRetry);
+        reject(abortedRequestError());
+      }
+      if (signal) {
+        signal.addEventListener("abort", abortRetry, { once: true });
+      }
     });
-    let payload = null;
-    try {
-      payload = await response.json();
-    } catch (error) {
-      if (response.ok) {
-        throw new Error("服务返回了无法识别的数据格式");
-      }
-    }
-    if (!response.ok) {
-      let message = payload && (payload.message || payload.error);
-      if (!message) {
-        message = "请求失败（HTTP " + response.status + "）";
-      }
-      if (response.status === 403) {
-        message = "请求被拒绝，请确认正在通过本机地址访问。";
-      }
-      const requestError = new Error(displayValue(message));
-      requestError.status = response.status;
-      throw requestError;
-    }
-    return payload && typeof payload === "object" ? payload : {};
+  }
+
+  function abortedRequestError() {
+    const error = new Error("请求已取消");
+    error.name = "AbortError";
+    return error;
   }
 
   function friendlyError(error) {

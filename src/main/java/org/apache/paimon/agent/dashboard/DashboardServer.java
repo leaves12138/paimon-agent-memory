@@ -227,8 +227,13 @@ public final class DashboardServer implements AutoCloseable {
     private void handleOverview(HttpExchange exchange) throws Exception {
         Map<String, List<String>> values = parameters(exchange);
         requireOnly(values, Set.of("refresh"));
-        refreshIfRequested(values);
-        DashboardOverview uploaded = withScanSlot(dataStore::overview);
+        boolean refresh = Boolean.TRUE.equals(optionalBoolean(values, "refresh"));
+        DashboardOverview uploaded =
+                withScanSlot(
+                        () -> {
+                            refreshIfRequested(refresh);
+                            return dataStore.overview();
+                        });
         CollectorStatus status = collectorStatus.get();
         long durablePending = uploaded.getPendingSessionCount();
         long pendingSessions = Math.max(durablePending, status.pendingSessions());
@@ -271,17 +276,19 @@ public final class DashboardServer implements AutoCloseable {
         String sourceType = optionalFilter(values, "sourceType");
         String search = optionalFilter(values, "query");
         Boolean archived = optionalBoolean(values, "archived");
-        refreshIfRequested(values);
+        boolean refresh = Boolean.TRUE.equals(optionalBoolean(values, "refresh"));
         DashboardPage<DashboardSession> result =
                 withScanSlot(
-                        () ->
-                                dataStore.listSessions(
-                                        new SessionQuery(
-                                                sourceType,
-                                                search,
-                                                archived,
-                                                page,
-                                                pageSize)));
+                        () -> {
+                            refreshIfRequested(refresh);
+                            return dataStore.listSessions(
+                                    new SessionQuery(
+                                            sourceType,
+                                            search,
+                                            archived,
+                                            page,
+                                            pageSize));
+                        });
         List<Map<String, Object>> items = new ArrayList<>();
         for (DashboardSession session : result.getItems()) {
             items.add(session(session));
@@ -312,20 +319,22 @@ public final class DashboardServer implements AutoCloseable {
         String search = optionalFilter(values, "query");
         boolean conversationOnly =
                 Boolean.TRUE.equals(optionalBoolean(values, "conversationOnly"));
-        refreshIfRequested(values);
+        boolean refresh = Boolean.TRUE.equals(optionalBoolean(values, "refresh"));
         DashboardPage<DashboardMessage> result =
                 withScanSlot(
-                        () ->
-                                dataStore.listMessages(
-                                        new MessageQuery(
-                                                sourceType,
-                                                sessionId,
-                                                role,
-                                                eventType,
-                                                search,
-                                                conversationOnly,
-                                                page,
-                                                pageSize)));
+                        () -> {
+                            refreshIfRequested(refresh);
+                            return dataStore.listMessages(
+                                    new MessageQuery(
+                                            sourceType,
+                                            sessionId,
+                                            role,
+                                            eventType,
+                                            search,
+                                            conversationOnly,
+                                            page,
+                                            pageSize));
+                        });
         List<Map<String, Object>> items = new ArrayList<>();
         for (DashboardMessage message : result.getItems()) {
             items.add(message(message));
@@ -333,9 +342,8 @@ public final class DashboardServer implements AutoCloseable {
         sendJson(exchange, 200, page(result, items));
     }
 
-    private void refreshIfRequested(Map<String, List<String>> values)
-            throws BadRequestException {
-        if (Boolean.TRUE.equals(optionalBoolean(values, "refresh"))) {
+    private void refreshIfRequested(boolean refresh) {
+        if (refresh) {
             dataStore.invalidate();
         }
     }

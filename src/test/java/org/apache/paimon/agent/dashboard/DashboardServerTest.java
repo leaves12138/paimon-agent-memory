@@ -27,6 +27,9 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -101,6 +104,10 @@ class DashboardServerTest {
                 .contains("dom.chatScroll.addEventListener(\"scroll\"")
                 .contains("conversation.restoringScroll")
                 .contains("isCurrentConversationRequest")
+                .contains("TRANSIENT_FETCH_MAX_RETRIES = 30")
+                .contains("response.headers.get(\"Retry-After\")")
+                .contains("explicitRetryDelay")
+                .contains("waitForRetry")
                 .contains("加载失败，重试更早消息")
                 .contains("refresh=true")
                 .contains("params.set(\"conversationOnly\", \"true\")")
@@ -273,6 +280,36 @@ class DashboardServerTest {
     }
 
     @Test
+    void busyRefreshDoesNotInvalidateUntilItAcquiresAScanSlot() throws Exception {
+        startServer();
+        dataStore.blockOverviewScans(2);
+        CompletableFuture<HttpResponse<byte[]>> first = requestAsync("api/overview");
+        CompletableFuture<HttpResponse<byte[]>> second = requestAsync("api/overview");
+
+        try {
+            assertThat(dataStore.awaitBlockedOverviewScans()).isTrue();
+
+            assertError(
+                    request("GET", "api/overview?refresh=now"),
+                    400,
+                    "refresh must be true or false");
+            assertThat(dataStore.invalidations).isZero();
+
+            HttpResponse<byte[]> busy = request("GET", "api/overview?refresh=true");
+            assertError(busy, 503, "Dashboard is busy");
+            assertThat(busy.headers().firstValue("Retry-After")).contains("1");
+            assertThat(dataStore.invalidations).isZero();
+        } finally {
+            dataStore.releaseOverviewScans();
+        }
+
+        assertThat(first.get(5, TimeUnit.SECONDS).statusCode()).isEqualTo(200);
+        assertThat(second.get(5, TimeUnit.SECONDS).statusCode()).isEqualTo(200);
+        assertThat(request("GET", "api/overview?refresh=true").statusCode()).isEqualTo(200);
+        assertThat(dataStore.invalidations).isEqualTo(1);
+    }
+
+    @Test
     void acceptsLocalhostAliasAndRequiresItsMatchingOrigin() throws Exception {
         startServer();
         URI localhostAddress =
@@ -386,6 +423,17 @@ class DashboardServerTest {
         return request(address, method, relativePath, null, null);
     }
 
+    private CompletableFuture<HttpResponse<byte[]>> requestAsync(String relativePath) {
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        return request("GET", relativePath);
+                    } catch (Exception error) {
+                        throw new RuntimeException(error);
+                    }
+                });
+    }
+
     private HttpResponse<byte[]> request(
             String method, String relativePath, String headerName, String headerValue)
             throws Exception {
@@ -443,10 +491,23 @@ class DashboardServerTest {
         private String lastDetailKey;
         private String lastAttachmentKey;
         private long lastAttachmentMaxBytes;
-        private int invalidations;
+        private volatile int invalidations;
+        private volatile CountDownLatch overviewScansStarted = new CountDownLatch(0);
+        private volatile CountDownLatch releaseOverviewScans = new CountDownLatch(0);
 
         @Override
         public DashboardOverview overview() {
+            if (releaseOverviewScans.getCount() > 0) {
+                overviewScansStarted.countDown();
+                try {
+                    if (!releaseOverviewScans.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("Timed out waiting to release overview scan");
+                    }
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted while blocking overview scan", error);
+                }
+            }
             Map<String, Long> sessions = new LinkedHashMap<>();
             sessions.put("codex", 3L);
             sessions.put("claude", 1L);
@@ -560,6 +621,19 @@ class DashboardServerTest {
         @Override
         public void invalidate() {
             invalidations++;
+        }
+
+        private void blockOverviewScans(int count) {
+            overviewScansStarted = new CountDownLatch(count);
+            releaseOverviewScans = new CountDownLatch(1);
+        }
+
+        private boolean awaitBlockedOverviewScans() throws InterruptedException {
+            return overviewScansStarted.await(5, TimeUnit.SECONDS);
+        }
+
+        private void releaseOverviewScans() {
+            releaseOverviewScans.countDown();
         }
 
         @Override
