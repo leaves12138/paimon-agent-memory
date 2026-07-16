@@ -36,16 +36,47 @@ class CodexConversationSourceTest {
     @TempDir Path tempDir;
 
     @Test
-    void assignsTrueAndFalseFromAuthoritativeProjectlessState() throws Exception {
+    void recognizesOnlyTheRootOfAGeneratedTaskWorkspace() {
+        assertThat(
+                        CodexConversationSource.isGeneratedTaskWorkspace(
+                                "/Users/test/Documents/Codex/2026-07-15/hi"))
+                .isTrue();
+        assertThat(
+                        CodexConversationSource.isGeneratedTaskWorkspace(
+                                "C:\\Users\\test\\Documents\\Codex\\2026-07-15\\hi\\"))
+                .isTrue();
+        assertThat(
+                        CodexConversationSource.isGeneratedTaskWorkspace(
+                                "/Users/test/Documents/Codex/not-a-date/hi"))
+                .isFalse();
+        assertThat(
+                        CodexConversationSource.isGeneratedTaskWorkspace(
+                                "/Users/test/Documents/Codex/2026-07-15/hi/work"))
+                .isFalse();
+        assertThat(CodexConversationSource.isGeneratedTaskWorkspace("/Users/test/project/hi"))
+                .isFalse();
+    }
+
+    @Test
+    void assignsProjectlessStateAndOverridesAStaleListForGeneratedTaskWorkspaces()
+            throws Exception {
         Path directory = tempDir.resolve("sessions/2026/01/01");
         Files.createDirectories(directory);
         Path projectless = directory.resolve("projectless.jsonl");
         Path project = directory.resolve("project.jsonl");
+        Path generated = directory.resolve("generated.jsonl");
         Files.writeString(projectless, canonicalUser("without project") + "\n");
         Files.writeString(project, canonicalUser("with project") + "\n");
+        Files.writeString(generated, canonicalUser("generated task") + "\n");
         createStateDatabase(
                 new ThreadRow("projectless", projectless, "No project", 2),
-                new ThreadRow("project", project, "Project", 1));
+                new ThreadRow("project", project, "Project", 1),
+                new ThreadRow(
+                        "generated",
+                        generated,
+                        "Generated",
+                        3,
+                        "/Users/test/Documents/Codex/2026-07-15/hi"));
         writeGlobalState("{\"projectless-thread-ids\":[\"projectless\"]}");
         ObjectMapper mapper = new ObjectMapper();
         CodexConversationSource source =
@@ -62,6 +93,78 @@ class CodexConversationSourceTest {
                 .filteredOn(batch -> batch.session().key().sessionId().equals("project"))
                 .singleElement()
                 .satisfies(batch -> assertThat(batch.session().projectless()).isFalse());
+        assertThat(batches)
+                .filteredOn(batch -> batch.session().key().sessionId().equals("generated"))
+                .singleElement()
+                .satisfies(batch -> assertThat(batch.session().projectless()).isTrue());
+    }
+
+    @Test
+    void publishesMetadataOnlyCorrectionForPreviouslyMisclassifiedGeneratedTask()
+            throws Exception {
+        Path directory = tempDir.resolve("sessions/2026/07/15");
+        Files.createDirectories(directory);
+        Path rollout = directory.resolve("generated.jsonl");
+        Files.writeString(rollout, canonicalUser("generated task") + "\n");
+        createStateDatabase(
+                new ThreadRow(
+                        "generated",
+                        rollout,
+                        "Generated",
+                        1,
+                        "C:\\Users\\test\\Documents\\Codex\\2026-07-15\\hi\\"));
+        writeGlobalState("{\"projectless-thread-ids\":[]}");
+        ObjectMapper mapper = new ObjectMapper();
+        CodexConversationSource source =
+                new CodexConversationSource(
+                        tempDir, mapper, new AttachmentResolver(mapper, true, false, 1024));
+
+        SessionBatch initial = source.scan(Collections.emptyMap(), 100).get(0);
+        ChatSession wrong = initial.session().withProjectless(false);
+        List<SessionBatch> corrected =
+                source.scan(Collections.singletonMap(wrong.key(), wrong), 100);
+
+        assertThat(corrected).singleElement();
+        assertThat(corrected.get(0).messages()).isEmpty();
+        assertThat(corrected.get(0).sourceRecordsRead()).isZero();
+        assertThat(corrected.get(0).session().projectless()).isTrue();
+    }
+
+    @Test
+    void classifiesGeneratedTaskFromRolloutWhenSqliteCwdIsEmpty() throws Exception {
+        Path directory = tempDir.resolve("sessions/2026/07/15");
+        Files.createDirectories(directory);
+        Path rollout = directory.resolve("generated-meta.jsonl");
+        String generatedCwd = "/Users/test/Documents/Codex/2026-07-15/hi";
+        Files.writeString(
+                rollout,
+                "{\"timestamp\":\"2026-07-15T00:00:00Z\",\"type\":\"session_meta\","
+                        + "\"payload\":{\"id\":\"generated-meta\",\"cwd\":\""
+                        + generatedCwd
+                        + "\"}}\n"
+                        + canonicalUser("generated task")
+                        + "\n",
+                StandardCharsets.UTF_8);
+        createStateDatabase(
+                new ThreadRow("generated-meta", rollout, "Generated", 1, ""));
+        writeGlobalState("{\"projectless-thread-ids\":[]}");
+        ObjectMapper mapper = new ObjectMapper();
+        CodexConversationSource source =
+                new CodexConversationSource(
+                        tempDir, mapper, new AttachmentResolver(mapper, true, false, 1024));
+
+        SessionBatch initial = source.scan(Collections.emptyMap(), 100).get(0);
+
+        assertThat(initial.session().cwd()).isEqualTo(generatedCwd);
+        assertThat(initial.session().projectless()).isTrue();
+
+        ChatSession wrong = initial.session().withProjectless(false);
+        List<SessionBatch> corrected =
+                source.scan(Collections.singletonMap(wrong.key(), wrong), 100);
+
+        assertThat(corrected).singleElement();
+        assertThat(corrected.get(0).messages()).isEmpty();
+        assertThat(corrected.get(0).session().projectless()).isTrue();
     }
 
     @Test
@@ -622,7 +725,9 @@ class CodexConversationSourceTest {
                                 + row.rollout.toString().replace("'", "''")
                                 + "', '"
                                 + row.title
-                                + "', '/tmp/project', 0, 1, "
+                                + "', '"
+                                + row.cwd.replace("'", "''")
+                                + "', 0, 1, "
                                 + row.updatedAt
                                 + ")");
             }
@@ -651,12 +756,19 @@ class CodexConversationSourceTest {
         private final Path rollout;
         private final String title;
         private final long updatedAt;
+        private final String cwd;
 
         private ThreadRow(String sessionId, Path rollout, String title, long updatedAt) {
+            this(sessionId, rollout, title, updatedAt, "/tmp/project");
+        }
+
+        private ThreadRow(
+                String sessionId, Path rollout, String title, long updatedAt, String cwd) {
             this.sessionId = sessionId;
             this.rollout = rollout;
             this.title = title;
             this.updatedAt = updatedAt;
+            this.cwd = cwd;
         }
     }
 }

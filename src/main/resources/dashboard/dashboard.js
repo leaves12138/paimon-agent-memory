@@ -730,17 +730,21 @@
     if (displayValue(item && item.sourceType, "").trim().toLowerCase() !== "codex") {
       return false;
     }
+    const normalizedCwd = displayValue(cwd, "").trim().replace(/[\\/]+$/, "");
     if (item && item.projectless === true) {
+      return true;
+    }
+    if (!normalizedCwd) {
+      return true;
+    }
+    // Codex creates these dated workspaces for conversations that are not attached to a project.
+    if (/(?:^|[\\/])Documents[\\/]Codex[\\/]\d{4}-\d{2}-\d{2}[\\/][^\\/]+$/.test(normalizedCwd)) {
       return true;
     }
     if (item && item.projectless === false) {
       return false;
     }
-    if (!cwd) {
-      return true;
-    }
-    // Codex creates these dated workspaces for conversations that are not attached to a project.
-    return /(?:^|[\\/])Documents[\\/]Codex[\\/]\d{4}-\d{2}-\d{2}[\\/][^\\/]+$/.test(cwd);
+    return false;
   }
 
   function buildSessionGroup(group) {

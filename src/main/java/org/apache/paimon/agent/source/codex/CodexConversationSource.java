@@ -59,6 +59,9 @@ public final class CodexConversationSource implements ConversationSource {
             Pattern.compile("(?m)^##[ \\t]+(.+):[ \\t]+(.+?)[ \\t]*$");
     private static final Pattern INLINE_IMAGE_PATH =
             Pattern.compile("<image\\b[^>]*\\bpath=\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
+    private static final Pattern GENERATED_TASK_WORKSPACE =
+            Pattern.compile(
+                    "(?:^|/)Documents/Codex/\\d{4}-\\d{2}-\\d{2}/[^/]+$");
 
     private final Path codexHome;
     private final ObjectMapper objectMapper;
@@ -405,10 +408,14 @@ public final class CodexConversationSource implements ConversationSource {
                 thread.sessionSourceKnown
                         ? thread.subagentSourceJson
                         : previous == null ? null : previous.subagentSourceJson();
-        Boolean projectless =
-                thread.projectless != null
-                        ? thread.projectless
-                        : previous == null ? null : previous.projectless();
+        Boolean projectless;
+        if (isGeneratedTaskWorkspace(cwd)) {
+            projectless = true;
+        } else if (thread.projectless != null) {
+            projectless = thread.projectless;
+        } else {
+            projectless = previous == null ? null : previous.projectless();
+        }
         ChatSession session =
                 new ChatSession(
                         key,
@@ -524,13 +531,16 @@ public final class CodexConversationSource implements ConversationSource {
                 new ArrayList<>(threads.entrySet())) {
             CodexThread current = entry.getValue();
             CodexThread discovered = discoverThread(current.rolloutPath, current.archived);
-            if (discovered != null
-                    && discovered.sessionSourceKnown
-                    && current.sessionId.equals(discovered.sessionId)) {
-                threads.put(
-                        entry.getKey(),
-                        current.withSessionSource(discovered.subagentSourceJson));
+            if (discovered == null || !current.sessionId.equals(discovered.sessionId)) {
+                continue;
             }
+            if (isBlank(current.cwd) && !isBlank(discovered.cwd)) {
+                current = current.withCwd(discovered.cwd);
+            }
+            if (discovered.sessionSourceKnown) {
+                current = current.withSessionSource(discovered.subagentSourceJson);
+            }
+            threads.put(entry.getKey(), current);
         }
     }
 
@@ -653,21 +663,38 @@ public final class CodexConversationSource implements ConversationSource {
 
     private void applyProjectlessState(
             Map<String, CodexThread> threads, Set<String> projectlessThreadIds) {
-        if (projectlessThreadIds == null) {
-            return;
-        }
         for (Map.Entry<String, CodexThread> entry : new ArrayList<>(threads.entrySet())) {
             CodexThread thread = entry.getValue();
+            if (isGeneratedTaskWorkspace(thread.cwd)) {
+                threads.put(entry.getKey(), thread.withProjectless(true));
+                continue;
+            }
+            if (projectlessThreadIds == null) {
+                continue;
+            }
             threads.put(
                     entry.getKey(),
                     thread.withProjectless(projectlessThreadIds.contains(thread.sessionId)));
         }
     }
 
+    /** Returns whether a cwd is one of Codex's generated homes for a projectless task. */
+    public static boolean isGeneratedTaskWorkspace(String cwd) {
+        if (isBlank(cwd)) {
+            return false;
+        }
+        String normalized = cwd.replace('\\', '/');
+        int end = normalized.length();
+        while (end > 0 && normalized.charAt(end - 1) == '/') {
+            end--;
+        }
+        return GENERATED_TASK_WORKSPACE.matcher(normalized.substring(0, end)).find();
+    }
+
     /**
-     * Returns the authoritative projectless thread set, or {@code null} when the global state is
-     * unavailable or cannot be trusted. A known empty array is intentionally different from an
-     * unknown state: it marks every captured thread as project-backed.
+     * Returns the projectless thread set, or {@code null} when the global state is unavailable or
+     * cannot be trusted. Codex-generated dated task workspaces remain projectless even when absent
+     * from this set because extension-created conversations are not always listed there.
      */
     private Set<String> loadProjectlessThreadIds() {
         Path state = codexHome.resolve(".codex-global-state.json");
@@ -1192,6 +1219,20 @@ public final class CodexConversationSource implements ConversationSource {
                     updatedAt,
                     value,
                     true,
+                    projectless);
+        }
+
+        private CodexThread withCwd(String value) {
+            return new CodexThread(
+                    sessionId,
+                    rolloutPath,
+                    title,
+                    value,
+                    archived,
+                    createdAt,
+                    updatedAt,
+                    subagentSourceJson,
+                    sessionSourceKnown,
                     projectless);
         }
 

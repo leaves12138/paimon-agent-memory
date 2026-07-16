@@ -2,6 +2,7 @@ package org.apache.paimon.agent.restore;
 
 import org.apache.paimon.agent.model.ChatSession;
 import org.apache.paimon.agent.source.IncrementalFiles;
+import org.apache.paimon.agent.source.codex.CodexConversationSource;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -256,9 +257,10 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
                         isBlank(session.title()) ? preview : session.title(),
                         updatedAt);
             }
-            if (visibleRoot && session.projectless() != null) {
+            Boolean projectless = restoredProjectless(session);
+            if (visibleRoot && projectless != null) {
                 globalStateBackup = backupGlobalState();
-                updateProjectlessState(session.key().sessionId(), session.projectless());
+                updateProjectlessState(session.key().sessionId(), projectless);
             }
             upsertThread(session, rollout, cwd, preview, createdAt, updatedAt, overwrite);
             committed = true;
@@ -294,6 +296,16 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
                 deleteBackupQuietly(backup);
             }
         }
+    }
+
+    private Boolean restoredProjectless(ChatSession session) {
+        if (targetProject != null) {
+            return false;
+        }
+        if (CodexConversationSource.isGeneratedTaskWorkspace(session.cwd())) {
+            return true;
+        }
+        return session.projectless();
     }
 
     private GlobalStateBackup backupGlobalState() throws IOException {

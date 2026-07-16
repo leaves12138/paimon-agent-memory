@@ -235,12 +235,20 @@ class RestoreServiceTest {
     void updatesCodexProjectlessStateWithoutLosingOtherGlobalFields() throws Exception {
         String addedId = "019f5952-14cd-7d21-a7f7-87b31cb62db0";
         String removedId = "019f5952-14cd-7d21-a7f7-87b31cb62db1";
+        String generatedId = "019f5952-14cd-7d21-a7f7-87b31cb62db5";
         SessionKey addedKey = new SessionKey("codex", addedId);
         SessionKey removedKey = new SessionKey("codex", removedId);
+        SessionKey generatedKey = new SessionKey("codex", generatedId);
         ChatSession added =
                 session(addedKey, "projectless", tempDir.toString()).withProjectless(true);
         ChatSession removed =
                 session(removedKey, "project", tempDir.toString()).withProjectless(false);
+        ChatSession generated =
+                session(
+                                generatedKey,
+                                "generated task",
+                                "/Users/test/Documents/Codex/2026-07-15/hi")
+                        .withProjectless(false);
         Path codexHome = tempDir.resolve("projectless-codex-home");
         initializeCodexState(codexHome);
         Files.writeString(
@@ -258,7 +266,7 @@ class RestoreServiceTest {
         RestoreSummary summary =
                 new RestoreService(
                                 new FakeRepository(
-                                        java.util.Arrays.asList(added, removed),
+                                        java.util.Arrays.asList(added, removed, generated),
                                         message(
                                                 addedKey,
                                                 "added-prompt",
@@ -274,6 +282,14 @@ class RestoreServiceTest {
                                                 "user",
                                                 "response_item",
                                                 codexPrompt("project prompt"),
+                                                Collections.emptyList()),
+                                        message(
+                                                generatedKey,
+                                                "generated-prompt",
+                                                1L,
+                                                "user",
+                                                "response_item",
+                                                codexPrompt("generated prompt"),
                                                 Collections.emptyList())),
                                 mapper)
                         .restore(
@@ -285,13 +301,60 @@ class RestoreServiceTest {
                                         null,
                                         false));
 
-        assertThat(summary.restoredSessions()).isEqualTo(2);
+        assertThat(summary.restoredSessions()).isEqualTo(3);
         JsonNode state = mapper.readTree(codexHome.resolve(".codex-global-state.json").toFile());
         assertThat(state.path("keep").path("nested").asInt()).isEqualTo(7);
         List<String> projectlessIds = new ArrayList<>();
         state.path("projectless-thread-ids")
                 .forEach(value -> projectlessIds.add(value.asText()));
-        assertThat(projectlessIds).containsExactly("keep-id", addedId);
+        assertThat(projectlessIds).containsExactly("keep-id", addedId, generatedId);
+    }
+
+    @Test
+    void explicitCodexTargetProjectOverridesProjectlessSourceMetadata() throws Exception {
+        String sessionId = "019f5952-14cd-7d21-a7f7-87b31cb62db6";
+        SessionKey key = new SessionKey("codex", sessionId);
+        ChatSession session =
+                session(
+                                key,
+                                "move into project",
+                                "/Users/test/Documents/Codex/2026-07-15/hi")
+                        .withProjectless(true);
+        Path codexHome = tempDir.resolve("target-project-codex-home");
+        Path targetProject = Files.createDirectories(tempDir.resolve("explicit-project"));
+        initializeCodexState(codexHome);
+        Files.writeString(
+                codexHome.resolve(".codex-global-state.json"),
+                "{\"projectless-thread-ids\":[\"" + sessionId + "\"]}\n",
+                StandardCharsets.UTF_8);
+
+        RestoreSummary summary =
+                new RestoreService(
+                                new FakeRepository(
+                                        session,
+                                        message(
+                                                key,
+                                                "target-project-prompt",
+                                                1L,
+                                                "user",
+                                                "response_item",
+                                                codexPrompt("target project prompt"),
+                                                Collections.emptyList())),
+                                mapper)
+                        .restore(
+                                new RestoreOptions(
+                                        RestoreType.CODEX,
+                                        codexHome,
+                                        tempDir.resolve("target-project-data"),
+                                        targetProject,
+                                        sessionId,
+                                        false));
+
+        assertThat(summary.restoredSessions()).isEqualTo(1);
+        JsonNode state = mapper.readTree(codexHome.resolve(".codex-global-state.json").toFile());
+        assertThat(state.path("projectless-thread-ids").size()).isZero();
+        assertThat(threadCwd(codexHome, sessionId))
+                .isEqualTo(targetProject.toRealPath().toString());
     }
 
     @Test
