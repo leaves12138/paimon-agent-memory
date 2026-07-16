@@ -2,6 +2,12 @@ package org.apache.paimon.agent.dashboard;
 
 import org.apache.paimon.agent.config.DashboardConfig;
 import org.apache.paimon.agent.config.ProjectConfig;
+import org.apache.paimon.agent.restore.RestoreSummary;
+import org.apache.paimon.agent.restore.RestoreClientRunningException;
+import org.apache.paimon.agent.restore.RestoreSessionNotFoundException;
+import org.apache.paimon.agent.restore.RestoreSessionPendingException;
+import org.apache.paimon.agent.restore.RestoreType;
+import org.apache.paimon.agent.restore.RestoreTargetBusyException;
 import org.apache.paimon.agent.service.CollectorStatus;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -34,6 +40,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
@@ -45,13 +52,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
-/** Loopback-only HTTP dashboard for the two chat tables. */
+/** Loopback-only HTTP dashboard for browsing chat tables and explicitly restoring local history. */
 public final class DashboardServer implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(DashboardServer.class);
     private static final int MAX_QUERY_BYTES = 4 * 1024;
     private static final int MAX_FILTER_CHARS = 512;
     private static final int MAX_CONTENT_CHARS = 2_000_000;
+    private static final String RESTORE_ACTION_HEADER = "X-Paimon-Agent-Action";
+    private static final String RESTORE_ACTION = "restore-session";
     private static final Set<String> SAFE_INLINE_IMAGES =
             Set.of("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif");
 
@@ -59,11 +68,13 @@ public final class DashboardServer implements AutoCloseable {
     private final DashboardConfig config;
     private final DashboardDataStore dataStore;
     private final Supplier<CollectorStatus> collectorStatus;
+    private final DashboardSessionRestorer sessionRestorer;
     private final ObjectMapper objectMapper;
     private final HttpServer server;
     private final ThreadPoolExecutor executor;
     private final Semaphore scanSlots = new Semaphore(2);
     private final Semaphore attachmentSlot = new Semaphore(1);
+    private final Semaphore restoreSlot = new Semaphore(1);
     private final CountDownLatch stopped = new CountDownLatch(1);
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -72,13 +83,15 @@ public final class DashboardServer implements AutoCloseable {
             DashboardDataStore dataStore,
             Supplier<CollectorStatus> collectorStatus,
             ObjectMapper objectMapper,
-            Path dataDirectory)
+            Path dataDirectory,
+            DashboardSessionRestorer sessionRestorer)
             throws IOException {
         this.project = project;
         this.config = project.dashboard();
         this.dataStore = dataStore;
         this.collectorStatus = collectorStatus;
         this.objectMapper = objectMapper;
+        this.sessionRestorer = Objects.requireNonNull(sessionRestorer, "sessionRestorer");
 
         InetAddress bindAddress = InetAddress.getByName(config.host());
         if (!bindAddress.isLoopbackAddress()) {
@@ -138,7 +151,16 @@ public final class DashboardServer implements AutoCloseable {
                 sendError(exchange, 403, "Request rejected");
                 return;
             }
+            String path = exchange.getRequestURI().getPath();
+            if (path == null || path.indexOf('\\') >= 0 || path.indexOf('\0') >= 0) {
+                sendError(exchange, 400, "Invalid request path");
+                return;
+            }
             String method = exchange.getRequestMethod();
+            if ("/api/sessions/restore".equals(path)) {
+                handleSessionRestoreRoute(exchange, method);
+                return;
+            }
             if (!"GET".equals(method) && !"HEAD".equals(method)) {
                 exchange.getResponseHeaders().set("Allow", "GET, HEAD");
                 sendError(exchange, 405, "Only GET and HEAD are supported");
@@ -146,12 +168,6 @@ public final class DashboardServer implements AutoCloseable {
             }
             if (requestHasBody(exchange)) {
                 sendError(exchange, 400, "Request bodies are not supported");
-                return;
-            }
-
-            String path = exchange.getRequestURI().getPath();
-            if (path == null || path.indexOf('\\') >= 0 || path.indexOf('\0') >= 0) {
-                sendError(exchange, 400, "Invalid request path");
                 return;
             }
             switch (path) {
@@ -221,6 +237,76 @@ public final class DashboardServer implements AutoCloseable {
             }
         } finally {
             exchange.close();
+        }
+    }
+
+    private void handleSessionRestoreRoute(HttpExchange exchange, String method) throws Exception {
+        if (!"POST".equals(method)) {
+            exchange.getResponseHeaders().set("Allow", "POST");
+            sendError(exchange, 405, "Only POST is supported for this action");
+            return;
+        }
+        if (requestHasBody(exchange)) {
+            sendError(exchange, 400, "Request bodies are not supported");
+            return;
+        }
+        List<String> actions = exchange.getRequestHeaders().get(RESTORE_ACTION_HEADER);
+        if (actions == null || actions.size() != 1 || !RESTORE_ACTION.equals(actions.get(0))) {
+            sendError(exchange, 403, "Restore action rejected");
+            return;
+        }
+        handleSessionRestore(exchange);
+    }
+
+    private void handleSessionRestore(HttpExchange exchange) throws Exception {
+        Map<String, List<String>> values = parameters(exchange);
+        requireOnly(values, Set.of("sourceType", "sessionId"));
+        String sourceType = requiredFilter(values, "sourceType");
+        String sessionId = requiredFilter(values, "sessionId");
+        RestoreType type;
+        try {
+            type = RestoreType.parse(sourceType);
+        } catch (IllegalArgumentException invalidType) {
+            throw new BadRequestException("sourceType must be codex or claude");
+        }
+        if (!restoreSlot.tryAcquire()) {
+            exchange.getResponseHeaders().set("Retry-After", "1");
+            sendError(exchange, 409, "Another local restore is already running");
+            return;
+        }
+        try {
+            DashboardRestoreResult result;
+            try {
+                result = sessionRestorer.restore(type, sessionId);
+            } catch (RestoreSessionNotFoundException missingSession) {
+                sendError(exchange, 404, "Session is no longer available for restore");
+                return;
+            } catch (RestoreSessionPendingException pendingSession) {
+                sendError(exchange, 409, "Session upload must finish before local restore");
+                return;
+            } catch (RestoreClientRunningException runningClient) {
+                sendError(exchange, 409, runningClient.getMessage());
+                return;
+            } catch (RestoreTargetBusyException busyTarget) {
+                exchange.getResponseHeaders().set("Retry-After", "1");
+                sendError(exchange, 409, "Another restore is already writing this local client home");
+                return;
+            }
+            RestoreSummary summary = result.summary();
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put(
+                    "status", summary.restoredSessions() > 0 ? "restored" : "skipped");
+            response.put("sourceType", type.sourceType());
+            response.put("sessionId", sessionId);
+            response.put("target", result.target().toString());
+            response.put("restoredSessions", summary.restoredSessions());
+            response.put("restoredMessages", summary.restoredMessages());
+            response.put("skippedSessions", summary.skippedSessions());
+            response.put("overwrite", false);
+            response.put("restartRequired", summary.restoredSessions() > 0);
+            sendJson(exchange, 200, response);
+        } finally {
+            restoreSlot.release();
         }
     }
 

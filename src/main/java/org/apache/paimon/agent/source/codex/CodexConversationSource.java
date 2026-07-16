@@ -211,14 +211,42 @@ public final class CodexConversationSource implements ConversationSource {
                 SourceCursors.parseFileCursor(
                         previous == null ? null : previous.pendingCursor());
         long startOffset = priorCursor.offset();
+        String startAnchor = priorCursor.anchor();
+        boolean checkpointRemapped = false;
         String currentFileKey = fileSnapshot == null ? null : fileSnapshot.fileKey();
-        if (fileSnapshot != null
-                && (fileSnapshot.size() < startOffset
-                        || (priorCursor.fileKey() != null
-                                && !java.util.Objects.equals(
-                                        priorCursor.fileKey(), currentFileKey))
-                        || !IncrementalFiles.anchorMatchesAtOffset(
-                                thread.rolloutPath, priorCursor))) {
+        String currentSourcePath =
+                thread.rolloutPath.toAbsolutePath().normalize().toString();
+        boolean checkpointMismatch =
+                fileSnapshot != null
+                        && (fileSnapshot.size() < startOffset
+                                || (previous != null
+                                        && !java.util.Objects.equals(
+                                                previous.sourcePath(), currentSourcePath))
+                                || (priorCursor.fileKey() != null
+                                        && !java.util.Objects.equals(
+                                                priorCursor.fileKey(), currentFileKey))
+                                || !IncrementalFiles.anchorMatchesAtOffset(
+                                        thread.rolloutPath, priorCursor));
+        boolean missingCursorIdentity =
+                previous != null
+                        && priorCursor.fileKey() == null
+                        && priorCursor.anchor() == null;
+        IncrementalFiles.RestoreBoundary restoreBoundary =
+                fileSnapshot == null || (!checkpointMismatch && !missingCursorIdentity)
+                        ? null
+                        : IncrementalFiles.findLastRestoreBoundary(
+                                tailReader,
+                                thread.rolloutPath,
+                                fileSnapshot.size(),
+                                previous);
+        if (restoreBoundary != null) {
+            startOffset = restoreBoundary.offset();
+            startAnchor = restoreBoundary.anchor();
+            checkpointRemapped = true;
+            LOG.info(
+                    "Resuming restored Codex session {} after its local restore boundary",
+                    thread.sessionId);
+        } else if (checkpointMismatch) {
             long recovered =
                     IncrementalFiles.findOffsetAfterAnchor(
                             tailReader,
@@ -234,6 +262,7 @@ public final class CodexConversationSource implements ConversationSource {
                 return null;
             }
             startOffset = recovered;
+            checkpointRemapped = true;
         }
         long targetOffset = -1L;
         if (previous != null && previous.hasPendingCommit()) {
@@ -278,7 +307,7 @@ public final class CodexConversationSource implements ConversationSource {
         List<ChatMessage> messages = new ArrayList<>();
         long processedOffset = startOffset;
         int processedRecords = 0;
-        String lastAnchor = priorCursor.anchor();
+        String lastAnchor = startAnchor;
         String title =
                 !isBlank(thread.title)
                         ? thread.title
@@ -386,7 +415,7 @@ public final class CodexConversationSource implements ConversationSource {
                         title,
                         cwd,
                         thread.archived,
-                        thread.rolloutPath.toAbsolutePath().normalize().toString(),
+                        currentSourcePath,
                         SourceCursors.file(processedOffset, currentFileKey, lastAnchor),
                         lastCommitId,
                         null,
@@ -405,6 +434,7 @@ public final class CodexConversationSource implements ConversationSource {
                         && processedOffset == targetOffset;
         if (!pendingBoundaryReached
                 && !cursorChanged
+                && !checkpointRemapped
                 && messages.isEmpty()
                 && !metadataChanged(previous, session)) {
             return null;

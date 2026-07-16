@@ -26,21 +26,99 @@ final class RestoreFiles {
 
     private RestoreFiles() {}
 
-    static Path canonicalTargetDirectory(Path requested, boolean create, String description)
+    static Path canonicalTargetPath(Path requested, boolean requireExisting, String description)
             throws IOException {
         Path absolute = requested.toAbsolutePath().normalize();
         if (Files.isSymbolicLink(absolute)) {
             throw new IOException(description + " must not be a symbolic link: " + absolute);
         }
-        if (create) {
-            Files.createDirectories(absolute);
+        if (Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
+            if (!Files.isDirectory(absolute, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException(description + " is not a directory: " + absolute);
+            }
+            return absolute.toRealPath();
         }
-        if (!Files.isDirectory(absolute, LinkOption.NOFOLLOW_LINKS)) {
+        if (requireExisting) {
             throw new IOException(description + " is not a directory: " + absolute);
         }
-        Path canonical = absolute.toRealPath();
+        Path parent = absolute.getParent();
+        if (parent == null || !Files.isDirectory(parent, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException(description + " parent is not a directory: " + parent);
+        }
+        Path canonicalParent = parent.toRealPath();
+        return canonicalParent.resolve(absolute.getFileName()).normalize();
+    }
+
+    static Path canonicalTargetDirectory(Path requested, boolean create, String description)
+            throws IOException {
+        Path target = canonicalTargetPath(requested, !create, description);
+        if (create && !Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+            Files.createDirectory(target);
+        }
+        if (!Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException(description + " is not a directory: " + target);
+        }
+        Path canonical = target.toRealPath();
         setOwnerOnlyDirectoryPermissions(canonical);
         return canonical;
+    }
+
+    static Path planContainedDirectory(Path canonicalRoot, Path relative) throws IOException {
+        if (relative.isAbsolute()) {
+            throw new IOException("Expected a relative restore directory, but found " + relative);
+        }
+        Path root = canonicalRoot.toAbsolutePath().normalize();
+        Path current = root;
+        for (Path component : relative.normalize()) {
+            String value = component.toString();
+            if (value.isEmpty() || ".".equals(value) || "..".equals(value)) {
+                throw new IOException("Unsafe restore directory component " + relative);
+            }
+            current = current.resolve(component).normalize();
+            if (!current.startsWith(root)) {
+                throw new IOException("Restore output directory escapes target " + root);
+            }
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                if (Files.isSymbolicLink(current)) {
+                    throw new IOException(
+                            "Restore output directory must not be a symbolic link: " + current);
+                }
+                if (!Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IOException("Restore output path is not a directory: " + current);
+                }
+                Path resolved = current.toRealPath();
+                if (!resolved.startsWith(root)) {
+                    throw new IOException(
+                            "Restore output directory escapes target " + root + ": " + resolved);
+                }
+                current = resolved;
+            }
+        }
+        return current;
+    }
+
+    static Path planContainedFile(Path canonicalRoot, Path relative) throws IOException {
+        if (relative.isAbsolute() || relative.getFileName() == null) {
+            throw new IOException("Expected a relative restore file, but found " + relative);
+        }
+        Path normalized = relative.normalize();
+        if (normalized.startsWith("..")) {
+            throw new IOException("Unsafe restore file path " + relative);
+        }
+        Path parentRelative = normalized.getParent();
+        Path parent =
+                parentRelative == null
+                        ? canonicalRoot.toAbsolutePath().normalize()
+                        : planContainedDirectory(canonicalRoot, parentRelative);
+        Path output = parent.resolve(normalized.getFileName()).normalize();
+        if (!output.getParent().equals(parent)
+                || !output.startsWith(canonicalRoot.toAbsolutePath().normalize())) {
+            throw new IOException("Restore output file escapes target: " + output);
+        }
+        if (Files.isSymbolicLink(output)) {
+            throw new IOException("Restore output file must not be a symbolic link: " + output);
+        }
+        return output;
     }
 
     static Path ensureContainedDirectory(Path canonicalRoot, Path relative) throws IOException {

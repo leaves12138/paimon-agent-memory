@@ -151,8 +151,9 @@ temporarily unavailable remote attachment does not prevent other sessions from a
 
 ## Dashboard
 
-The distribution includes a loopback-only, read-only web dashboard for customer demonstrations
-and local inspection. With `dashboard.enabled=true`, an ordinary `bin/paimon-agent start` starts
+The distribution includes a loopback-only web dashboard for customer demonstrations and local
+inspection. Paimon data access from the page is read-only; an explicit per-session action can write
+a restored copy into the configured local Codex or Claude home. With `dashboard.enabled=true`, an ordinary `bin/paimon-agent start` starts
 the collector and Dashboard in the same managed process; `bin/paimon-agent stop` stops both. Set
 `dashboard.enabled=false` to run only the collector. A one-shot
 `bin/paimon-agent run --once` always performs one collection cycle and exits without starting the
@@ -176,6 +177,16 @@ http://localhost:8787/
 
 No token is required. `bin/paimon-agent dashboard-url` remains available as a convenience command
 that prints the configured local address.
+
+Each uploaded session row exposes `同步回本地` on hover, keyboard focus, selection, or a narrow
+screen. The source type selects Codex or Claude automatically, and the destination is fixed by
+`collector.codex.path` or `collector.claude.path`; the browser cannot supply a target path or enable
+overwrite. Sessions with local changes waiting for upload cannot be restored. Stop the destination
+client before clicking the action, then restart it after a successful restore. Existing local
+session IDs are skipped rather than replaced. A Codex root action includes its stored subagent
+graph. The service checks for a running Codex/ChatGPT or Claude process both when the action starts
+and again immediately before installing the staged files; this is a best-effort race guard, so the
+destination client must remain fully stopped until the Dashboard reports success.
 
 The overview distinguishes uploaded rows from sessions and messages that still belong to an
 unfinished collector commit. The detail area follows a two-pane chat layout: searchable Codex and
@@ -217,9 +228,10 @@ in the foreground:
 bin/paimon-agent dashboard
 ```
 
-This command does not acquire the collector writer lock or collect, upload, restore, or modify any
-conversation. Open the configured loopback address after it starts. Do not run the standalone
-command on the same host and port while the Dashboard managed by `start` is already active.
+This command does not acquire the collector writer lock, collect, upload, or modify Paimon. Its
+Dashboard still offers the explicit local restore action described above. Open the configured
+loopback address after it starts. Do not run the standalone command on the same host and port while
+the Dashboard managed by `start` is already active.
 
 The server binds only to the literal loopback addresses `127.0.0.1` or `::1` and also accepts
 `localhost` as a request Host alias; it cannot be bound to `0.0.0.0` or another network interface.
@@ -231,7 +243,12 @@ ssh -L 8787:127.0.0.1:8787 user@collector-host
 ```
 
 Then open `http://127.0.0.1:8787/` or `http://localhost:8787/` in the local browser. Use the same
-local and remote port so the Dashboard's strict Host validation is preserved.
+local and remote port so the Dashboard's strict Host validation is preserved. The restore action
+always writes on the machine and OS account running Paimon Agent—not on the browser machine—so do
+not use it through an SSH tunnel unless that remote destination is intentional. Loopback, strict
+Host/Origin checks, POST-only routing, and a non-simple action header protect against browser CSRF;
+they are not OS-user authentication. The mutation endpoint is intended for a single-user
+workstation only; do not enable this no-token Dashboard on a shared multi-user host.
 
 ## Build
 
@@ -356,7 +373,10 @@ metadata are retained rather than fabricating an empty attachment.
 
 This first version restores recognizable, browsable conversation history. It does not recreate
 Codex execution context that the collector intentionally does not store, such as `turn_context`,
-tool runtime state, or resumable in-flight work. Restart Codex or Claude Code after restoration.
+tool runtime state, or resumable in-flight work. Restored JSONL files carry an internal boundary
+marker so the collector remaps its old file cursor and uploads only messages appended after the
+restore instead of pausing or recollecting the restored history. Restart Codex or Claude Code after
+restoration.
 
 The script validates that the selected Java runtime is version 11. Configuration and data paths
 can be overridden with `PAIMON_AGENT_PAIMON_CONFIG`, `PAIMON_AGENT_PROJECT_CONFIG`, and

@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -46,8 +47,59 @@ public final class RestoreService {
     }
 
     public RestoreSummary restore(RestoreOptions options) throws Exception {
-        List<ChatSession> candidates = selectSessions(options);
-        Set<String> blockedByPending = pendingSessionsAndDescendants(options.type(), candidates);
+        return restore(options, java.util.Collections.emptyList());
+    }
+
+    /** Restores while treating the collector's not-yet-committed in-memory sessions as pending. */
+    public RestoreSummary restore(
+            RestoreOptions options, List<ChatSession> additionalPendingSessions)
+            throws Exception {
+        try (RestoreTargetLock ignored = RestoreTargetLock.acquire(options)) {
+            return restoreLocked(options, additionalPendingSessions, null, null);
+        }
+    }
+
+    /** Dashboard restore variant that rejects the whole selected graph if local changes appear. */
+    public RestoreSummary restore(
+            RestoreOptions options, Supplier<List<ChatSession>> livePendingSessions)
+            throws Exception {
+        return restore(options, livePendingSessions, () -> {});
+    }
+
+    /** Dashboard variant with a final native-client guard immediately before local installation. */
+    public RestoreSummary restore(
+            RestoreOptions options,
+            Supplier<List<ChatSession>> livePendingSessions,
+            Runnable beforeInstallGuard)
+            throws Exception {
+        Objects.requireNonNull(livePendingSessions, "livePendingSessions");
+        Objects.requireNonNull(beforeInstallGuard, "beforeInstallGuard");
+        try (RestoreTargetLock ignored = RestoreTargetLock.acquire(options)) {
+            List<ChatSession> initialPending = livePendingSessions.get();
+            return restoreLocked(
+                    options, initialPending, livePendingSessions, beforeInstallGuard);
+        }
+    }
+
+    private RestoreSummary restoreLocked(
+            RestoreOptions options,
+            List<ChatSession> additionalPendingSessions,
+            Supplier<List<ChatSession>> livePendingSessions,
+            Runnable beforeInstallGuard)
+            throws Exception {
+        Set<String> additionalPendingIds = new HashSet<>();
+        for (ChatSession session : additionalPendingSessions) {
+            if (options.type().sourceType().equals(session.key().sourceType())) {
+                additionalPendingIds.add(session.key().sessionId());
+            }
+        }
+        List<ChatSession> candidates = selectSessions(options, additionalPendingSessions);
+        if (livePendingSessions != null) {
+            rejectPendingDashboardSelection(options, candidates, additionalPendingSessions);
+        }
+        Set<String> blockedByPending =
+                pendingSessionsAndDescendants(
+                        options.type(), candidates, additionalPendingIds);
         List<ChatSession> stableCandidates = new ArrayList<>();
         for (ChatSession session : candidates) {
             if (blockedByPending.contains(session.key().sessionId())) {
@@ -161,6 +213,39 @@ public final class RestoreService {
                         });
             }
             verifyStableSnapshot(selected);
+            if (livePendingSessions != null) {
+                rejectPendingDashboardSelection(
+                        options, candidates, livePendingSessions.get());
+            }
+            if (beforeInstallGuard != null) {
+                try {
+                    beforeInstallGuard.run();
+                } catch (RestoreClientRunningException runningClient) {
+                    // No target files have been installed yet, so this expected rejection does
+                    // not need a retained diagnostic staging directory.
+                    complete = true;
+                    throw runningClient;
+                }
+            }
+            format.prepareForInstall();
+            if (!options.overwrite()) {
+                java.util.Iterator<Map.Entry<String, ChatSession>> selectedSessions =
+                        selected.entrySet().iterator();
+                while (selectedSessions.hasNext()) {
+                    Map.Entry<String, ChatSession> entry = selectedSessions.next();
+                    if (format.existsForInstall(entry.getValue())) {
+                        int stagedMessageCount =
+                                listMessages(messageDirectories.get(entry.getKey())).size();
+                        restoredMessages[0] -= stagedMessageCount;
+                        skippedSessions++;
+                        selectedSessions.remove();
+                        LOG.info(
+                                "Skipping {} session {} because it appeared locally during restore",
+                                options.type(),
+                                entry.getKey());
+                    }
+                }
+            }
 
             List<ChatSession> orderedSessions = new ArrayList<>(selected.values());
             orderedSessions.sort(
@@ -176,7 +261,7 @@ public final class RestoreService {
                 List<Path> installedAttachments =
                         RestoreFiles.installStagedAttachments(
                                 attachmentStagingDirectories.get(session.key().sessionId()),
-                                format.attachmentDirectory(session));
+                                format.prepareAttachmentDirectory(session));
                 try {
                     format.restore(session, orderedMessages, options.overwrite());
                 } catch (Exception failure) {
@@ -197,9 +282,80 @@ public final class RestoreService {
         }
     }
 
-    private List<ChatSession> selectSessions(RestoreOptions options) throws Exception {
+    private void rejectPendingDashboardSelection(
+            RestoreOptions options,
+            List<ChatSession> candidates,
+            List<ChatSession> livePendingSessions) {
+        Set<String> selectedIds =
+                candidates.stream()
+                        .map(session -> session.key().sessionId())
+                        .collect(Collectors.toSet());
+        for (ChatSession candidate : candidates) {
+            if (candidate.hasPendingCommit()) {
+                throw pendingSelection(candidate.key().sessionId());
+            }
+        }
+        Map<String, ChatSession> graph = new HashMap<>();
+        for (ChatSession candidate : candidates) {
+            graph.put(candidate.key().sessionId(), candidate);
+        }
+        for (ChatSession pending : livePendingSessions) {
+            if (options.type().sourceType().equals(pending.key().sourceType())) {
+                graph.put(pending.key().sessionId(), pending);
+            }
+        }
+        for (ChatSession pending : livePendingSessions) {
+            if (!options.type().sourceType().equals(pending.key().sourceType())) {
+                continue;
+            }
+            String id = pending.key().sessionId();
+            if (selectedIds.contains(id)
+                    || (options.type() == RestoreType.CODEX
+                            && descendsFromSelection(id, selectedIds, graph))) {
+                throw pendingSelection(id);
+            }
+        }
+    }
+
+    private boolean descendsFromSelection(
+            String sessionId, Set<String> selectedIds, Map<String, ChatSession> graph) {
+        Set<String> visited = new HashSet<>();
+        String current = sessionId;
+        while (visited.add(current)) {
+            ChatSession session = graph.get(current);
+            if (session == null) {
+                return false;
+            }
+            String parent = parentSessionId(session);
+            if (parent == null) {
+                return false;
+            }
+            if (selectedIds.contains(parent)) {
+                return true;
+            }
+            current = parent;
+        }
+        throw new IllegalStateException(
+                "Cycle in pending Codex subagent metadata at session " + sessionId);
+    }
+
+    private static RestoreSessionPendingException pendingSelection(String sessionId) {
+        return new RestoreSessionPendingException(
+                "Session "
+                        + sessionId
+                        + " has changes waiting for collection; retry after upload completes");
+    }
+
+    private List<ChatSession> selectSessions(
+            RestoreOptions options, List<ChatSession> additionalPendingSessions)
+            throws Exception {
         Map<String, ChatSession> available = new LinkedHashMap<>();
         for (ChatSession session : repository.loadSessions().values()) {
+            if (options.type().sourceType().equals(session.key().sourceType())) {
+                available.put(session.key().sessionId(), session);
+            }
+        }
+        for (ChatSession session : additionalPendingSessions) {
             if (options.type().sourceType().equals(session.key().sourceType())) {
                 available.put(session.key().sessionId(), session);
             }
@@ -213,7 +369,7 @@ public final class RestoreService {
 
         ChatSession requested = available.get(options.sessionId());
         if (requested == null) {
-            throw new IllegalArgumentException(
+            throw new RestoreSessionNotFoundException(
                     "No "
                             + options.type().sourceType()
                             + " session found with id "
@@ -250,10 +406,13 @@ public final class RestoreService {
     }
 
     private Set<String> pendingSessionsAndDescendants(
-            RestoreType type, List<ChatSession> candidates) {
+            RestoreType type,
+            List<ChatSession> candidates,
+            Set<String> additionalPendingIds) {
         Set<String> blocked = new HashSet<>();
         for (ChatSession session : candidates) {
-            if (session.hasPendingCommit()) {
+            if (session.hasPendingCommit()
+                    || additionalPendingIds.contains(session.key().sessionId())) {
                 blocked.add(session.key().sessionId());
             }
         }

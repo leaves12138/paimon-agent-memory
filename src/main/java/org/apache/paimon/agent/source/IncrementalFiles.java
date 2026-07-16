@@ -1,5 +1,11 @@
 package org.apache.paimon.agent.source;
 
+import org.apache.paimon.agent.model.ChatSession;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SeekableByteChannel;
@@ -14,6 +20,10 @@ import java.util.List;
 
 /** Helpers for validating and recovering append-file cursors after file replacement or rewind. */
 public final class IncrementalFiles {
+
+    public static final String RESTORE_BOUNDARY_FIELD = "_paimon_agent_restore_boundary";
+
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private IncrementalFiles() {}
 
@@ -192,5 +202,99 @@ public final class IncrementalFiles {
             offset = next;
         }
         return bestOffset;
+    }
+
+    /** Finds the last paimon-agent restore boundary in a frozen JSONL file. */
+    public static RestoreBoundary findLastRestoreBoundary(
+            JsonlTailReader reader,
+            Path path,
+            long endOffset,
+            ChatSession previous)
+            throws IOException {
+        if (previous == null) {
+            return null;
+        }
+        long offset = 0L;
+        RestoreBoundary result = null;
+        while (offset < endOffset) {
+            List<JsonlRecord> records = reader.read(path, offset, 1_000, endOffset);
+            if (records.isEmpty()) {
+                break;
+            }
+            long next = offset;
+            for (JsonlRecord record : records) {
+                if (!record.lineTerminated()) {
+                    return result;
+                }
+                next = record.endOffset();
+                if (matchesRestoreBoundary(record.json(), previous)) {
+                    result =
+                            new RestoreBoundary(
+                                    record.endOffset(), lineAnchor(record.json()));
+                }
+            }
+            if (next <= offset) {
+                break;
+            }
+            offset = next;
+        }
+        return result;
+    }
+
+    /** Metadata embedded into the last JSONL record emitted by a restore. */
+    public static ObjectNode restoreBoundaryMarker(
+            ObjectMapper objectMapper, ChatSession session) {
+        ObjectNode marker = objectMapper.createObjectNode();
+        marker.put("source_type", session.key().sourceType());
+        marker.put("session_id", session.key().sessionId());
+        marker.put("last_commit_id", session.lastCommitId());
+        marker.put("source_cursor_sha256", checkpointFingerprint(session.sourceCursor()));
+        return marker;
+    }
+
+    private static boolean matchesRestoreBoundary(String json, ChatSession previous) {
+        if (!json.contains('"' + RESTORE_BOUNDARY_FIELD + '"')) {
+            return false;
+        }
+        try {
+            JsonNode root = OBJECT_MAPPER.readTree(json);
+            if (root == null || !root.isObject()) {
+                return false;
+            }
+            JsonNode marker = root.get(RESTORE_BOUNDARY_FIELD);
+            return marker != null
+                    && marker.isObject()
+                    && previous.key().sourceType().equals(marker.path("source_type").asText())
+                    && previous.key().sessionId().equals(marker.path("session_id").asText())
+                    && marker.path("last_commit_id").isIntegralNumber()
+                    && previous.lastCommitId() == marker.path("last_commit_id").asLong()
+                    && checkpointFingerprint(previous.sourceCursor())
+                            .equals(marker.path("source_cursor_sha256").asText());
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
+    private static String checkpointFingerprint(String cursor) {
+        return lineAnchor(cursor == null ? "" : cursor);
+    }
+
+    /** Byte boundary and line anchor written by a completed local restore. */
+    public static final class RestoreBoundary {
+        private final long offset;
+        private final String anchor;
+
+        private RestoreBoundary(long offset, String anchor) {
+            this.offset = offset;
+            this.anchor = anchor;
+        }
+
+        public long offset() {
+            return offset;
+        }
+
+        public String anchor() {
+            return anchor;
+        }
     }
 }

@@ -1,6 +1,7 @@
 package org.apache.paimon.agent.restore;
 
 import org.apache.paimon.agent.model.ChatSession;
+import org.apache.paimon.agent.source.IncrementalFiles;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -32,7 +33,7 @@ final class ClaudeFormatRestorer implements ConversationFormatRestorer {
             throws Exception {
         this.targetProject = canonicalProject(targetProject);
         this.claudeHome =
-                RestoreFiles.canonicalTargetDirectory(claudeHome, true, "Claude target home");
+                RestoreFiles.canonicalTargetPath(claudeHome, false, "Claude target home");
         this.objectMapper = objectMapper;
     }
 
@@ -44,7 +45,7 @@ final class ClaudeFormatRestorer implements ConversationFormatRestorer {
     @Override
     public Path attachmentDirectory(ChatSession session) {
         try {
-            return RestoreFiles.ensureContainedDirectory(
+            return RestoreFiles.planContainedDirectory(
                     claudeHome,
                     Paths.get(
                             "restored-attachments",
@@ -56,9 +57,27 @@ final class ClaudeFormatRestorer implements ConversationFormatRestorer {
     }
 
     @Override
+    public void prepareForInstall() throws Exception {
+        RestoreFiles.canonicalTargetDirectory(claudeHome, true, "Claude target home");
+    }
+
+    @Override
+    public Path prepareAttachmentDirectory(ChatSession session) throws Exception {
+        return RestoreFiles.ensureContainedDirectory(
+                claudeHome,
+                Paths.get(
+                        "restored-attachments",
+                        localSessionId(session.key().sessionId()).toString()));
+    }
+
+    @Override
     public void restore(ChatSession session, List<Path> orderedMessages, boolean overwrite)
             throws Exception {
-        Path output = transcriptPath(session);
+        Path plannedOutput = transcriptPath(session);
+        Path output =
+                RestoreFiles.resolveContainedFile(
+                        claudeHome, claudeHome.relativize(plannedOutput));
+        transcriptPaths.put(session.key().sessionId(), output);
         if (Files.isSymbolicLink(output)) {
             throw new java.io.IOException(
                     "Claude transcript must not be a symbolic link: " + output);
@@ -128,6 +147,7 @@ final class ClaudeFormatRestorer implements ConversationFormatRestorer {
             title.put("sessionId", localSessionId);
             lines.add(objectMapper.writeValueAsString(title));
         }
+        markRestoreBoundary(lines, localSessionId, session);
 
         boolean reserved = false;
         boolean committed = false;
@@ -152,13 +172,39 @@ final class ClaudeFormatRestorer implements ConversationFormatRestorer {
         }
     }
 
+    private void markRestoreBoundary(
+            List<String> lines, String localSessionId, ChatSession session)
+            throws java.io.IOException {
+        ObjectNode boundary;
+        if (lines.isEmpty()) {
+            boundary = objectMapper.createObjectNode();
+            boundary.put("type", "paimon-agent-restore-boundary");
+            boundary.put("sessionId", localSessionId);
+            boundary.set(
+                    IncrementalFiles.RESTORE_BOUNDARY_FIELD,
+                    IncrementalFiles.restoreBoundaryMarker(objectMapper, session));
+            lines.add(objectMapper.writeValueAsString(boundary));
+            return;
+        }
+        int last = lines.size() - 1;
+        JsonNode parsed = objectMapper.readTree(lines.get(last));
+        if (!(parsed instanceof ObjectNode)) {
+            throw new java.io.IOException("Restored Claude boundary is not a JSON object");
+        }
+        boundary = (ObjectNode) parsed;
+        boundary.set(
+                IncrementalFiles.RESTORE_BOUNDARY_FIELD,
+                IncrementalFiles.restoreBoundaryMarker(objectMapper, session));
+        lines.set(last, objectMapper.writeValueAsString(boundary));
+    }
+
     private Path transcriptPath(ChatSession session) throws Exception {
         Path cached = transcriptPaths.get(session.key().sessionId());
         if (cached != null) {
             return cached;
         }
         Path result =
-                RestoreFiles.resolveContainedFile(
+                RestoreFiles.planContainedFile(
                         claudeHome,
                         Paths.get(
                                 "projects",

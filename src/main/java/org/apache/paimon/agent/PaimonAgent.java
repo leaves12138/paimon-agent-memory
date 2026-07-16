@@ -5,9 +5,13 @@ import org.apache.paimon.agent.config.ConfigLoader;
 import org.apache.paimon.agent.config.ProjectConfig;
 import org.apache.paimon.agent.dashboard.DashboardDataStore;
 import org.apache.paimon.agent.dashboard.DashboardServer;
+import org.apache.paimon.agent.dashboard.DashboardRestoreResult;
+import org.apache.paimon.agent.dashboard.DashboardSessionRestorer;
 import org.apache.paimon.agent.dashboard.LiveDashboardDataStore;
 import org.apache.paimon.agent.dashboard.PaimonDashboardDataStore;
+import org.apache.paimon.agent.model.ChatSession;
 import org.apache.paimon.agent.restore.RestoreOptions;
+import org.apache.paimon.agent.restore.RestoreClientProcessGuard;
 import org.apache.paimon.agent.restore.RestoreService;
 import org.apache.paimon.agent.restore.RestoreSummary;
 import org.apache.paimon.agent.restore.RestoreType;
@@ -239,7 +243,9 @@ public final class PaimonAgent {
                     liveDataStore,
                     collectorStatus,
                     objectMapper,
-                    dataDirectory);
+                    dataDirectory,
+                    dashboardSessionRestorer(
+                            configuration, objectMapper, dataDirectory, pendingData));
         } catch (Exception failure) {
             try {
                 liveDataStore.close();
@@ -248,6 +254,49 @@ public final class PaimonAgent {
             }
             throw failure;
         }
+    }
+
+    private static DashboardSessionRestorer dashboardSessionRestorer(
+            AgentConfiguration configuration,
+            ObjectMapper objectMapper,
+            Path dataDirectory,
+            java.util.function.Supplier<PendingDataSnapshot> pendingData) {
+        return (type, sessionId) -> {
+            RestoreClientProcessGuard.requireStopped(type);
+            Path target =
+                    type == RestoreType.CODEX
+                            ? configuration.project().codex().path()
+                            : configuration.project().claude().path();
+            RestoreOptions options =
+                    new RestoreOptions(
+                            type,
+                            target,
+                            dataDirectory,
+                            null,
+                            sessionId,
+                            false);
+            try (PaimonChatRepository repository = new PaimonChatRepository(configuration)) {
+                repository.initializeForRestore();
+                RestoreSummary summary =
+                        new RestoreService(repository, objectMapper)
+                                .restore(
+                                        options,
+                                        () -> {
+                                            List<ChatSession> pendingSessions =
+                                                    new ArrayList<>();
+                                            pendingData
+                                                    .get()
+                                                    .batches()
+                                                    .forEach(
+                                                            batch ->
+                                                                    pendingSessions.add(
+                                                                            batch.session()));
+                                            return pendingSessions;
+                                        },
+                                        () -> RestoreClientProcessGuard.requireStopped(type));
+                return new DashboardRestoreResult(options.target(), summary);
+            }
+        };
     }
 
     private static void closeDashboardAndCollector(

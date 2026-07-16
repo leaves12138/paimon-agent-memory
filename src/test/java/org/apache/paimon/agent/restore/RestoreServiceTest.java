@@ -129,6 +129,11 @@ class RestoreServiceTest {
                                     }
                                 })
                         .collect(Collectors.toList());
+        assertThat(
+                        events.get(events.size() - 1)
+                                .path("_paimon_agent_restore_boundary")
+                                .isObject())
+                .isTrue();
         JsonNode event =
                 events.stream()
                         .filter(node -> "response_item".equals(node.path("type").asText()))
@@ -615,6 +620,268 @@ class RestoreServiceTest {
     }
 
     @Test
+    void dashboardRestoreRejectsTheWholeCodexGraphWhenAChildIsPending()
+            throws Exception {
+        String rootId = "019f6100-0000-7000-8000-000000000011";
+        String childId = "019f6100-0000-7000-8000-000000000012";
+        ChatSession root =
+                session(
+                        new SessionKey("codex", rootId),
+                        "Stable root",
+                        tempDir.toString());
+        ChatSession child =
+                session(
+                                new SessionKey("codex", childId),
+                                "Pending child",
+                                tempDir.toString())
+                        .withSubagentSourceJson(
+                                "{\"thread_spawn\":{\"parent_thread_id\":\""
+                                        + rootId
+                                        + "\",\"depth\":1}}");
+        Path codexHome = tempDir.resolve("strict-pending-codex-home");
+        initializeCodexState(codexHome);
+        RestoreOptions options =
+                new RestoreOptions(
+                        RestoreType.CODEX,
+                        codexHome,
+                        tempDir.resolve("strict-pending-data"),
+                        null,
+                        rootId,
+                        false);
+
+        assertThatThrownBy(
+                        () ->
+                                new RestoreService(
+                                                new FakeRepository(
+                                                        java.util.Arrays.asList(root, child)),
+                                                mapper)
+                                        .restore(
+                                                options,
+                                                () -> Collections.singletonList(child)))
+                .isInstanceOf(RestoreSessionPendingException.class)
+                .hasMessageContaining(childId);
+
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                Statement statement = connection.createStatement();
+                ResultSet rows = statement.executeQuery("SELECT id FROM threads")) {
+            assertThat(rows.next()).isFalse();
+        }
+        assertThat(codexHome.resolve("sessions")).doesNotExist();
+    }
+
+    @Test
+    void dashboardRestoreRechecksTheNativeClientImmediatelyBeforeInstall()
+            throws Exception {
+        String sessionId = "019f6100-0000-7000-8000-000000000021";
+        SessionKey key = new SessionKey("codex", sessionId);
+        ChatSession session = session(key, "Guarded restore", tempDir.toString());
+        ChatMessage prompt =
+                message(
+                        key,
+                        "guarded-prompt",
+                        1L,
+                        "user",
+                        "response_item",
+                        codexPrompt("do not install"),
+                        Collections.emptyList());
+        Path codexHome = tempDir.resolve("guarded-codex-home");
+        initializeCodexState(codexHome);
+        assertThat(codexJournalMode(codexHome)).isEqualTo("delete");
+        boolean[] checked = {false};
+
+        assertThatThrownBy(
+                        () ->
+                                new RestoreService(
+                                                new FakeRepository(session, prompt), mapper)
+                                        .restore(
+                                                new RestoreOptions(
+                                                        RestoreType.CODEX,
+                                                        codexHome,
+                                                        tempDir.resolve("guarded-data"),
+                                                        null,
+                                                        sessionId,
+                                                        false),
+                                                Collections::emptyList,
+                                                () -> {
+                                                    checked[0] = true;
+                                                    throw new RestoreClientRunningException(
+                                                            "Codex is running");
+                                                }))
+                .isInstanceOf(RestoreClientRunningException.class);
+
+        assertThat(checked[0]).isTrue();
+        assertThat(codexHome.resolve("session_index.jsonl")).doesNotExist();
+        assertThat(codexHome.resolve("sessions")).doesNotExist();
+        assertThat(codexHome.resolve("attachments")).doesNotExist();
+        assertThat(codexJournalMode(codexHome)).isEqualTo("delete");
+        assertThat(codexHome.resolve("state_5.sqlite-wal")).doesNotExist();
+        assertThat(codexHome.resolve("state_5.sqlite-shm")).doesNotExist();
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                Statement statement = connection.createStatement();
+                ResultSet rows = statement.executeQuery("SELECT id FROM threads")) {
+            assertThat(rows.next()).isFalse();
+        }
+    }
+
+    @Test
+    void dashboardGuardDoesNotCreateAMissingClaudeHome() throws Exception {
+        String sessionId = "019f6100-0000-7000-8000-000000000022";
+        SessionKey key = new SessionKey("claude", sessionId);
+        ChatSession session = session(key, "Guarded Claude restore", tempDir.toString());
+        ChatMessage prompt =
+                message(
+                        key,
+                        "guarded-claude-prompt",
+                        1L,
+                        "user",
+                        "user",
+                        "{\"type\":\"user\",\"message\":{\"content\":\"do not install\"}}",
+                        Collections.emptyList());
+        Path claudeHome = tempDir.resolve("guarded-claude-home");
+
+        assertThatThrownBy(
+                        () ->
+                                new RestoreService(
+                                                new FakeRepository(session, prompt), mapper)
+                                        .restore(
+                                                new RestoreOptions(
+                                                        RestoreType.CLAUDE,
+                                                        claudeHome,
+                                                        tempDir.resolve("guarded-claude-data"),
+                                                        tempDir,
+                                                        sessionId,
+                                                        false),
+                                                Collections::emptyList,
+                                                () -> {
+                                                    throw new RestoreClientRunningException(
+                                                            "Claude is running");
+                                                }))
+                .isInstanceOf(RestoreClientRunningException.class);
+
+        assertThat(claudeHome).doesNotExist();
+    }
+
+    @Test
+    void dashboardPreflightReadsACleanWalDatabaseWithoutCreatingSidecars()
+            throws Exception {
+        String sessionId = "019f6100-0000-7000-8000-000000000023";
+        SessionKey key = new SessionKey("codex", sessionId);
+        ChatSession session = session(key, "Clean WAL restore", tempDir.toString());
+        ChatMessage prompt =
+                message(
+                        key,
+                        "clean-wal-prompt",
+                        1L,
+                        "user",
+                        "response_item",
+                        codexPrompt("do not install"),
+                        Collections.emptyList());
+        Path codexHome = tempDir.resolve("clean-wal-codex-home");
+        initializeCodexState(codexHome);
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                Statement statement = connection.createStatement();
+                ResultSet rows = statement.executeQuery("PRAGMA journal_mode=WAL")) {
+            assertThat(rows.next()).isTrue();
+            assertThat(rows.getString(1)).isEqualTo("wal");
+        }
+        assertThat(codexHome.resolve("state_5.sqlite-wal")).doesNotExist();
+        assertThat(codexHome.resolve("state_5.sqlite-shm")).doesNotExist();
+
+        assertThatThrownBy(
+                        () ->
+                                new RestoreService(
+                                                new FakeRepository(session, prompt), mapper)
+                                        .restore(
+                                                new RestoreOptions(
+                                                        RestoreType.CODEX,
+                                                        codexHome,
+                                                        tempDir.resolve("clean-wal-data"),
+                                                        null,
+                                                        sessionId,
+                                                        false),
+                                                Collections::emptyList,
+                                                () -> {
+                                                    throw new RestoreClientRunningException(
+                                                            "Codex is running");
+                                                }))
+                .isInstanceOf(RestoreClientRunningException.class);
+
+        assertThat(codexJournalMode(codexHome)).isEqualTo("wal");
+        assertThat(codexHome.resolve("state_5.sqlite-wal")).doesNotExist();
+        assertThat(codexHome.resolve("state_5.sqlite-shm")).doesNotExist();
+    }
+
+    @Test
+    void dashboardRestoreSkipsASessionThatAppearsAfterTheFinalGuard()
+            throws Exception {
+        String sessionId = "019f6100-0000-7000-8000-000000000024";
+        SessionKey key = new SessionKey("codex", sessionId);
+        ChatSession session = session(key, "Cloud title", tempDir.toString());
+        ChatMessage prompt =
+                message(
+                        key,
+                        "appearing-session-prompt",
+                        1L,
+                        "user",
+                        "response_item",
+                        codexPrompt("must not overwrite"),
+                        Collections.emptyList());
+        Path codexHome = tempDir.resolve("appearing-session-codex-home");
+        initializeCodexState(codexHome);
+
+        RestoreSummary summary =
+                new RestoreService(new FakeRepository(session, prompt), mapper)
+                        .restore(
+                                new RestoreOptions(
+                                        RestoreType.CODEX,
+                                        codexHome,
+                                        tempDir.resolve("appearing-session-data"),
+                                        null,
+                                        sessionId,
+                                        false),
+                                Collections::emptyList,
+                                () -> {
+                                    try (Connection connection =
+                                                    DriverManager.getConnection(
+                                                            "jdbc:sqlite:"
+                                                                    + codexHome.resolve(
+                                                                            "state_5.sqlite"));
+                                            Statement statement = connection.createStatement()) {
+                                        statement.execute(
+                                                "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, "
+                                                        + "model_provider, cwd, title, sandbox_policy, approval_mode) VALUES ('"
+                                                        + sessionId
+                                                        + "', '/tmp/native.jsonl', 1, 1, 'vscode', 'openai', "
+                                                        + "'/tmp', 'native title', '{}', 'on-request')");
+                                    } catch (Exception error) {
+                                        throw new IllegalStateException(error);
+                                    }
+                                });
+
+        assertThat(summary.restoredSessions()).isZero();
+        assertThat(summary.restoredMessages()).isZero();
+        assertThat(summary.skippedSessions()).isEqualTo(1);
+        assertThat(codexHome.resolve("session_index.jsonl")).doesNotExist();
+        assertThat(codexHome.resolve("sessions")).doesNotExist();
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                Statement statement = connection.createStatement();
+                ResultSet rows =
+                        statement.executeQuery(
+                                "SELECT title FROM threads WHERE id = '" + sessionId + "'")) {
+            assertThat(rows.next()).isTrue();
+            assertThat(rows.getString(1)).isEqualTo("native title");
+        }
+    }
+
+    @Test
     void restoresClaudeProjectTranscriptAndRepairsBrokenParentChain() throws Exception {
         String sessionId = UUID.randomUUID().toString();
         String firstUuid = UUID.randomUUID().toString();
@@ -685,6 +952,7 @@ class RestoreServiceTest {
         assertThat(restoredSecond.path("isSidechain").asBoolean()).isFalse();
         assertThat(title.path("type").asText()).isEqualTo("custom-title");
         assertThat(title.path("customTitle").asText()).isEqualTo("Restored Claude title");
+        assertThat(title.path("_paimon_agent_restore_boundary").isObject()).isTrue();
     }
 
     @Test
@@ -997,9 +1265,7 @@ class RestoreServiceTest {
                                                         false)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("changed while restore was reading Paimon");
-        try (Stream<Path> files = Files.walk(claudeHome)) {
-            assertThat(files.filter(path -> path.toString().endsWith(".jsonl"))).isEmpty();
-        }
+        assertThat(claudeHome).doesNotExist();
     }
 
     @Test
@@ -1340,6 +1606,17 @@ class RestoreServiceTest {
                 assertThat(rows.next()).isTrue();
                 return rows.getString(1);
             }
+        }
+    }
+
+    private static String codexJournalMode(Path codexHome) throws Exception {
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                "jdbc:sqlite:" + codexHome.resolve("state_5.sqlite"));
+                Statement statement = connection.createStatement();
+                ResultSet rows = statement.executeQuery("PRAGMA journal_mode")) {
+            assertThat(rows.next()).isTrue();
+            return rows.getString(1);
         }
     }
 

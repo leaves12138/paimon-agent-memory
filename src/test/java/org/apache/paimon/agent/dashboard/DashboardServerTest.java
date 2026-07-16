@@ -3,6 +3,9 @@ package org.apache.paimon.agent.dashboard;
 import org.apache.paimon.agent.config.DashboardConfig;
 import org.apache.paimon.agent.config.ProjectConfig;
 import org.apache.paimon.agent.config.SourceConfig;
+import org.apache.paimon.agent.restore.RestoreSessionNotFoundException;
+import org.apache.paimon.agent.restore.RestoreSummary;
+import org.apache.paimon.agent.restore.RestoreType;
 import org.apache.paimon.agent.service.CollectorStatus;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -51,6 +54,7 @@ class DashboardServerTest {
 
     private DashboardServer server;
     private FakeDashboardDataStore dataStore;
+    private FakeDashboardSessionRestorer sessionRestorer;
     private URI address;
 
     @AfterEach
@@ -74,6 +78,7 @@ class DashboardServerTest {
                 .contains("id=\"session-list\"")
                 .contains("id=\"message-list\"")
                 .contains("id=\"chat-pane\"")
+                .contains("Paimon 数据只读 · 可将单个会话同步回本机客户端")
                 .doesNotContain("id=\"sessions-tab\"", "id=\"messages-tab\"");
         assertSecurityHeaders(index);
 
@@ -88,7 +93,9 @@ class DashboardServerTest {
                 .contains(".message-inline-attachments")
                 .contains("width: 144px")
                 .contains("height: 144px")
-                .contains("object-fit: cover");
+                .contains("object-fit: cover")
+                .contains(".session-sync-button")
+                .contains(".session-sync-symbol");
 
         HttpResponse<byte[]> javascript = request("GET", "dashboard.js");
         assertThat(javascript.statusCode()).isEqualTo(200);
@@ -131,6 +138,11 @@ class DashboardServerTest {
                 .contains("message-inline-attachments")
                 .contains("window.IntersectionObserver")
                 .contains("fetchAttachmentBlob")
+                .contains("postRestore")
+                .contains("/sessions/restore?")
+                .contains("X-Paimon-Agent-Action")
+                .contains("restore-session")
+                .contains("同步回本地")
                 .doesNotContain(
                         "foundVisibleMessage",
                         "MAX_AUTO_HIDDEN_TOOL_PAGES",
@@ -299,6 +311,106 @@ class DashboardServerTest {
     }
 
     @Test
+    void restoresOneSelectedSessionThroughProtectedPostAction() throws Exception {
+        startServer();
+
+        HttpResponse<byte[]> restored =
+                request(
+                        "POST",
+                        "api/sessions/restore?sourceType=codex&sessionId=session-1",
+                        "X-Paimon-Agent-Action",
+                        "restore-session");
+
+        assertThat(restored.statusCode()).isEqualTo(200);
+        assertSecurityHeaders(restored);
+        JsonNode result = json(restored);
+        assertThat(result.path("status").asText()).isEqualTo("restored");
+        assertThat(result.path("sourceType").asText()).isEqualTo("codex");
+        assertThat(result.path("sessionId").asText()).isEqualTo("session-1");
+        assertThat(result.path("target").asText())
+                .isEqualTo(tempDir.resolve("codex-home").toAbsolutePath().toString());
+        assertThat(result.path("restoredSessions").asInt()).isEqualTo(1);
+        assertThat(result.path("restoredMessages").asInt()).isEqualTo(12);
+        assertThat(result.path("skippedSessions").asInt()).isZero();
+        assertThat(result.path("overwrite").asBoolean()).isFalse();
+        assertThat(result.path("restartRequired").asBoolean()).isTrue();
+        assertThat(sessionRestorer.lastType).isEqualTo(RestoreType.CODEX);
+        assertThat(sessionRestorer.lastSessionId).isEqualTo("session-1");
+
+        HttpResponse<byte[]> claude =
+                request(
+                        "POST",
+                        "api/sessions/restore?sourceType=claude&sessionId=claude-session",
+                        "X-Paimon-Agent-Action",
+                        "restore-session");
+        assertThat(claude.statusCode()).isEqualTo(200);
+        assertThat(json(claude).path("target").asText())
+                .isEqualTo(tempDir.resolve("claude-home").toAbsolutePath().toString());
+        assertThat(sessionRestorer.lastType).isEqualTo(RestoreType.CLAUDE);
+    }
+
+    @Test
+    void protectsRestoreActionAndReportsValidationAndMissingSessions() throws Exception {
+        startServer();
+        String path = "api/sessions/restore?sourceType=codex&sessionId=session-1";
+
+        HttpResponse<byte[]> get = request("GET", path);
+        assertError(get, 405, "Only POST");
+        assertThat(get.headers().firstValue("Allow")).contains("POST");
+        assertError(request("POST", path), 403, "Restore action rejected");
+        assertError(
+                request(
+                        "POST",
+                        "api/sessions/restore?sourceType=other&sessionId=session-1",
+                        "X-Paimon-Agent-Action",
+                        "restore-session"),
+                400,
+                "sourceType must be codex or claude");
+        assertError(
+                request(
+                        "POST",
+                        "api/sessions/restore?sourceType=codex&sessionId=a&sessionId=b",
+                        "X-Paimon-Agent-Action",
+                        "restore-session"),
+                400,
+                "Duplicate query parameter: sessionId");
+
+        sessionRestorer.missing = true;
+        assertError(
+                request(
+                        "POST",
+                        path,
+                        "X-Paimon-Agent-Action",
+                        "restore-session"),
+                404,
+                "Session is no longer available");
+    }
+
+    @Test
+    void serializesRestoreActionsWithoutRetryingTheMutation() throws Exception {
+        startServer();
+        sessionRestorer.block();
+        String path = "api/sessions/restore?sourceType=codex&sessionId=session-1";
+        CompletableFuture<HttpResponse<byte[]>> first =
+                requestAsync(
+                        "POST", path, "X-Paimon-Agent-Action", "restore-session");
+        try {
+            assertThat(sessionRestorer.awaitStarted()).isTrue();
+            HttpResponse<byte[]> busy =
+                    request(
+                            "POST",
+                            path,
+                            "X-Paimon-Agent-Action",
+                            "restore-session");
+            assertError(busy, 409, "Another local restore is already running");
+            assertThat(busy.headers().firstValue("Retry-After")).contains("1");
+        } finally {
+            sessionRestorer.release();
+        }
+        assertThat(first.get(5, TimeUnit.SECONDS).statusCode()).isEqualTo(200);
+    }
+
+    @Test
     void rejectsCrossOriginAndCrossSiteRequests() throws Exception {
         startServer();
 
@@ -387,6 +499,7 @@ class DashboardServerTest {
 
     private void startServer(String host) throws Exception {
         dataStore = new FakeDashboardDataStore();
+        sessionRestorer = new FakeDashboardSessionRestorer(tempDir);
         server =
                 new DashboardServer(
                         project(host),
@@ -402,7 +515,8 @@ class DashboardServerTest {
                                         2,
                                         3),
                         objectMapper,
-                        tempDir.resolve("data"));
+                        tempDir.resolve("data"),
+                        sessionRestorer);
         address = server.start();
     }
 
@@ -457,10 +571,18 @@ class DashboardServerTest {
     }
 
     private CompletableFuture<HttpResponse<byte[]>> requestAsync(String relativePath) {
+        return requestAsync("GET", relativePath, null, null);
+    }
+
+    private CompletableFuture<HttpResponse<byte[]>> requestAsync(
+            String method,
+            String relativePath,
+            String headerName,
+            String headerValue) {
         return CompletableFuture.supplyAsync(
                 () -> {
                     try {
-                        return request("GET", relativePath);
+                        return request(method, relativePath, headerName, headerValue);
                     } catch (Exception error) {
                         throw new RuntimeException(error);
                     }
@@ -514,6 +636,53 @@ class DashboardServerTest {
         assertThat(response.headers().firstValue("Referrer-Policy")).contains("no-referrer");
         assertThat(response.headers().firstValue("Cache-Control"))
                 .hasValueSatisfying(value -> assertThat(value).contains("no-store"));
+    }
+
+    private static final class FakeDashboardSessionRestorer
+            implements DashboardSessionRestorer {
+
+        private final Path root;
+        private volatile RestoreType lastType;
+        private volatile String lastSessionId;
+        private volatile boolean missing;
+        private volatile CountDownLatch started = new CountDownLatch(0);
+        private volatile CountDownLatch release = new CountDownLatch(0);
+
+        private FakeDashboardSessionRestorer(Path root) {
+            this.root = root;
+        }
+
+        @Override
+        public DashboardRestoreResult restore(RestoreType type, String sessionId)
+                throws Exception {
+            lastType = type;
+            lastSessionId = sessionId;
+            if (missing) {
+                throw new RestoreSessionNotFoundException("missing");
+            }
+            if (release.getCount() > 0) {
+                started.countDown();
+                if (!release.await(5, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("Timed out waiting to release restore");
+                }
+            }
+            return new DashboardRestoreResult(
+                    root.resolve(type.sourceType() + "-home"),
+                    new RestoreSummary(1, 12, 0));
+        }
+
+        private void block() {
+            started = new CountDownLatch(1);
+            release = new CountDownLatch(1);
+        }
+
+        private boolean awaitStarted() throws InterruptedException {
+            return started.await(5, TimeUnit.SECONDS);
+        }
+
+        private void release() {
+            release.countDown();
+        }
     }
 
     private static final class FakeDashboardDataStore implements DashboardDataStore {

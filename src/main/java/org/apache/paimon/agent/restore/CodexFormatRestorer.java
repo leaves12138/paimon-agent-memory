@@ -1,6 +1,7 @@
 package org.apache.paimon.agent.restore;
 
 import org.apache.paimon.agent.model.ChatSession;
+import org.apache.paimon.agent.source.IncrementalFiles;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -64,7 +65,7 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
     CodexFormatRestorer(Path codexHome, Path targetProject, ObjectMapper objectMapper)
             throws Exception {
         this.codexHome =
-                RestoreFiles.canonicalTargetDirectory(codexHome, false, "Codex target home");
+                RestoreFiles.canonicalTargetPath(codexHome, true, "Codex target home");
         this.stateDatabase = this.codexHome.resolve("state_5.sqlite");
         this.sessionIndex =
                 RestoreFiles.resolveContainedFile(
@@ -109,30 +110,22 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
 
     @Override
     public boolean exists(ChatSession session) throws Exception {
-        try (Connection connection = openConnection();
-                PreparedStatement statement =
-                        connection.prepareStatement(
-                                "SELECT rollout_path FROM threads WHERE id = ?")) {
-            statement.setString(1, session.key().sessionId());
-            try (ResultSet rows = statement.executeQuery()) {
-                if (!rows.next()) {
-                    return false;
-                }
-                String value = rows.getString(1);
-                if (value != null && !value.trim().isEmpty()) {
-                    existingRollouts.put(
-                            session.key().sessionId(),
-                            Paths.get(value).toAbsolutePath().normalize());
-                }
-                return true;
-            }
+        try (Connection connection = openReadOnlyConnection()) {
+            return exists(connection, session);
+        }
+    }
+
+    @Override
+    public boolean existsForInstall(ChatSession session) throws Exception {
+        try (Connection connection = openConnection()) {
+            return exists(connection, session);
         }
     }
 
     @Override
     public Path attachmentDirectory(ChatSession session) {
         try {
-            return RestoreFiles.ensureContainedDirectory(
+            return RestoreFiles.planContainedDirectory(
                     codexHome,
                     Paths.get(
                             "attachments",
@@ -142,6 +135,21 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
             throw new IllegalStateException(
                     "Unable to create a contained Codex attachment directory", e);
         }
+    }
+
+    @Override
+    public void prepareForInstall() throws Exception {
+        RestoreFiles.canonicalTargetDirectory(codexHome, false, "Codex target home");
+    }
+
+    @Override
+    public Path prepareAttachmentDirectory(ChatSession session) throws Exception {
+        return RestoreFiles.ensureContainedDirectory(
+                codexHome,
+                Paths.get(
+                        "attachments",
+                        "restored",
+                        safeSessionId(session.key().sessionId())));
     }
 
     @Override
@@ -173,6 +181,7 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
         rolloutLines.addAll(
                 restoreTurnBoundaries(
                         session.key().sessionId(), events, parsedMessages, turns, createdAt));
+        markRestoreBoundary(rolloutLines, session);
         installRolloutAndThread(
                 session,
                 rollout,
@@ -182,6 +191,20 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
                 createdAt,
                 updatedAt,
                 overwrite);
+    }
+
+    private void markRestoreBoundary(List<String> lines, ChatSession session)
+            throws IOException {
+        int last = lines.size() - 1;
+        JsonNode parsed = objectMapper.readTree(lines.get(last));
+        if (!(parsed instanceof ObjectNode)) {
+            throw new IOException("Restored Codex boundary is not a JSON object");
+        }
+        ((ObjectNode) parsed)
+                .set(
+                        IncrementalFiles.RESTORE_BOUNDARY_FIELD,
+                        IncrementalFiles.restoreBoundaryMarker(objectMapper, session));
+        lines.set(last, objectMapper.writeValueAsString(parsed));
     }
 
     private void installRolloutAndThread(
@@ -1109,7 +1132,7 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
     }
 
     private String loadLatestCliVersion() throws Exception {
-        try (Connection connection = openConnection()) {
+        try (Connection connection = openReadOnlyConnection()) {
             Map<String, Column> available = columns(connection);
             if (!available.containsKey("cli_version")) {
                 return "paimon-agent-restore";
@@ -1131,7 +1154,7 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
     }
 
     private void validateStateDatabase() throws Exception {
-        try (Connection connection = openConnection()) {
+        try (Connection connection = openReadOnlyConnection()) {
             if (!tableExists(connection, "_sqlx_migrations")
                     || !tableExists(connection, "threads")) {
                 throw new IllegalStateException(
@@ -1198,6 +1221,50 @@ final class CodexFormatRestorer implements ConversationFormatRestorer {
                 failure.addSuppressed(closeFailure);
             }
             throw failure;
+        }
+    }
+
+    private Connection openReadOnlyConnection() throws Exception {
+        Path wal = Paths.get(stateDatabase.toString() + "-wal");
+        Path shm = Paths.get(stateDatabase.toString() + "-shm");
+        boolean sidecarsPresent = Files.exists(wal) || Files.exists(shm);
+        String parameters = sidecarsPresent ? "?mode=ro" : "?mode=ro&immutable=1";
+        Connection connection =
+                DriverManager.getConnection(
+                        "jdbc:sqlite:" + stateDatabase.toUri() + parameters);
+        try {
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("PRAGMA busy_timeout=10000");
+                statement.execute("PRAGMA query_only=ON");
+            }
+            return connection;
+        } catch (Exception failure) {
+            try {
+                connection.close();
+            } catch (Exception closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
+    }
+
+    private boolean exists(Connection connection, ChatSession session) throws Exception {
+        try (PreparedStatement statement =
+                connection.prepareStatement(
+                        "SELECT rollout_path FROM threads WHERE id = ?")) {
+            statement.setString(1, session.key().sessionId());
+            try (ResultSet rows = statement.executeQuery()) {
+                if (!rows.next()) {
+                    return false;
+                }
+                String value = rows.getString(1);
+                if (value != null && !value.trim().isEmpty()) {
+                    existingRollouts.put(
+                            session.key().sessionId(),
+                            Paths.get(value).toAbsolutePath().normalize());
+                }
+                return true;
+            }
         }
     }
 

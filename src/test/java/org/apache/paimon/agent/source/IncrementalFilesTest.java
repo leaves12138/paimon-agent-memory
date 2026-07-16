@@ -1,5 +1,10 @@
 package org.apache.paimon.agent.source;
 
+import org.apache.paimon.agent.model.ChatSession;
+import org.apache.paimon.agent.model.SessionKey;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -7,12 +12,48 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Instant;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class IncrementalFilesTest {
 
     @TempDir Path tempDir;
+
+    @Test
+    void findsTheLastRestoreBoundaryWithoutMatchingEscapedMessageText() throws Exception {
+        Path file = tempDir.resolve("restored.jsonl");
+        ObjectMapper mapper = new ObjectMapper();
+        ChatSession previous = checkpoint();
+        String escaped =
+                "{\"text\":\"\\\"_paimon_agent_restore_boundary\\\":true\"}";
+        String first = boundary(mapper, previous, 1);
+        String second = boundary(mapper, previous, 2);
+        Files.writeString(file, escaped + '\n' + first + '\n' + second + '\n');
+
+        IncrementalFiles.RestoreBoundary boundary =
+                IncrementalFiles.findLastRestoreBoundary(
+                        new JsonlTailReader(), file, Files.size(file), previous);
+
+        assertThat(boundary).isNotNull();
+        assertThat(boundary.offset()).isEqualTo(Files.size(file));
+        assertThat(boundary.anchor()).isEqualTo(IncrementalFiles.lineAnchor(second));
+
+        Path falseMarkers = tempDir.resolve("false-markers.jsonl");
+        Files.writeString(
+                falseMarkers,
+                escaped
+                        + '\n'
+                        + "{\"payload\":{\"_paimon_agent_restore_boundary\":{"
+                        + "\"source_type\":\"codex\"}}}\n");
+        assertThat(
+                        IncrementalFiles.findLastRestoreBoundary(
+                                new JsonlTailReader(),
+                                falseMarkers,
+                                Files.size(falseMarkers),
+                                previous))
+                .isNull();
+    }
 
     @Test
     void detectsAndRemapsAnAnchorMovedByAnInPlaceRewrite() throws Exception {
@@ -92,5 +133,31 @@ class IncrementalFilesTest {
                                 expectedOffset,
                                 boundary))
                 .isEqualTo(expectedOffset);
+    }
+
+    private static String boundary(ObjectMapper mapper, ChatSession previous, int index)
+            throws Exception {
+        ObjectNode line = mapper.createObjectNode();
+        line.put("index", index);
+        line.set(
+                IncrementalFiles.RESTORE_BOUNDARY_FIELD,
+                IncrementalFiles.restoreBoundaryMarker(mapper, previous));
+        return mapper.writeValueAsString(line);
+    }
+
+    private static ChatSession checkpoint() {
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+        return new ChatSession(
+                new SessionKey("codex", "session-1"),
+                "title",
+                "/tmp/project",
+                false,
+                "/tmp/source.jsonl",
+                "source-cursor",
+                7L,
+                now,
+                now,
+                now,
+                now);
     }
 }

@@ -1,11 +1,13 @@
 package org.apache.paimon.agent.source.claude;
 
 import org.apache.paimon.agent.model.SessionBatch;
+import org.apache.paimon.agent.model.ChatSession;
 import org.apache.paimon.agent.source.AttachmentResolver;
 import org.apache.paimon.agent.source.ConversationSource;
 import org.apache.paimon.agent.source.IncrementalFiles;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -180,6 +182,71 @@ class ClaudeConversationSourceTest {
         assertThat(resumed.get(0).messages().get(0).contentJson()).contains("second");
     }
 
+    @Test
+    void resumesAfterACloudRestoreBoundaryWithoutRecollectingRestoredMessages()
+            throws Exception {
+        Path project = tempDir.resolve("projects/-tmp-project");
+        Files.createDirectories(project);
+        Path transcript = project.resolve("session-restored.jsonl");
+        String first = claudeUser("session-restored", "original");
+        Files.writeString(transcript, first + '\n');
+        ObjectMapper mapper = new ObjectMapper();
+        ClaudeConversationSource source =
+                new ClaudeConversationSource(
+                        tempDir,
+                        mapper,
+                        new AttachmentResolver(mapper, true, false, 1024));
+        SessionBatch checkpoint = source.scan(Collections.emptyMap(), 100).get(0);
+
+        String restoredAssistant =
+                withRestoreBoundary(
+                        mapper,
+                "{\"type\":\"assistant\",\"sessionId\":\"session-restored\","
+                        + "\"uuid\":\"restored-assistant\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":["
+                                + "{\"type\":\"text\",\"text\":\"restored\"}]}}",
+                        checkpoint.session());
+        Files.writeString(
+                transcript,
+                "{\"type\":\"summary\"}\n"
+                        + first
+                        + '\n'
+                        + restoredAssistant
+                        + '\n'
+                        + claudeUser("session-restored", "after restore")
+                        + '\n',
+                StandardOpenOption.TRUNCATE_EXISTING);
+
+        List<SessionBatch> resumed =
+                source.scan(
+                        Collections.singletonMap(
+                                checkpoint.session().key(), checkpoint.session()),
+                        100);
+
+        assertThat(resumed).hasSize(1);
+        assertThat(resumed.get(0).messages()).hasSize(1);
+        assertThat(resumed.get(0).messages().get(0).contentJson())
+                .contains("after restore")
+                .doesNotContain("\"text\":\"restored\"");
+
+        Files.writeString(
+                transcript,
+                "{\"type\":\"a-longer-summary-after-the-checkpoint-advanced\"}\n"
+                        + first
+                        + '\n'
+                        + restoredAssistant
+                        + '\n'
+                        + claudeUser("session-restored", "after restore")
+                        + '\n',
+                StandardOpenOption.TRUNCATE_EXISTING);
+        List<SessionBatch> remapped =
+                source.scan(
+                        Collections.singletonMap(
+                                resumed.get(0).session().key(), resumed.get(0).session()),
+                        100);
+        assertThat(remapped).singleElement().satisfies(batch -> assertThat(batch.messages()).isEmpty());
+    }
+
     private static String claudeUser(String sessionId, String text) {
         return "{\"type\":\"user\",\"sessionId\":\""
                 + sessionId
@@ -189,5 +256,14 @@ class ClaudeConversationSourceTest {
                 + "{\"type\":\"text\",\"text\":\""
                 + text
                 + "\"}]}}";
+    }
+
+    private static String withRestoreBoundary(
+            ObjectMapper mapper, String json, ChatSession checkpoint) throws Exception {
+        ObjectNode event = (ObjectNode) mapper.readTree(json);
+        event.set(
+                IncrementalFiles.RESTORE_BOUNDARY_FIELD,
+                IncrementalFiles.restoreBoundaryMarker(mapper, checkpoint));
+        return mapper.writeValueAsString(event);
     }
 }

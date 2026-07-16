@@ -197,10 +197,33 @@ public final class ClaudeConversationSource implements ConversationSource {
                         previous == null ? null : previous.pendingCursor());
         String currentFileKey = fileSnapshot.fileKey();
         long startOffset = priorCursor.offset();
-        if (fileSnapshot.size() < startOffset
-                || (priorCursor.fileKey() != null
-                        && !Objects.equals(priorCursor.fileKey(), currentFileKey))
-                || !IncrementalFiles.anchorMatchesAtOffset(transcript, priorCursor)) {
+        String startAnchor = priorCursor.anchor();
+        boolean checkpointRemapped = false;
+        String currentSourcePath = transcript.toAbsolutePath().normalize().toString();
+        boolean checkpointMismatch =
+                fileSnapshot.size() < startOffset
+                        || (previous != null
+                                && !Objects.equals(previous.sourcePath(), currentSourcePath))
+                        || (priorCursor.fileKey() != null
+                                && !Objects.equals(priorCursor.fileKey(), currentFileKey))
+                        || !IncrementalFiles.anchorMatchesAtOffset(transcript, priorCursor);
+        boolean missingCursorIdentity =
+                previous != null
+                        && priorCursor.fileKey() == null
+                        && priorCursor.anchor() == null;
+        IncrementalFiles.RestoreBoundary restoreBoundary =
+                !checkpointMismatch && !missingCursorIdentity
+                        ? null
+                        : IncrementalFiles.findLastRestoreBoundary(
+                                tailReader, transcript, fileSnapshot.size(), previous);
+        if (restoreBoundary != null) {
+            startOffset = restoreBoundary.offset();
+            startAnchor = restoreBoundary.anchor();
+            checkpointRemapped = true;
+            LOG.info(
+                    "Resuming restored Claude session {} after its local restore boundary",
+                    sessionId);
+        } else if (checkpointMismatch) {
             long recovered =
                     IncrementalFiles.findOffsetAfterAnchor(
                             tailReader,
@@ -216,6 +239,7 @@ public final class ClaudeConversationSource implements ConversationSource {
                 return null;
             }
             startOffset = recovered;
+            checkpointRemapped = true;
         }
         long targetOffset = -1L;
         if (previous != null && previous.hasPendingCommit()) {
@@ -245,7 +269,7 @@ public final class ClaudeConversationSource implements ConversationSource {
         SessionKey key = new SessionKey(SOURCE_TYPE, sessionId);
         long processedOffset = startOffset;
         int processedRecords = 0;
-        String lastAnchor = priorCursor.anchor();
+        String lastAnchor = startAnchor;
         String title =
                 previous != null && !isBlank(previous.title())
                         ? previous.title()
@@ -364,7 +388,7 @@ public final class ClaudeConversationSource implements ConversationSource {
                         title,
                         cwd,
                         false,
-                        transcript.toAbsolutePath().normalize().toString(),
+                        currentSourcePath,
                         SourceCursors.file(processedOffset, currentFileKey, lastAnchor),
                         previous == null ? -1L : previous.lastCommitId(),
                         createdAt,
@@ -378,6 +402,7 @@ public final class ClaudeConversationSource implements ConversationSource {
                         && processedOffset == targetOffset;
         if (!pendingBoundaryReached
                 && processedOffset == startOffset
+                && !checkpointRemapped
                 && messages.isEmpty()
                 && !metadataChanged(previous, session)) {
             return null;

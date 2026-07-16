@@ -9,6 +9,7 @@ import org.apache.paimon.agent.source.IncrementalFiles;
 import org.apache.paimon.agent.source.SourceCursors;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -522,6 +523,79 @@ class CodexConversationSourceTest {
                 .isTrue();
     }
 
+    @Test
+    void resumesAfterACloudRestoreBoundaryWithoutRecollectingRestoredMessages()
+            throws Exception {
+        Path sessions = tempDir.resolve("sessions/2026/01/01");
+        Files.createDirectories(sessions);
+        Path rollout = sessions.resolve("rollout-restored-session.jsonl");
+        String sessionMeta =
+                "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_meta\","
+                        + "\"payload\":{\"id\":\"session-1\",\"cwd\":\"/tmp/project\"}}";
+        String original = canonicalUser("original");
+        Files.writeString(rollout, sessionMeta + '\n' + original + '\n');
+        createStateDatabase(rollout);
+        ObjectMapper mapper = new ObjectMapper();
+        CodexConversationSource source =
+                new CodexConversationSource(
+                        tempDir,
+                        mapper,
+                        new AttachmentResolver(mapper, true, false, 1024));
+        SessionBatch checkpoint = source.scan(Collections.emptyMap(), 100).get(0);
+
+        String restoredAssistant =
+                withRestoreBoundary(
+                        mapper,
+                "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"type\":\"response_item\","
+                        + "\"payload\":{\"type\":\"message\",\"role\":\"assistant\","
+                                + "\"content\":[{\"type\":\"output_text\",\"text\":\"restored\"}]}}",
+                        checkpoint.session());
+        String appended = canonicalUser("after restore");
+        Files.writeString(
+                rollout,
+                "{\"type\":\"summary\"}\n"
+                        + sessionMeta
+                        + '\n'
+                        + original
+                        + '\n'
+                        + restoredAssistant
+                        + '\n'
+                        + appended
+                        + '\n',
+                StandardOpenOption.TRUNCATE_EXISTING);
+
+        List<SessionBatch> resumed =
+                source.scan(
+                        Collections.singletonMap(
+                                checkpoint.session().key(), checkpoint.session()),
+                        100);
+
+        assertThat(resumed).hasSize(1);
+        assertThat(resumed.get(0).messages()).hasSize(1);
+        assertThat(resumed.get(0).messages().get(0).contentJson())
+                .contains("after restore")
+                .doesNotContain("restored");
+
+        Files.writeString(
+                rollout,
+                "{\"type\":\"a-longer-summary-after-the-checkpoint-advanced\"}\n"
+                        + sessionMeta
+                        + '\n'
+                        + original
+                        + '\n'
+                        + restoredAssistant
+                        + '\n'
+                        + appended
+                        + '\n',
+                StandardOpenOption.TRUNCATE_EXISTING);
+        List<SessionBatch> remapped =
+                source.scan(
+                        Collections.singletonMap(
+                                resumed.get(0).session().key(), resumed.get(0).session()),
+                        100);
+        assertThat(remapped).singleElement().satisfies(batch -> assertThat(batch.messages()).isEmpty());
+    }
+
     private void createStateDatabase(Path rollout) throws Exception {
         createStateDatabase(new ThreadRow("session-1", rollout, "Test title", 2));
     }
@@ -561,6 +635,15 @@ class CodexConversationSourceTest {
                 + "{\"type\":\"input_text\",\"text\":\""
                 + value
                 + "\"}]}}";
+    }
+
+    private static String withRestoreBoundary(
+            ObjectMapper mapper, String json, ChatSession checkpoint) throws Exception {
+        ObjectNode event = (ObjectNode) mapper.readTree(json);
+        event.set(
+                IncrementalFiles.RESTORE_BOUNDARY_FIELD,
+                IncrementalFiles.restoreBoundaryMarker(mapper, checkpoint));
+        return mapper.writeValueAsString(event);
     }
 
     private static final class ThreadRow {

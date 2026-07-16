@@ -75,6 +75,11 @@
       key: null,
       session: null
     },
+    restore: {
+      key: null,
+      loading: false,
+      controller: null
+    },
     conversation: {
       sessionKey: null,
       items: [],
@@ -358,6 +363,38 @@
     }
   }
 
+  async function postRestore(path, signal) {
+    const response = await sameOriginFetch(path, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "X-Paimon-Agent-Action": "restore-session"
+      },
+      signal: signal
+    });
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      if (response.ok) {
+        throw new Error("服务返回了无法识别的数据格式");
+      }
+    }
+    if (!response.ok) {
+      let message = payload && (payload.message || payload.error);
+      if (!message) {
+        message = "同步失败（HTTP " + response.status + "）";
+      }
+      if (response.status === 403) {
+        message = "同步请求被拒绝，请确认正在通过本机地址访问。";
+      }
+      const requestError = new Error(displayValue(message));
+      requestError.status = response.status;
+      throw requestError;
+    }
+    return payload && typeof payload === "object" ? payload : {};
+  }
+
   function transientRetryDelay(retryAfter, retryNumber) {
     const seconds = Number(retryAfter);
     if (Number.isFinite(seconds) && seconds >= 0) {
@@ -416,6 +453,12 @@
     }
     if (error.status === 403) {
       return "请求被拒绝，请确认正在通过本机地址访问。";
+    }
+    if (error.status === 404) {
+      return "这个会话已不存在或尚未上传，请刷新会话列表后重试。";
+    }
+    if (error.status === 409) {
+      return "请先完全退出 Codex/Claude；若客户端已退出，会话可能仍在上传，或另一个本地同步正在进行。";
     }
     if (error.status === 429 || error.status === 503) {
       return "数据读取任务较多，请稍后重试。";
@@ -765,8 +808,82 @@
     const indicator = element("span", "session-state-dot is-" + status.kind);
     indicator.setAttribute("aria-hidden", "true");
     button.append(title, indicator);
-    listItem.appendChild(button);
+
+    const syncButton = element("button", "session-sync-button");
+    const restoring = state.restore.loading && state.restore.key === key;
+    const available = status.kind === "uploaded";
+    syncButton.type = "button";
+    syncButton.disabled = state.restore.loading || !available;
+    syncButton.classList.toggle("is-syncing", restoring);
+    syncButton.setAttribute(
+      "aria-label",
+      (restoring ? "正在同步" : "同步回本地") + "：" + titleText
+    );
+    syncButton.title = restoring
+      ? "正在同步到本机 " + sourceLabel(item.sourceType)
+      : (available
+        ? "请先退出 " + sourceLabel(item.sourceType) + "；同步后重启客户端即可看到会话"
+        : "上传完成后才能同步回本地");
+    const syncSymbol = element("span", "session-sync-symbol");
+    syncSymbol.setAttribute("aria-hidden", "true");
+    syncButton.append(
+      syncSymbol,
+      element("span", "session-sync-label", restoring ? "同步中…" : "同步回本地")
+    );
+    syncButton.addEventListener("click", function (event) {
+      event.stopPropagation();
+      restoreSessionToLocal(item);
+    });
+    listItem.append(button, syncButton);
     return listItem;
+  }
+
+  async function restoreSessionToLocal(item) {
+    const key = sessionKey(item);
+    if (state.restore.loading) {
+      return;
+    }
+    if (sessionStatus(item).kind !== "uploaded") {
+      showToast("会话上传完成后才能同步回本地", true);
+      return;
+    }
+    const controller = new AbortController();
+    state.restore.key = key;
+    state.restore.loading = true;
+    state.restore.controller = controller;
+    renderSessions();
+    try {
+      const params = new URLSearchParams();
+      params.set("sourceType", displayValue(item.sourceType, ""));
+      params.set("sessionId", displayValue(item.sessionId, ""));
+      const result = await postRestore(
+        API_ROOT + "/sessions/restore?" + params.toString(),
+        controller.signal
+      );
+      if (result.status === "restored" && safeNumber(result.restoredSessions, 0) > 0) {
+        const client = sourceLabel(result.sourceType || item.sourceType);
+        const restoredSessions = formatCount(safeNumber(result.restoredSessions, 0));
+        const restoredMessages = formatCount(safeNumber(result.restoredMessages, 0));
+        showToast(
+          "已同步 " + restoredSessions + " 个关联会话、" + restoredMessages
+            + " 条消息到 " + displayValue(result.target, "本机 " + client)
+            + "；重启 " + client + " 后可见"
+        );
+      } else {
+        showToast("本地已存在相同会话或记录仍在提交，本次未覆盖", true);
+      }
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        showToast(friendlyError(error), true);
+      }
+    } finally {
+      if (state.restore.key === key) {
+        state.restore.key = null;
+        state.restore.loading = false;
+        state.restore.controller = null;
+        renderSessions();
+      }
+    }
   }
 
   async function selectSession(item, options) {
@@ -2683,6 +2800,9 @@
       }
       if (state.conversation.controller) {
         state.conversation.controller.abort();
+      }
+      if (state.restore.controller) {
+        state.restore.controller.abort();
       }
     });
   }
